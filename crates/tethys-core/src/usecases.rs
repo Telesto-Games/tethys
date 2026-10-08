@@ -308,6 +308,12 @@ mod tests {
         fn set_build_configuration(&self, _: Configuration) -> PortResult<()> {
             Ok(())
         }
+        fn skipped_version(&self) -> PortResult<Option<crate::update::Version>> {
+            Ok(None)
+        }
+        fn set_skipped_version(&self, _: Option<crate::update::Version>) -> PortResult<()> {
+            Ok(())
+        }
     }
 
     struct FakeSession(SessionId);

@@ -10,6 +10,7 @@ mod keys;
 mod session_panel;
 mod terminal_view;
 mod theme;
+mod update_ui;
 mod workspace;
 
 use std::path::PathBuf;

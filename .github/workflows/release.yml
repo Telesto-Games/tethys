@@ -1,0 +1,52 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching [workspace.package] version) to publish a
+# GitHub Release. The in-app updater installs its `tethys.exe` asset, checked
+# against the SHA-256 GitHub records for it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches the version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "tethys-app") | .version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml ($version)"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          dir="tethys-$VERSION-windows-x64"
+          mkdir "$dir"
+          cp target/release/tethys.exe LICENSE THIRD-PARTY-NOTICES.md README.md "$dir/"
+          7z a "$dir.zip" "$dir" > /dev/null
+          cp target/release/tethys.exe tethys.exe
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "tethys-$VERSION-windows-x64.zip" tethys.exe \
+            --title "Tethys $VERSION" --generate-notes

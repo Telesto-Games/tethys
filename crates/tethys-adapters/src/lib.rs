@@ -6,3 +6,5 @@ pub mod engine_registry;
 pub mod process_launcher;
 pub mod scm_git;
 pub mod scm_svn;
+pub mod self_install;
+pub mod update_github;

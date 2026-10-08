@@ -19,6 +19,11 @@ similar = "3.2"
 quick-xml = "0.42"
 futures = "0.3"
 toml = "1.1"
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "platform-verifier", "json"] }
+# Only to pick ring as the TLS crypto provider for ureq (ring is already in the tree).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.11"
+self-replace = "1.5"
 
 gpui-kit = "=0.7.1"
 # Only to enable syntax highlighting grammars; the code uses it through gpui-kit.

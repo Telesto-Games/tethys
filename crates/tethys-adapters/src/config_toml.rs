@@ -1,7 +1,8 @@
 //! `ConfigStore` backed by TOML files in `%APPDATA%\tethys`.
 //!
 //! - `agents.toml`: `[[agent]]` profiles (user-edited, read-only to Tethys)
-//! - `state.toml`: recent projects and build configuration (written by Tethys)
+//! - `state.toml`: recent projects, build configuration and a skipped release
+//!   (written by Tethys)
 
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tethys_core::AgentProfile;
 use tethys_core::ports::{ConfigStore, PortResult};
 use tethys_core::unreal::Configuration;
+use tethys_core::update::Version;
 
 #[derive(Debug, Clone)]
 pub struct TomlConfigStore {
@@ -27,6 +29,9 @@ struct StateFile {
     recent_projects: Vec<PathBuf>,
     #[serde(default)]
     build_configuration: Configuration,
+    /// A release the user chose to skip, e.g. "0.2.0".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skipped_version: Option<String>,
 }
 
 impl TomlConfigStore {
@@ -89,6 +94,15 @@ impl ConfigStore for TomlConfigStore {
 
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()> {
         self.update_state(|s| s.build_configuration = configuration)
+    }
+
+    fn skipped_version(&self) -> PortResult<Option<Version>> {
+        let state = self.read::<StateFile>("state.toml")?;
+        Ok(state.skipped_version.as_deref().and_then(Version::parse))
+    }
+
+    fn set_skipped_version(&self, version: Option<Version>) -> PortResult<()> {
+        self.update_state(|s| s.skipped_version = version.map(|v| v.to_string()))
     }
 }
 
@@ -175,5 +189,18 @@ mod state_tests {
             Configuration::DebugGame
         );
         assert_eq!(store.recent_projects().unwrap(), recent);
+    }
+
+    #[test]
+    fn skipped_version_round_trips() {
+        let dir = std::env::temp_dir().join(format!("tethys-config-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        assert_eq!(store.skipped_version().unwrap(), None);
+        let v = Version::parse("0.2.0");
+        store.set_skipped_version(v).unwrap();
+        assert_eq!(store.skipped_version().unwrap(), v);
+        store.set_skipped_version(None).unwrap();
+        assert_eq!(store.skipped_version().unwrap(), None);
     }
 }

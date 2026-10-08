@@ -4,6 +4,19 @@ Tethys: a lightweight, LLM-first IDE for Telesto Games' Unreal projects
 Open a `.uproject` and Tethys starts Claude Code in the project folder, in a native
 GPU-rendered terminal. See [docs/design.md](docs/design.md) for the design.
 
+## Install
+
+Download `tethys-<version>-windows-x64.zip` from [Releases](https://github.com/Telesto-Games/tethys/releases),
+unzip it anywhere you can write to, and run `tethys.exe`. It isn't code-signed yet, so Windows
+SmartScreen may warn the first time.
+
+Tethys keeps itself up to date: a few seconds after it starts it checks for a newer release and
+offers to install it (**Update and restart**, **Skip this version** or **Later**). **Help →
+Check for Updates…** checks on demand. Updating replaces `tethys.exe` in place, checked against
+the SHA-256 GitHub records for it, then reopens the same project. Set
+`TETHYS_NO_UPDATE_CHECK=1` to turn the startup check off; debug builds never check by
+themselves.
+
 ## Build and run
 
 Needs Rust (stable, MSVC) and the Visual Studio C++ build tools.
@@ -32,8 +45,22 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Arrange sessions side by side | Drag a tab onto the edge of a pane to split it, or onto another tab bar to move it. Drag the divider to resize; close a tab with its × |
 | Copy | Drag to select, then **Ctrl+C** (or Ctrl+Shift+C) |
 | Paste | **Ctrl+V** or right-click |
+| Update Tethys | **Help → Check for Updates…** (also checked automatically after startup) |
 
 Every other key goes straight to the agent.
+
+## Releasing
+
+1. Bump `version` under `[workspace.package]` in `Cargo.toml` and commit ("Release 0.2.0").
+2. Tag and push: `git tag v0.2.0 && git push origin main v0.2.0`.
+
+The **Release** workflow checks the tag matches the version, builds, and publishes a GitHub
+Release with `tethys-0.2.0-windows-x64.zip` (exe, LICENSE, notices, README) and the bare
+`tethys.exe` the updater downloads. Release notes are generated from the commits; edit them on
+GitHub afterwards if you like, since they appear in the update dialog.
+
+To try the updater against the latest release, run an older build or pretend to be one:
+`TETHYS_PRETEND_VERSION=0.0.1` (this also enables the startup check in debug builds).
 
 ## App icon
 

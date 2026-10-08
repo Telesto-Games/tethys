@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
 use crate::scm::{FileStatus, WorkingCopyInfo};
 use crate::unreal::{CommandSpec, Configuration};
+use crate::update::{Release, Version};
 
 pub type PortError = Box<dyn std::error::Error + Send + Sync>;
 pub type PortResult<T> = Result<T, PortError>;
@@ -26,6 +27,9 @@ pub trait ConfigStore {
     /// The build configuration last chosen, for builds and editor launches.
     fn build_configuration(&self) -> PortResult<Configuration>;
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()>;
+    /// The release the user chose not to be offered again, if any.
+    fn skipped_version(&self) -> PortResult<Option<Version>>;
+    fn set_skipped_version(&self, version: Option<Version>) -> PortResult<()>;
 }
 
 /// A source control system (Subversion and git now; Perforce later).
@@ -95,4 +99,24 @@ pub enum SessionEvent {
     TitleChanged(String),
     Bell,
     Exited(i32),
+}
+
+/// Where released builds come from (GitHub Releases now).
+pub trait UpdateSource: Send + Sync {
+    /// The latest published release, or `None` if there isn't one.
+    fn latest(&self) -> PortResult<Option<Release>>;
+    /// Downloads the release's exe to `dest` and checks its SHA-256. On any
+    /// failure, including a hash mismatch, `dest` is removed.
+    fn download(&self, release: &Release, dest: &Path) -> PortResult<()>;
+}
+
+/// Replaces the running program with a downloaded build.
+pub trait SelfInstaller: Send + Sync {
+    /// Where to download the new exe: next to the current one, so the swap
+    /// is a rename on the same volume.
+    fn staging_path(&self) -> PortResult<PathBuf>;
+    /// Makes `new_exe` the program that runs next time, and removes it.
+    fn install(&self, new_exe: &Path) -> PortResult<()>;
+    /// Starts the installed program with `args`, independent of this process.
+    fn relaunch(&self, args: &[String]) -> PortResult<()>;
 }

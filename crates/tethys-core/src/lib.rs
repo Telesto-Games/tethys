@@ -8,6 +8,7 @@ pub mod domain;
 pub mod ports;
 pub mod scm;
 pub mod unreal;
+pub mod update;
 pub mod usecases;
 
 pub use domain::{

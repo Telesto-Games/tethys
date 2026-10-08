@@ -12,6 +12,11 @@ serde.workspace = true
 toml.workspace = true
 quick-xml.workspace = true
 alacritty_terminal.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+self-replace.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true

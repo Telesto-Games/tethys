@@ -23,8 +23,12 @@ use tethys_adapters::engine_registry::RegistryEngineLocator;
 use tethys_adapters::process_launcher::DetachedLauncher;
 use tethys_adapters::scm_git::Git;
 use tethys_adapters::scm_svn::Subversion;
+use tethys_adapters::self_install::ExeReplacer;
+use tethys_adapters::update_github::GitHubReleases;
 use tethys_core::diff::FileDiff;
-use tethys_core::ports::{AgentSession, ConfigStore, EventSink, SessionEvent, SourceControl};
+use tethys_core::ports::{
+    AgentSession, ConfigStore, EventSink, SelfInstaller, SessionEvent, SourceControl, UpdateSource,
+};
 use tethys_core::unreal::Configuration;
 use tethys_core::usecases::{RecentProject, ScmSummary};
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
@@ -35,6 +39,7 @@ use crate::editor_panel::{self, EditorEvent, EditorPanel};
 use crate::file_tree::{FileTreeEvent, FileTreePanel};
 use crate::session_panel::{SessionKind, SessionPanel};
 use crate::theme;
+use crate::update_ui;
 
 /// Initial width of the build pane on the right.
 const BUILD_PANE_WIDTH: Pixels = px(560.);
@@ -55,7 +60,8 @@ gpui_kit::actions!(
         LaunchEditor,
         ShowProjects,
         Exit,
-        About
+        About,
+        CheckForUpdates
     ]
 );
 
@@ -80,7 +86,11 @@ pub fn install_menus(cx: &mut App) {
             ])
             .owned(),
         Menu::new("Help")
-            .items([MenuItem::action("About Tethys", About)])
+            .items([
+                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::separator(),
+                MenuItem::action("About Tethys", About),
+            ])
             .owned(),
     ];
     GlobalState::global_mut(cx).set_app_menus(menus);
@@ -107,6 +117,8 @@ pub struct Services {
     pub locator: RegistryEngineLocator,
     /// Every source control Tethys knows; each project uses the one managing it.
     pub scms: Vec<Arc<dyn SourceControl>>,
+    pub updates: Arc<dyn UpdateSource>,
+    pub installer: Arc<dyn SelfInstaller>,
     next_session: AtomicU64,
 }
 
@@ -117,6 +129,8 @@ impl Services {
             config: TomlConfigStore::user_default(),
             locator: RegistryEngineLocator,
             scms: vec![Arc::new(Git::new()), Arc::new(Subversion::new())],
+            updates: Arc::new(GitHubReleases::new(update_ui::REPO)),
+            installer: Arc::new(ExeReplacer::new()),
             next_session: AtomicU64::new(1),
         }
     }
@@ -240,7 +254,32 @@ impl Workspace {
         if let Some(path) = path {
             this.open(path, window, cx);
         }
+        // The first window checks for updates once, a little after startup.
+        if update_ui::claim_startup_check() {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(update_ui::startup_delay())
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    update_ui::check(false, this.project_path(), window, cx)
+                });
+            })
+            .detach();
+        }
         this
+    }
+
+    fn project_path(&self) -> Option<PathBuf> {
+        self.project.as_ref().map(|p| p.path.clone())
+    }
+
+    fn check_for_updates(
+        &mut self,
+        _: &CheckForUpdates,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        update_ui::check(true, self.project_path(), window, cx);
     }
 
     /// Opens a project here, or in a new window if this one already has one.
@@ -1159,6 +1198,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::launch_editor))
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::check_for_updates))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if let Some(path) = paths.paths().iter().find(|p| is_uproject(p)) {
                     this.open(path.clone(), window, cx);
