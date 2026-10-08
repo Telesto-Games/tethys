@@ -341,3 +341,13 @@ Things learned while building M0–M3 that aren't obvious from the code.
   first. For full-screen TUIs like opencode, the terminal sends mouse-wheel reports (SGR or
   legacy) when the program enables mouse mode, and arrow keys on the alternate screen. Mouse
   clicks aren't forwarded yet.
+- **Menu bar.** File / Build / Help, drawn in-window by gpui-component's `AppMenuBar` from
+  menus set in `install_menus`. Menu items dispatch the same actions as the shortcuts. Exit
+  closes every window, which stops their sessions gracefully. Help → About opens a dialog. The
+  app registers an asset source (`assets.rs`) with gpui-kit's default icons plus the few Lucide
+  icons the toolbar uses.
+- **Build pane.** Each project window has a build pane in the dock's right region
+  (`DockPlacement::Right`, 560px to start, collapsible and resizable). Builds always open there
+  and agents open in the center. Before the first build, and after the last build tab closes, it
+  holds a `BuildPlaceholder` that can't be closed. Starting a build closes finished build tabs, so
+  the pane shows the latest log.

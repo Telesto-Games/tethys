@@ -13,6 +13,8 @@ const BACKDROP: u32 = 0x0e1014;
 const SURFACE: u32 = 0x1a1e25;
 const SURFACE_HOVER: u32 = 0x242932;
 const BORDER: u32 = 0x2c323c;
+/// Menu bar and header: lighter than the backdrop so the chrome stands apart.
+const HEADER: u32 = 0x1b1f27;
 const FOREGROUND: u32 = 0xe6e9ef;
 const MUTED: u32 = 0x8a93a3;
 const ACCENT: u32 = 0x4f8cff;
@@ -29,8 +31,10 @@ pub fn apply(cx: &mut App) {
     c.muted = rgb(SURFACE).into();
     c.muted_foreground = rgb(MUTED).into();
     c.border = rgb(BORDER).into();
-    c.title_bar = rgb(BACKDROP).into();
+    c.title_bar = rgb(HEADER).into();
     c.title_bar_border = rgb(BORDER).into();
+    c.popover = rgb(SURFACE).into();
+    c.popover_foreground = rgb(FOREGROUND).into();
 
     c.primary = rgb(ACCENT).into();
     c.primary_hover = rgb(ACCENT_HOVER).into();

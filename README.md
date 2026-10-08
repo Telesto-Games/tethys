@@ -18,11 +18,12 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Do this | How |
 |---|---|
 | Open a project | Start `tethys.exe` with no argument for the project browser (picker + recent projects), or pass a `.uproject`. Also **Ctrl+Shift+O**, or drop a `.uproject` on the window |
-| Project browser from a project | **Ctrl+Shift+P** opens it in a new window |
+| Project browser from a project | **File → Projects…** or **Ctrl+Shift+P** opens it in a new window |
+| Menus | **File** (Open Project, Projects, New/Close Session, Exit), **Build** (Build, Launch Editor), **Help** (About) |
 | New agent session | **New session ▾** → Claude Code or opencode. **Ctrl+Shift+T** starts the first (Claude Code) |
 | Close session | **Ctrl+Shift+W** |
 | Pick the build configuration | **Development** / **DebugGame** toggle in the project header (remembered between runs) |
-| Build the editor target | **Ctrl+Shift+B**: runs `Build.bat <Project>Editor Win64 <Configuration>` in a tab (✓ or ✗ when done) |
+| Build the editor target | **Ctrl+Shift+B**: runs `Build.bat <Project>Editor Win64 <Configuration>` in the **Build pane** on the right (✓ or ✗ when done). Each new build replaces the previous finished log |
 | Launch the Unreal Editor | **Ctrl+Shift+E**: starts `UnrealEditor.exe` (or `UnrealEditor-Win64-DebugGame.exe`) on the project, independent of Tethys |
 | Switch session | **Ctrl+Tab** / **Ctrl+Shift+Tab**, or click the tab |
 | Arrange sessions side by side | Drag a tab onto the edge of a pane to split it, or onto another tab bar to move it. Drag the divider to resize; close a tab with its × |

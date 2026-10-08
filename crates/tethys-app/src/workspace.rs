@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
+use gpui_kit::assets::IconName;
+use gpui_kit::base::GlobalState;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
     DockArea, DockEvent, DockPlacement, DockSkin, PanelHandle, PanelId, PanelStyle,
 };
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
+use gpui_kit::component::{Icon, WindowExt};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use tethys_adapters::agent_terminal::TerminalHost;
@@ -23,7 +26,11 @@ use tethys_core::unreal::Configuration;
 use tethys_core::usecases::RecentProject;
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
+use crate::build_placeholder::BuildPlaceholder;
 use crate::session_panel::{SessionKind, SessionPanel};
+
+/// Initial width of the build pane on the right.
+const BUILD_PANE_WIDTH: Pixels = px(560.);
 
 gpui_kit::actions!(
     tethys,
@@ -35,9 +42,38 @@ gpui_kit::actions!(
         PrevSession,
         BuildProject,
         LaunchEditor,
-        ShowProjects
+        ShowProjects,
+        Exit,
+        About
     ]
 );
+
+/// The menu bar: File, Build and Help. Rendered in-window by `AppMenuBar`.
+pub fn install_menus(cx: &mut App) {
+    let menus = vec![
+        Menu::new("File")
+            .items([
+                MenuItem::action("Open Project…", OpenProject),
+                MenuItem::action("Projects…", ShowProjects),
+                MenuItem::separator(),
+                MenuItem::action("New Session", NewSession),
+                MenuItem::action("Close Session", CloseSession),
+                MenuItem::separator(),
+                MenuItem::action("Exit", Exit),
+            ])
+            .owned(),
+        Menu::new("Build")
+            .items([
+                MenuItem::action("Build", BuildProject),
+                MenuItem::action("Launch Editor", LaunchEditor),
+            ])
+            .owned(),
+        Menu::new("Help")
+            .items([MenuItem::action("About Tethys", About)])
+            .owned(),
+    ];
+    GlobalState::global_mut(cx).set_app_menus(menus);
+}
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
@@ -111,6 +147,9 @@ pub struct Workspace {
     focus: FocusHandle,
     _events: Task<()>,
     _dock_events: Subscription,
+    menu_bar: Entity<AppMenuBar>,
+    /// Shown in the build pane while it has no build tab.
+    build_placeholder: Option<Entity<BuildPlaceholder>>,
 }
 
 impl Workspace {
@@ -130,11 +169,13 @@ impl Workspace {
         let (dock, skin) = DockSkin::dock_area("sessions", None, window, cx);
         skin.set_panel_style(PanelStyle::TabBar, cx);
         skin.set_close_button_visible(true, cx);
-        let dock_events = cx.subscribe(&dock, |this, _, event: &DockEvent, cx| {
-            if let DockEvent::LayoutChanged = event {
-                this.prune_closed_panels(cx);
-            }
-        });
+        let dock_events =
+            cx.subscribe_in(&dock, window, |this, _, event: &DockEvent, window, cx| {
+                if let DockEvent::LayoutChanged = event {
+                    this.prune_closed_panels(cx);
+                    this.ensure_build_pane(window, cx);
+                }
+            });
 
         let services = cx.global::<Services>();
         let recent = usecases::recent_projects(&services.config, &services.locator);
@@ -167,6 +208,8 @@ impl Workspace {
             focus,
             _events: events,
             _dock_events: dock_events,
+            menu_bar: AppMenuBar::new(cx),
+            build_placeholder: None,
         };
         if let Some(path) = path {
             this.open(path, window, cx);
@@ -190,6 +233,7 @@ impl Workspace {
                 window.set_window_title(&format!("{} — Tethys", project.name()));
                 self.project = Some(project);
                 self.error = None;
+                self.ensure_build_pane(window, cx);
                 self.new_session(&NewSession, window, cx);
             }
             Err(e) => {
@@ -211,6 +255,34 @@ impl Workspace {
         }
         self.reload_recent(cx);
         cx.notify();
+    }
+
+    fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            dialog.title("About Tethys").w(px(420.)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("Tethys {}", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .child("A lightweight, LLM-first IDE for Telesto Games' Unreal projects.")
+                    .child(div().text_sm().text_color(muted).child(
+                        "Runs Claude Code and opencode in native terminals, builds with UBT and launches the Unreal Editor.",
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Built with Rust, GPUI and alacritty_terminal."),
+                    ),
+            )
+        });
     }
 
     /// Opens a project browser in a new window.
@@ -340,21 +412,71 @@ impl Workspace {
                     return;
                 };
                 let panel = cx.new(|cx| SessionPanel::new(id, kind, label, session, handle, cx));
+                // Agents go in the main area; builds go in the build pane on the right.
+                let placement = match kind {
+                    SessionKind::Agent => DockPlacement::Center,
+                    SessionKind::Build => DockPlacement::Right,
+                };
+                if kind == SessionKind::Build {
+                    self.close_finished_builds(window, cx);
+                }
                 self.dock.update(cx, |dock, cx| {
                     dock.add_panel_view(
                         Arc::new(PanelHandle::new(panel.clone())),
-                        DockPlacement::Center,
-                        None,
+                        placement,
+                        Some(BUILD_PANE_WIDTH),
                         window,
                         cx,
                     )
                 });
                 self.panels.push(panel);
+                if kind == SessionKind::Build
+                    && let Some(placeholder) = self.build_placeholder.take()
+                {
+                    self.dock
+                        .update(cx, |dock, cx| dock.remove_panel(placeholder, window, cx));
+                }
                 self.activate(self.panels.len() - 1, window, cx);
             }
             Err(e) => self.error = Some(e),
         }
         cx.notify();
+    }
+
+    /// Keeps the build pane on the right: when it has no build tab, it shows
+    /// the placeholder. Idempotent.
+    fn ensure_build_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_build = self
+            .panels
+            .iter()
+            .any(|p| p.read(cx).kind() == SessionKind::Build);
+        if self.project.is_none() || has_build || self.build_placeholder.is_some() {
+            return;
+        }
+        let placeholder = cx.new(BuildPlaceholder::new);
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                Arc::new(PanelHandle::new(placeholder.clone())),
+                DockPlacement::Right,
+                Some(BUILD_PANE_WIDTH),
+                window,
+                cx,
+            )
+        });
+        self.build_placeholder = Some(placeholder);
+    }
+
+    /// Removes build tabs whose build has finished, so the pane shows the latest log.
+    fn close_finished_builds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (finished, kept): (Vec<_>, Vec<_>) = self.panels.drain(..).partition(|p| {
+            let p = p.read(cx);
+            p.kind() == SessionKind::Build && !p.is_running()
+        });
+        self.panels = kept;
+        for panel in finished {
+            self.dock
+                .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        }
     }
 
     /// Drops panels the dock no longer holds (closed from their tab).
@@ -580,99 +702,107 @@ impl Workspace {
 
     fn render_project(&self, project: &Project, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let association = association_label(project);
-        let engine = match &project.engine {
-            Ok(path) => div()
-                .text_color(theme.muted_foreground)
-                .child(format!("Engine: {association} → {}", path.display())),
-            Err(e) => div()
-                .text_color(theme.danger)
-                .child(format!("Engine: {association} — {e}")),
+        let (engine_chip, engine_error) = match &project.engine {
+            Ok(path) => (association_label(project), path.display().to_string()),
+            Err(e) => (association_label(project), e.clone()),
         };
+        let engine_ok = project.engine.is_ok();
         let enabled_plugins = project.plugins.iter().filter(|(_, on)| *on).count();
+        let divider = || div().w_px().h(px(20.)).mx_1().bg(theme.border);
+
+        let identity = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(project.name().to_string()),
+                    )
+                    .child(
+                        div()
+                            .px_1p5()
+                            .rounded(theme.radius)
+                            .text_xs()
+                            .bg(if engine_ok {
+                                theme.primary.opacity(0.15)
+                            } else {
+                                theme.danger.opacity(0.15)
+                            })
+                            .text_color(if engine_ok {
+                                theme.primary
+                            } else {
+                                theme.danger
+                            })
+                            .child(engine_chip),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if engine_ok {
+                        theme.muted_foreground
+                    } else {
+                        theme.danger
+                    })
+                    .truncate()
+                    .child(format!(
+                        "{} · engine {} · {} module(s), {} plugin(s)",
+                        project.root().display(),
+                        engine_error,
+                        project.modules.len(),
+                        enabled_plugins
+                    )),
+            );
+
+        let configuration = div()
+            .flex()
+            .gap_0p5()
+            .p_0p5()
+            .rounded(theme.radius)
+            .bg(theme.background)
+            .border_1()
+            .border_color(theme.border)
+            .children(Configuration::ALL.map(|configuration| {
+                let button =
+                    Button::new(configuration.as_str())
+                        .xsmall()
+                        .label(configuration.as_str())
+                        .tooltip("Configuration for Build and Launch editor")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_configuration(configuration, cx)
+                        }));
+                if configuration == self.configuration {
+                    button.primary()
+                } else {
+                    button.ghost()
+                }
+            }));
 
         let header = div()
             .flex()
             .items_center()
             .gap_2()
             .px_4()
-            .py_3()
+            .py_2p5()
+            .bg(theme.title_bar)
             .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .text_sm()
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .items_baseline()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(project.name().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(project.root().display().to_string()),
-                            ),
-                    )
-                    .child(engine)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "{} modules: {} · {} plugins enabled",
-                                project.modules.len(),
-                                project.modules.join(", "),
-                                enabled_plugins
-                            )),
-                    ),
-            )
-            .child(
-                Button::new("projects")
-                    .small()
-                    .ghost()
-                    .label("Projects")
-                    .tooltip("Projects (Ctrl+Shift+P)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.show_projects(&ShowProjects, window, cx)
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_0p5()
-                    .p_0p5()
-                    .rounded(theme.radius)
-                    .bg(theme.muted)
-                    .border_1()
-                    .border_color(theme.border)
-                    .children(Configuration::ALL.map(|configuration| {
-                        let button = Button::new(configuration.as_str())
-                            .small()
-                            .label(configuration.as_str())
-                            .tooltip("Configuration for Build and Launch editor")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_configuration(configuration, cx)
-                            }));
-                        if configuration == self.configuration {
-                            button.primary()
-                        } else {
-                            button.ghost()
-                        }
-                    })),
-            )
+            .border_color(theme.title_bar_border)
+            .child(identity)
+            .child(configuration)
             .child(
                 Button::new("build")
                     .small()
+                    .ghost()
+                    .icon(Icon::new(IconName::Hammer))
                     .label("Build")
                     .tooltip("Build (Ctrl+Shift+B)")
                     .on_click(
@@ -682,16 +812,21 @@ impl Workspace {
             .child(
                 Button::new("launch-editor")
                     .small()
+                    .ghost()
+                    .icon(Icon::new(IconName::Play))
                     .label("Launch editor")
                     .tooltip("Launch editor (Ctrl+Shift+E)")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.launch_editor(&LaunchEditor, window, cx)
                     })),
             )
+            .child(divider())
             .child(
                 Button::new("new-session")
                     .small()
-                    .label("New session ▾")
+                    .primary()
+                    .icon(Icon::new(IconName::Plus))
+                    .label("New session")
                     .tooltip("Pick an agent (Ctrl+Shift+T starts the first)")
                     .dropdown_menu({
                         let this = cx.entity().downgrade();
@@ -709,32 +844,11 @@ impl Workspace {
                             })
                         }
                     }),
-            )
-            .when(!self.panels.is_empty(), |d| {
-                d.child(
-                    Button::new("close-session")
-                        .small()
-                        .ghost()
-                        .label("Close session")
-                        .tooltip("Close session (Ctrl+Shift+W)")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.close_session(&CloseSession, window, cx)
-                        })),
-                )
-            });
+            );
 
-        let body = if self.panels.is_empty() {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.muted_foreground)
-                .child("No sessions. Press Ctrl+Shift+T to start one.")
-        } else {
-            // Drag a tab to an edge of a pane to split, or onto another tab bar to move it.
-            div().flex_1().min_h_0().child(self.dock.clone())
-        };
+        // Always shown: the build pane lives in the dock even with no sessions.
+        // Drag a tab to an edge of a pane to split, or onto another tab bar to move it.
+        let body = div().flex_1().min_h_0().child(self.dock.clone());
 
         div()
             .flex_1()
@@ -769,11 +883,20 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::build))
             .on_action(cx.listener(Self::launch_editor))
             .on_action(cx.listener(Self::show_projects))
+            .on_action(cx.listener(Self::about))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if let Some(path) = paths.paths().iter().find(|p| is_uproject(p)) {
                     this.open(path.clone(), window, cx);
                 }
             }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .bg(cx.theme().title_bar)
+                    .child(self.menu_bar.clone()),
+            )
             .children(self.render_error(cx))
             .child(content)
     }
