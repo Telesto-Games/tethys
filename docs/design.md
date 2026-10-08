@@ -278,5 +278,5 @@ the agent; a read-only file viewer.
 
 ## Prerequisites
 
-- Rust via rustup: `winget install Rustlang.Rustup`, then the MSVC toolchain.
+- Rust stable (MSVC target) via rustup.
 - Rust needs the MSVC linker. The Visual Studio C++ toolchain that UE development needs should already provide it.
