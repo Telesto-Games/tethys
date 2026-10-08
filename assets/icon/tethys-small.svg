@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- Simplified for 16-32px: no crater or border, thicker horizon. -->
+  <rect x="0" y="0" width="32" height="32" rx="6" fill="#0B001F"/>
+  <circle cx="16" cy="16.5" r="11" fill="#F24B38"/>
+  <rect x="3" y="17" width="26" height="4" fill="#0B001F"/>
+  <rect x="1" y="18" width="30" height="2" fill="#F24B38"/>
+</svg>

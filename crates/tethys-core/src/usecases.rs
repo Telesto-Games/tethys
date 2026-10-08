@@ -8,7 +8,7 @@ use crate::ports::{
     AgentHost, AgentSession, ConfigStore, EngineLocator, EventSink, PortError, ProcessLauncher,
     SourceControl,
 };
-use crate::scm::WorkingCopyStatus;
+use crate::scm::{WorkingCopyInfo, WorkingCopyStatus};
 use crate::unreal::{self, Configuration, ToolError};
 
 /// Lines of unchanged context shown around each change in a diff.
@@ -20,6 +20,37 @@ pub fn working_copy_status(
     root: &Path,
 ) -> Result<WorkingCopyStatus, PortError> {
     Ok(WorkingCopyStatus::new(scm.status(root)?))
+}
+
+/// What the Files pane shows about source control: the provider and where the
+/// working copy points, or why there's nothing to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScmSummary {
+    /// The project folder isn't managed by the configured source control.
+    NotUnderControl { provider: &'static str },
+    Ready {
+        provider: &'static str,
+        info: WorkingCopyInfo,
+    },
+    Failed {
+        provider: &'static str,
+        error: String,
+    },
+}
+
+/// Summarises the working copy at `root` for display.
+pub fn scm_summary(scm: &dyn SourceControl, root: &Path) -> ScmSummary {
+    let provider = scm.name();
+    if !scm.is_working_copy(root) {
+        return ScmSummary::NotUnderControl { provider };
+    }
+    match scm.info(root) {
+        Ok(info) => ScmSummary::Ready { provider, info },
+        Err(e) => ScmSummary::Failed {
+            provider,
+            error: e.to_string(),
+        },
+    }
 }
 
 /// Diffs a file's current text against its BASE version. A file with no
@@ -519,7 +550,7 @@ mod scm_tests {
     use super::*;
     use crate::diff::LineKind;
     use crate::ports::PortResult;
-    use crate::scm::{ChangeKind, FileStatus};
+    use crate::scm::{ChangeKind, FileStatus, WorkingCopyInfo};
 
     struct FakeScm;
     impl SourceControl for FakeScm {
@@ -529,6 +560,14 @@ mod scm_tests {
         fn is_working_copy(&self, _: &Path) -> bool {
             true
         }
+        fn info(&self, _: &Path) -> PortResult<WorkingCopyInfo> {
+            Ok(WorkingCopyInfo {
+                url: "https://host/svn/game/trunk".into(),
+                branch: Some("^/trunk".into()),
+                revision: Some("712".into()),
+                last_change: None,
+            })
+        }
         fn status(&self, root: &Path) -> PortResult<Vec<FileStatus>> {
             Ok(vec![FileStatus {
                 path: root.join("a.cpp"),
@@ -537,6 +576,17 @@ mod scm_tests {
         }
         fn base_text(&self, file: &Path) -> PortResult<Option<String>> {
             Ok(file.ends_with("a.cpp").then(|| "one\ntwo\n".to_string()))
+        }
+    }
+
+    #[test]
+    fn summarises_the_working_copy() {
+        match scm_summary(&FakeScm, Path::new(r"D:p")) {
+            ScmSummary::Ready { provider, info } => {
+                assert_eq!(provider, "Fake");
+                assert_eq!(info.branch.as_deref(), Some("^/trunk"));
+            }
+            other => panic!("{other:?}"),
         }
     }
 

@@ -26,7 +26,7 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Build the editor target | **Ctrl+Shift+B**: runs `Build.bat <Project>Editor Win64 <Configuration>` in the **Build pane** on the right (✓ or ✗ when done). Each new build replaces the previous finished log |
 | Launch the Unreal Editor | **Ctrl+Shift+E**: starts `UnrealEditor.exe` (or `UnrealEditor-Win64-DebugGame.exe`) on the project, independent of Tethys |
 | Switch session | **Ctrl+Tab** / **Ctrl+Shift+Tab**, or click the tab |
-| Browse files | The **Files** pane on the left lists the project folder. **All / Changes** at its top switches to a flat list of only added and modified files. Changed files are coloured (yellow modified, green added, red deleted/conflicted, grey unversioned) with their SVN letter; folders containing changes are yellow |
+| Browse files | The **Files** pane on the left lists the project folder; its footer shows the source control in use (Subversion branch, revision, URL, last change). **All / Changes** at its top switches to a flat list of only added and modified files. Changed files are coloured (yellow modified, green added, red deleted/conflicted, grey unversioned) with their SVN letter; folders containing changes are yellow |
 | Edit a file | Click it in Files. Ctrl+S saves, **Revert** discards unsaved edits. Line endings, BOM and tab indentation are preserved exactly. Tabs with unsaved edits can't be closed until saved or reverted |
 | Diff a file | Click **diff** next to a changed file in Files, or **Diff** in its editor (includes unsaved edits). Shows a unified diff against the SVN BASE |
 | Arrange sessions side by side | Drag a tab onto the edge of a pane to split it, or onto another tab bar to move it. Drag the divider to resize; close a tab with its × |
@@ -34,6 +34,14 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Paste | **Ctrl+V** or right-click |
 
 Every other key goes straight to the agent.
+
+## App icon
+
+Sources are `assets/icon/tethys.svg` and `tethys-small.svg` (16–32 px). After editing them, regenerate the `.ico` with:
+
+```sh
+cargo run --manifest-path tools/make-icon/Cargo.toml
+```
 
 ## Configuration
 

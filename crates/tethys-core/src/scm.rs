@@ -51,6 +51,26 @@ impl ChangeKind {
     }
 }
 
+/// Where a working copy points, for display. All read locally.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkingCopyInfo {
+    /// The checked-out location, e.g. `https://host/svn/game/trunk`.
+    pub url: String,
+    /// The location within the repository, e.g. `^/trunk` (a branch, for SVN).
+    pub branch: Option<String>,
+    /// The working copy's revision, e.g. `712`.
+    pub revision: Option<String>,
+    /// The last commit to this location: revision, author and ISO date.
+    pub last_change: Option<LastChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastChange {
+    pub revision: String,
+    pub author: String,
+    pub date: String,
+}
+
 /// One changed file. `path` is absolute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStatus {

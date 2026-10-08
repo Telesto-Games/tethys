@@ -10,6 +10,7 @@ use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use tethys_core::scm::{ChangeKind, WorkingCopyStatus};
+use tethys_core::usecases::ScmSummary;
 
 /// Folders that are tool metadata, not project content.
 const HIDDEN: &[&str] = &[".svn", ".git", ".vs", ".idea"];
@@ -50,6 +51,8 @@ pub struct FileTreePanel {
     status: Arc<WorkingCopyStatus>,
     /// Show only added and modified files, as a flat list.
     changes_only: bool,
+    /// Source control details for the footer; `None` until loaded.
+    scm: Option<ScmSummary>,
     scroll: UniformListScrollHandle,
 }
 
@@ -64,10 +67,74 @@ impl FileTreePanel {
             selected: None,
             status: Arc::default(),
             changes_only: false,
+            scm: None,
             scroll: UniformListScrollHandle::new(),
         };
         this.rebuild();
         this
+    }
+
+    pub fn set_scm(&mut self, scm: ScmSummary, cx: &mut Context<Self>) {
+        self.scm = Some(scm);
+        cx.notify();
+    }
+
+    /// The source control footer: provider, branch, revision and last change.
+    fn render_scm_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let line = || div().text_xs().truncate().text_color(muted);
+        let (provider, ok, lines): (String, bool, Vec<String>) = match &self.scm {
+            None => ("Source control".into(), true, vec!["Checking…".into()]),
+            Some(ScmSummary::NotUnderControl { provider }) => (
+                "No source control".into(),
+                false,
+                vec![format!("Not a {provider} working copy")],
+            ),
+            Some(ScmSummary::Failed { provider, error }) => {
+                ((*provider).into(), false, vec![error.clone()])
+            }
+            Some(ScmSummary::Ready { provider, info }) => {
+                let mut lines = vec![info.url.clone()];
+                if let Some(last) = &info.last_change {
+                    // ISO date to "2026-10-06".
+                    let when = last.date.get(..10).unwrap_or(&last.date);
+                    lines.push(format!(
+                        "changed r{} · {} · {when}",
+                        last.revision, last.author
+                    ));
+                }
+                let mut title = (*provider).to_string();
+                if let Some(branch) = &info.branch {
+                    title.push_str(&format!("  {branch}"));
+                }
+                if let Some(rev) = &info.revision {
+                    title.push_str(&format!("  r{rev}"));
+                }
+                (title, true, lines)
+            }
+        };
+        let dot = if ok { Hsla::from(rgb(0x98c379)) } else { muted };
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .mt_1()
+            .px_2()
+            .pt_1p5()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_sm()
+                    .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
+                    .child(div().truncate().child(provider)),
+            )
+            .children(lines.into_iter().map(|l| line().child(l)))
     }
 
     pub fn set_status(&mut self, status: Arc<WorkingCopyStatus>, cx: &mut Context<Self>) {
@@ -438,7 +505,8 @@ impl Render for FileTreePanel {
                     .border_color(theme.border)
                     .bg(theme.title_bar)
                     .child(filter)
-                    .child(body),
+                    .child(body)
+                    .child(self.render_scm_footer(cx)),
             )
     }
 }

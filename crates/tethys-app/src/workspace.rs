@@ -33,11 +33,14 @@ use crate::diff_panel::DiffPanel;
 use crate::editor_panel::{self, EditorEvent, EditorPanel};
 use crate::file_tree::{FileTreeEvent, FileTreePanel};
 use crate::session_panel::{SessionKind, SessionPanel};
+use crate::theme;
 
 /// Initial width of the build pane on the right.
 const BUILD_PANE_WIDTH: Pixels = px(560.);
 /// Initial width of the Files pane on the left.
 const FILES_PANE_WIDTH: Pixels = px(280.);
+/// Height of every control in the project header, so they line up.
+const TOOLBAR_HEIGHT: Pixels = px(28.);
 
 gpui_kit::actions!(
     tethys,
@@ -549,21 +552,28 @@ impl Workspace {
         let (Some(project), Some(tree)) = (self.project.as_ref(), self.file_tree.clone()) else {
             return;
         };
-        if !self.under_scm {
-            return;
-        }
         let scm = cx.global::<Services>().scm.clone();
         let root = project.root().to_path_buf();
-        let status = cx
-            .background_executor()
-            .spawn(async move { usecases::working_copy_status(scm.as_ref(), &root) });
+        let under_scm = self.under_scm;
+        // Summary (footer) and file status (colours) together, off the UI thread.
+        let loaded = cx.background_executor().spawn(async move {
+            let summary = usecases::scm_summary(scm.as_ref(), &root);
+            let status = under_scm.then(|| usecases::working_copy_status(scm.as_ref(), &root));
+            (summary, status)
+        });
         cx.spawn(async move |this, cx| {
-            let status = status.await;
-            let _ = this.update(cx, |this, cx| match status {
-                Ok(status) => tree.update(cx, |tree, cx| tree.set_status(Arc::new(status), cx)),
-                Err(e) => {
-                    this.error = Some(format!("Can't read source control status: {e}"));
-                    cx.notify();
+            let (summary, status) = loaded.await;
+            let _ = this.update(cx, |this, cx| {
+                tree.update(cx, |tree, cx| tree.set_scm(summary, cx));
+                match status {
+                    Some(Ok(status)) => {
+                        tree.update(cx, |tree, cx| tree.set_status(Arc::new(status), cx))
+                    }
+                    Some(Err(e)) => {
+                        this.error = Some(format!("Can't read source control status: {e}"));
+                        cx.notify();
+                    }
+                    None => {}
                 }
             });
         })
@@ -890,7 +900,19 @@ impl Workspace {
                     .flex_col()
                     .gap_4()
                     .w(px(640.))
-                    .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("Tethys"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.primary.opacity(0.6))
+                            .child(theme::tracked("Telesto Games")),
+                    )
+                    .child(
+                        div()
+                            .text_3xl()
+                            .text_color(theme.primary)
+                            .child("TETHYS"),
+                    )
+                    .child(div().h(px(1.)).w_full().bg(theme.primary.opacity(0.2)))
                     .child(
                         div()
                             .text_color(muted)
@@ -906,7 +928,12 @@ impl Workspace {
                                 })),
                         ),
                     )
-                    .child(div().text_sm().text_color(muted).child("Recent projects"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(theme::tracked("Recent projects")),
+                    )
                     .child(if self.recent.is_empty() {
                         div()
                             .text_sm()
@@ -990,8 +1017,12 @@ impl Workspace {
                     )),
             );
 
+        // Every header control is TOOLBAR_HEIGHT tall with small-size labels.
         let configuration = div()
             .flex()
+            .items_center()
+            .flex_none()
+            .h(TOOLBAR_HEIGHT)
             .gap_0p5()
             .p_0p5()
             .rounded(theme.radius)
@@ -1001,7 +1032,9 @@ impl Workspace {
             .children(Configuration::ALL.map(|configuration| {
                 let button =
                     Button::new(configuration.as_str())
-                        .xsmall()
+                        .small()
+                        // Fill the pill: its height minus border and padding.
+                        .h(TOOLBAR_HEIGHT - px(6.))
                         .label(configuration.as_str())
                         .tooltip("Configuration for Build and Launch editor")
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1028,7 +1061,8 @@ impl Workspace {
             .child(
                 Button::new("build")
                     .small()
-                    .ghost()
+                    .h(TOOLBAR_HEIGHT)
+                    .outline()
                     .icon(Icon::new(IconName::Hammer))
                     .label("Build")
                     .tooltip("Build (Ctrl+Shift+B)")
@@ -1039,7 +1073,8 @@ impl Workspace {
             .child(
                 Button::new("launch-editor")
                     .small()
-                    .ghost()
+                    .h(TOOLBAR_HEIGHT)
+                    .outline()
                     .icon(Icon::new(IconName::Play))
                     .label("Launch editor")
                     .tooltip("Launch editor (Ctrl+Shift+E)")
@@ -1051,6 +1086,7 @@ impl Workspace {
             .child(
                 Button::new("new-session")
                     .small()
+                    .h(TOOLBAR_HEIGHT)
                     .primary()
                     .icon(Icon::new(IconName::Plus))
                     .label("New session")
@@ -1116,6 +1152,14 @@ impl Render for Workspace {
                     this.open(path.clone(), window, cx);
                 }
             }))
+            // The Telesto top hairline: one line of broadcast orange.
+            .child(
+                div()
+                    .h(px(1.))
+                    .w_full()
+                    .flex_none()
+                    .bg(cx.theme().primary.opacity(0.6)),
+            )
             .child(
                 div()
                     .flex()

@@ -1,0 +1,13 @@
+[package]
+name = "make-icon"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Renders assets/icon/*.svg into assets/icon/tethys.ico. Run by hand when the icon changes."
+
+# Standalone: not part of the Tethys workspace, so CI doesn't build resvg.
+[workspace]
+
+[dependencies]
+resvg = "0.48"
+ico = "0.5"

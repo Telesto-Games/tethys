@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
-use crate::scm::FileStatus;
+use crate::scm::{FileStatus, WorkingCopyInfo};
 use crate::unreal::{CommandSpec, Configuration};
 
 pub type PortError = Box<dyn std::error::Error + Send + Sync>;
@@ -36,6 +36,8 @@ pub trait SourceControl: Send + Sync {
     fn name(&self) -> &'static str;
     /// Whether `dir` is inside a working copy this system manages.
     fn is_working_copy(&self, dir: &Path) -> bool;
+    /// Where the working copy at `root` points (URL, branch, revision).
+    fn info(&self, root: &Path) -> PortResult<WorkingCopyInfo>;
     /// Changed and unversioned files under `root`. Paths are absolute.
     fn status(&self, root: &Path) -> PortResult<Vec<FileStatus>>;
     /// The file as last checked out (BASE), or `None` if it has no base

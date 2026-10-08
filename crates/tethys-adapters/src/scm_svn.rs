@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use tethys_core::ports::{PortResult, SourceControl};
-use tethys_core::scm::{ChangeKind, FileStatus};
+use tethys_core::scm::{ChangeKind, FileStatus, LastChange, WorkingCopyInfo};
 
 #[derive(Debug, Clone)]
 pub struct Subversion {
@@ -64,6 +64,19 @@ impl SourceControl for Subversion {
         dir.ancestors().any(|d| d.join(".svn").is_dir())
     }
 
+    fn info(&self, root: &Path) -> PortResult<WorkingCopyInfo> {
+        let target = svn_path(root);
+        let out = self.run(&["info", "--xml", &target])?;
+        if !out.status.success() {
+            return Err(format!(
+                "svn info failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        parse_info(&String::from_utf8_lossy(&out.stdout))
+    }
+
     fn status(&self, root: &Path) -> PortResult<Vec<FileStatus>> {
         let target = svn_path(root);
         let out = self.run(&["status", "--xml", &target])?;
@@ -95,6 +108,70 @@ impl SourceControl for Subversion {
         }
         Err(format!("svn cat failed: {}", stderr.trim()).into())
     }
+}
+
+/// Parses `svn info --xml` for the first entry.
+pub fn parse_info(xml: &str) -> PortResult<WorkingCopyInfo> {
+    let mut reader = Reader::from_str(xml);
+    let mut info = WorkingCopyInfo::default();
+    let mut commit_revision: Option<String> = None;
+    let (mut author, mut date) = (None, None);
+    // The element whose text we're reading, and whether we're inside <commit>.
+    let mut current = String::new();
+    let mut in_commit = false;
+    loop {
+        match reader.read_event()? {
+            Event::Start(e) => {
+                let name = e.name().as_ref().to_string();
+                match name.as_str() {
+                    "entry" if info.revision.is_none() => {
+                        info.revision = attribute(&e, "revision")?;
+                    }
+                    "commit" => {
+                        in_commit = true;
+                        commit_revision = attribute(&e, "revision")?;
+                    }
+                    _ => {}
+                }
+                current = name;
+            }
+            Event::Text(t) => {
+                let text = t.xml10_content().trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                match (current.as_str(), in_commit) {
+                    ("url", false) => info.url = text,
+                    ("relative-url", false) => info.branch = Some(text),
+                    ("author", true) => author = Some(text),
+                    ("date", true) => date = Some(text),
+                    _ => {}
+                }
+            }
+            Event::End(e) => {
+                if e.name().as_ref() == "commit" {
+                    in_commit = false;
+                }
+                if e.name().as_ref() == "entry" {
+                    break;
+                }
+                current.clear();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if let Some(revision) = commit_revision {
+        info.last_change = Some(LastChange {
+            revision,
+            author: author.unwrap_or_default(),
+            date: date.unwrap_or_default(),
+        });
+    }
+    if info.url.is_empty() {
+        return Err("svn info returned no URL".into());
+    }
+    Ok(info)
 }
 
 /// Parses `svn status --xml`. Relative entry paths are resolved against `root`.
@@ -182,6 +259,30 @@ mod tests {
 </status>"#;
 
     #[test]
+    fn parses_info_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<info>
+<entry path="." revision="712" kind="dir">
+<url>https://host/svn/game/trunk</url>
+<relative-url>^/trunk</relative-url>
+<repository><root>https://host/svn/game</root><uuid>x</uuid></repository>
+<wc-info><wcroot-abspath>D:/dev/repos/game</wcroot-abspath></wc-info>
+<commit revision="710"><author>cashworth</author><date>2026-10-06T11:26:47.183781Z</date></commit>
+</entry>
+</info>"#;
+        let info = parse_info(xml).unwrap();
+        assert_eq!(info.url, "https://host/svn/game/trunk");
+        assert_eq!(info.branch.as_deref(), Some("^/trunk"));
+        assert_eq!(info.revision.as_deref(), Some("712"));
+        let last = info.last_change.unwrap();
+        assert_eq!(
+            (last.revision.as_str(), last.author.as_str()),
+            ("710", "cashworth")
+        );
+        assert!(last.date.starts_with("2026-10-06"));
+    }
+
+    #[test]
     fn parses_status_xml() {
         let files = parse_status(STATUS, Path::new(r"D:\p")).unwrap();
         let got: Vec<_> = files
@@ -239,6 +340,10 @@ mod tests {
         std::fs::write(wc.join("new.txt"), "x\n").unwrap();
 
         assert!(svn.is_working_copy(&wc.join("sub")));
+        let info = svn.info(&wc).unwrap();
+        // Committing doesn't bump the folder's own revision until `svn update`.
+        assert_eq!(info.revision.as_deref(), Some("0"));
+        assert!(info.url.starts_with("file:"));
         assert!(!svn.is_working_copy(&base));
 
         let mut status = svn.status(&wc).unwrap();

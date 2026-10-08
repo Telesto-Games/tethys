@@ -11,18 +11,18 @@ const fn rgb(hex: u32) -> Rgb {
     }
 }
 
-/// ANSI 0-15 (a dark theme based on Zed's One Dark).
+/// ANSI 0-15: One Dark hues on Telesto plum, with brand orange for red.
 const BASE: [Rgb; 16] = [
-    rgb(0x282c34),
-    rgb(0xe06c75),
+    rgb(0x2a1a52),
+    rgb(0xf24b38),
     rgb(0x98c379),
     rgb(0xe5c07b),
     rgb(0x61afef),
     rgb(0xc678dd),
     rgb(0x56b6c2),
     rgb(0xabb2bf),
-    rgb(0x5c6370),
-    rgb(0xea858b),
+    rgb(0x6e5e8c),
+    rgb(0xff6a57),
     rgb(0xaad581),
     rgb(0xffd885),
     rgb(0x85c1ff),
@@ -31,9 +31,9 @@ const BASE: [Rgb; 16] = [
     rgb(0xfafafa),
 ];
 
-pub const FOREGROUND: Rgb = rgb(0xdcdfe4);
-pub const BACKGROUND: Rgb = rgb(0x16191f);
-pub const CURSOR: Rgb = rgb(0x74ade8);
+pub const FOREGROUND: Rgb = rgb(0xe6dcf0);
+pub const BACKGROUND: Rgb = rgb(0x120628);
+pub const CURSOR: Rgb = rgb(0xf24b38);
 
 /// The default colour for a palette index (0..269, see `NamedColor`).
 pub fn default_color(index: usize) -> Rgb {

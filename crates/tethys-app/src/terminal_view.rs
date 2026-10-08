@@ -20,9 +20,9 @@ const FONT_SIZE: f32 = 14.;
 const LINE_HEIGHT: f32 = 1.3;
 const PADDING: f32 = 6.;
 const SELECTION: Rgb = Rgb {
-    r: 0x26,
-    g: 0x4f,
-    b: 0x78,
+    r: 0x55,
+    g: 0x1b,
+    b: 0x2d,
 };
 
 pub struct TerminalView {

@@ -355,7 +355,7 @@ Things learned while building M0–M3 that aren't obvious from the code.
   with a Subversion adapter (`scm_svn`) that runs the `svn` CLI read-only: `status --xml` and
   `cat -r BASE`, which reads the pristine copy with no network access, and no console windows.
   The core's `diff` module turns BASE and the current text into hunks (with `similar`).
-  - **Files pane:** loads folders lazily and colours them from `WorkingCopyStatus`. An All / Changes toggle switches to a flat list of local edits (`WorkingCopyStatus::local_edits`: added, modified, replaced, conflicted). Status
+  - **Files pane:** loads folders lazily and colours them from `WorkingCopyStatus`. Its footer shows the provider and where the working copy points (`SourceControl::info`, `svn info --xml`, local only): branch, revision, URL and last change, or "No source control". An All / Changes toggle switches to a flat list of local edits (`WorkingCopyStatus::local_edits`: added, modified, replaced, conflicted). Status
     refreshes on project open, after each save, and when the window regains focus.
   - **Editor:** gpui-component's code editor. That editor can't draw tab stops, so `TextCodec`
     expands tabs for display and writes unedited lines back verbatim. Line endings and BOM are
@@ -365,3 +365,24 @@ Things learned while building M0–M3 that aren't obvious from the code.
   - **Not done yet:** nothing is ever committed, reverted or updated through SVN; syntax
     highlighting is the editor library's default and fairly sparse; there's no prompt for unsaved
     edits when closing the window.
+- **Visual identity.** Follows the Telesto Games brand (telesto.games):
+  - **Colour:** plum `#0B001F` backdrop and broadcast orange `#F24B38` as the only accent, with
+    plum text on orange buttons. Lilac `#C8B8D8` for quiet text. Structure is orange hairlines
+    at low opacity, including a 1px line across the top of the window. Corners are nearly square.
+  - **Type:** Cascadia Mono everywhere (SIL OFL, ships with Windows 11). The brand face, PP
+    Fraktion Mono, is commercial and can't ship in an MIT product. Only use standard or
+    OFL/MIT-compatible fonts and assets. Cascadia's capitals are centred in its line box
+    (measured offset 0.000 em, against 0.065 em for Segoe UI), so labels sit level
+    in buttons.
+  - **Controls:** every control in the project header is `TOOLBAR_HEIGHT` (28px) tall and uses
+    small labels: an outlined button for each secondary action, filled orange for the primary
+    one, and a bordered pill for the configuration toggle.
+  - **Labels:** GPUI has no letter-spacing, so `theme::tracked` imitates the brand's wide
+    tracking for a few welcome-screen labels only. Panel tabs use plain title case.
+  - Everything lives in `crates/tethys-app/src/theme.rs` and `agent_terminal::palette`.
+- **App icon.** Tethys the moon (Telesto shares its orbit) in brand colours: an orange moon with
+  a plum `>_` agent prompt above the Telesto horizon line, on a plum tile. The sources are
+  `assets/icon/tethys.svg`, plus `tethys-small.svg` for 16–32 px, which drops the prompt so the
+  icon stays legible. `tools/make-icon` (standalone, outside the workspace) renders them with
+  resvg into `assets/icon/tethys.ico`. `crates/tethys-app/build.rs` embeds that as resource #1
+  (via winresource), the resource GPUI uses for the window icon.
