@@ -1,0 +1,30 @@
+# `cargo deny check licenses`: keeps every shipped dependency under a license that's
+# compatible with releasing Tethys under MIT. Copyleft (GPL, LGPL, AGPL) isn't allowed.
+# Keep in step with `accepted` in about.toml.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "bzip2-1.0.6",
+    # File-level copyleft: fine for an unmodified dependency (option-ext, build time only).
+    "MPL-2.0",
+]
+
+[licenses.private]
+ignore = true

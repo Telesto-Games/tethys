@@ -13,7 +13,11 @@ fn main() {
                 "FileDescription",
                 "Tethys — an LLM-first IDE for Unreal projects",
             )
-            .set("CompanyName", "Telesto Games");
+            .set("CompanyName", "Telesto Games")
+            .set(
+                "LegalCopyright",
+                "Copyright 2026 Gradient Ascent Ltd. MIT licensed.",
+            );
         res.compile().expect("embedding the Windows icon resource");
     }
 }

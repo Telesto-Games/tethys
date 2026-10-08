@@ -60,3 +60,21 @@ args = []
 
 Profiles appear in the New session menu; the first is the Ctrl+Shift+T default. opencode installs with `npm i -g opencode-ai`. Tethys keeps recent projects in
 `%APPDATA%\tethys\state.toml`.
+
+## License
+
+Tethys is MIT licensed: see [LICENSE](LICENSE). Copyright © 2026 Gradient Ascent Ltd.
+Third-party code it ships with, and their licenses, are listed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). CI runs `cargo deny check licenses` to
+keep the dependency tree permissive (see `deny.toml`). Regenerate the notices after changing
+dependencies:
+
+```sh
+cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md
+```
+
+## Trademarks
+
+Telesto® is a registered trademark of Gradient Ascent Ltd. The MIT license covers the code,
+not the Telesto name, logo or brand. Unreal® Engine is a trademark of Epic Games, Inc.; Claude
+is a trademark of Anthropic, PBC. Tethys is not affiliated with or endorsed by either.

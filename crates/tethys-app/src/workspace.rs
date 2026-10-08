@@ -307,7 +307,10 @@ impl Workspace {
                             .text_xs()
                             .text_color(muted)
                             .child("Built with Rust, GPUI and alacritty_terminal."),
-                    ),
+                    )
+                    .child(div().text_xs().text_color(muted).child(
+                        "© 2026 Gradient Ascent Ltd. MIT licensed; third-party licenses in THIRD-PARTY-NOTICES.md.",
+                    )),
             )
         });
     }
