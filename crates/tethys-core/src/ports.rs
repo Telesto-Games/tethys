@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
+use crate::scm::FileStatus;
 use crate::unreal::{CommandSpec, Configuration};
 
 pub type PortError = Box<dyn std::error::Error + Send + Sync>;
@@ -25,6 +26,21 @@ pub trait ConfigStore {
     /// The build configuration last chosen, for builds and editor launches.
     fn build_configuration(&self) -> PortResult<Configuration>;
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()>;
+}
+
+/// A source control system (Subversion now; Perforce or git later).
+///
+/// Read-only: Tethys shows what changed but never commits, reverts or updates.
+pub trait SourceControl: Send + Sync {
+    /// Display name, e.g. "Subversion".
+    fn name(&self) -> &'static str;
+    /// Whether `dir` is inside a working copy this system manages.
+    fn is_working_copy(&self, dir: &Path) -> bool;
+    /// Changed and unversioned files under `root`. Paths are absolute.
+    fn status(&self, root: &Path) -> PortResult<Vec<FileStatus>>;
+    /// The file as last checked out (BASE), or `None` if it has no base
+    /// (unversioned or newly added).
+    fn base_text(&self, file: &Path) -> PortResult<Option<String>>;
 }
 
 /// Starts programs that outlive Tethys, like the Unreal Editor.

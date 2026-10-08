@@ -2,11 +2,36 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::diff::{self, FileDiff};
 use crate::domain::{AdapterKind, AgentProfile, DomainError, Project, ProjectError, SessionId};
 use crate::ports::{
     AgentHost, AgentSession, ConfigStore, EngineLocator, EventSink, PortError, ProcessLauncher,
+    SourceControl,
 };
+use crate::scm::WorkingCopyStatus;
 use crate::unreal::{self, Configuration, ToolError};
+
+/// Lines of unchanged context shown around each change in a diff.
+pub const DIFF_CONTEXT: usize = 3;
+
+/// The changed files of the working copy at `root`.
+pub fn working_copy_status(
+    scm: &dyn SourceControl,
+    root: &Path,
+) -> Result<WorkingCopyStatus, PortError> {
+    Ok(WorkingCopyStatus::new(scm.status(root)?))
+}
+
+/// Diffs a file's current text against its BASE version. A file with no
+/// base (unversioned or added) diffs against empty text.
+pub fn diff_against_base(
+    scm: &dyn SourceControl,
+    file: &Path,
+    current: &str,
+) -> Result<FileDiff, PortError> {
+    let base = scm.base_text(file)?.unwrap_or_default();
+    Ok(diff::diff_lines(&base, current, DIFF_CONTEXT))
+}
 
 /// How many recent projects to remember.
 pub const MAX_RECENT_PROJECTS: usize = 10;
@@ -484,5 +509,48 @@ mod tool_tests {
         let p = open_project(&dir.join("Game.uproject"), &NoEngine).unwrap();
         assert_eq!(p.targets, ["GameEditor"]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scm_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::diff::LineKind;
+    use crate::ports::PortResult;
+    use crate::scm::{ChangeKind, FileStatus};
+
+    struct FakeScm;
+    impl SourceControl for FakeScm {
+        fn name(&self) -> &'static str {
+            "Fake"
+        }
+        fn is_working_copy(&self, _: &Path) -> bool {
+            true
+        }
+        fn status(&self, root: &Path) -> PortResult<Vec<FileStatus>> {
+            Ok(vec![FileStatus {
+                path: root.join("a.cpp"),
+                kind: ChangeKind::Modified,
+            }])
+        }
+        fn base_text(&self, file: &Path) -> PortResult<Option<String>> {
+            Ok(file.ends_with("a.cpp").then(|| "one\ntwo\n".to_string()))
+        }
+    }
+
+    #[test]
+    fn status_and_diff_go_through_the_port() {
+        let root = PathBuf::from(r"D:\p");
+        let status = working_copy_status(&FakeScm, &root).unwrap();
+        assert_eq!(status.of(&root.join("a.cpp")), Some(ChangeKind::Modified));
+
+        let d = diff_against_base(&FakeScm, &root.join("a.cpp"), "one\n2\n").unwrap();
+        assert_eq!((d.added, d.removed), (1, 1));
+
+        // No base: everything is added.
+        let d = diff_against_base(&FakeScm, &root.join("new.cpp"), "x\ny\n").unwrap();
+        assert!(d.hunks[0].lines.iter().all(|l| l.kind == LineKind::Added));
     }
 }

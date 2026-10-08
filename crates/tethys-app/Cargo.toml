@@ -16,3 +16,4 @@ tethys-adapters.workspace = true
 gpui-kit.workspace = true
 rfd.workspace = true
 futures.workspace = true
+gpui-component.workspace = true

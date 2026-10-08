@@ -351,3 +351,17 @@ Things learned while building M0–M3 that aren't obvious from the code.
   and agents open in the center. Before the first build, and after the last build tab closes, it
   holds a `BuildPlaceholder` that can't be closed. Starting a build closes finished build tabs, so
   the pane shows the latest log.
+- **Files, editor and diff.** A `SourceControl` port (`is_working_copy`, `status`, `base_text`)
+  with a Subversion adapter (`scm_svn`) that runs the `svn` CLI read-only: `status --xml` and
+  `cat -r BASE`, which reads the pristine copy with no network access, and no console windows.
+  The core's `diff` module turns BASE and the current text into hunks (with `similar`).
+  - **Files pane:** loads folders lazily and colours them from `WorkingCopyStatus`. An All / Changes toggle switches to a flat list of local edits (`WorkingCopyStatus::local_edits`: added, modified, replaced, conflicted). Status
+    refreshes on project open, after each save, and when the window regains focus.
+  - **Editor:** gpui-component's code editor. That editor can't draw tab stops, so `TextCodec`
+    expands tabs for display and writes unedited lines back verbatim. Line endings and BOM are
+    preserved too. Every text file in a large game's `Source` (707 files) round-trips byte for
+    byte (`TETHYS_ROUNDTRIP_DIR=… cargo test -- --ignored`).
+  - **Diff:** a unified diff against BASE in the main area.
+  - **Not done yet:** nothing is ever committed, reverted or updated through SVN; syntax
+    highlighting is the editor library's default and fairly sparse; there's no prompt for unsaved
+    edits when closing the window.

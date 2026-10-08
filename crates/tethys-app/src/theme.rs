@@ -1,6 +1,7 @@
 //! Tethys's look: a dark slate palette with a blue accent, where each pane
 //! reads as a bordered card on a darker backdrop.
 
+use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::{Theme, ThemeMode, ThemeTokens};
 use gpui_kit::*;
 use tethys_adapters::agent_terminal::palette;
@@ -71,6 +72,7 @@ pub fn apply(cx: &mut App) {
     c.drag_border = rgb(ACCENT).into();
     c.drop_target = hsla_from_hex(ACCENT).opacity(0.18);
 
+    theme.highlight_theme = HighlightTheme::default_dark();
     theme.radius = px(6.);
     theme.radius_lg = px(10.);
     // The dock and tabs read these derived tokens, not the colors directly.

@@ -15,10 +15,25 @@ tethys-adapters = { path = "crates/tethys-adapters" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+similar = "3.2"
+quick-xml = "0.42"
 futures = "0.3"
 toml = "1.1"
 
 gpui-kit = "=0.7.1"
+# Only to enable syntax highlighting grammars; the code uses it through gpui-kit.
+gpui-component = { version = "=0.7.1", features = [
+    "tree-sitter",
+    "tree-sitter-cpp",
+    "tree-sitter-csharp",
+    "tree-sitter-toml",
+    "tree-sitter-python",
+    "tree-sitter-markdown",
+    "tree-sitter-markdown-inline",
+    "tree-sitter-rust",
+    "tree-sitter-yaml",
+    "tree-sitter-bash",
+] }
 alacritty_terminal = "=0.26.0"
 rfd = "0.17"
 winreg = "0.56"

@@ -10,7 +10,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::GlobalState;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
-    DockArea, DockEvent, DockPlacement, DockSkin, PanelHandle, PanelId, PanelStyle,
+    DockArea, DockEvent, DockPlacement, DockSkin, Panel, PanelHandle, PanelId, PanelStyle,
 };
 use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
@@ -21,16 +21,23 @@ use tethys_adapters::agent_terminal::TerminalHost;
 use tethys_adapters::config_toml::TomlConfigStore;
 use tethys_adapters::engine_registry::RegistryEngineLocator;
 use tethys_adapters::process_launcher::DetachedLauncher;
-use tethys_core::ports::{AgentSession, ConfigStore, EventSink, SessionEvent};
+use tethys_adapters::scm_svn::Subversion;
+use tethys_core::diff::FileDiff;
+use tethys_core::ports::{AgentSession, ConfigStore, EventSink, SessionEvent, SourceControl};
 use tethys_core::unreal::Configuration;
 use tethys_core::usecases::RecentProject;
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
 use crate::build_placeholder::BuildPlaceholder;
+use crate::diff_panel::DiffPanel;
+use crate::editor_panel::{self, EditorEvent, EditorPanel};
+use crate::file_tree::{FileTreeEvent, FileTreePanel};
 use crate::session_panel::{SessionKind, SessionPanel};
 
 /// Initial width of the build pane on the right.
 const BUILD_PANE_WIDTH: Pixels = px(560.);
+/// Initial width of the Files pane on the left.
+const FILES_PANE_WIDTH: Pixels = px(280.);
 
 gpui_kit::actions!(
     tethys,
@@ -78,6 +85,7 @@ pub fn install_menus(cx: &mut App) {
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-shift-p", ShowProjects, None),
+        KeyBinding::new("ctrl-s", crate::editor_panel::Save, None),
         KeyBinding::new("ctrl-shift-b", BuildProject, None),
         KeyBinding::new("ctrl-shift-e", LaunchEditor, None),
         KeyBinding::new("ctrl-shift-o", OpenProject, None),
@@ -93,6 +101,7 @@ pub struct Services {
     pub host: TerminalHost,
     pub config: TomlConfigStore,
     pub locator: RegistryEngineLocator,
+    pub scm: Arc<dyn SourceControl>,
     next_session: AtomicU64,
 }
 
@@ -102,6 +111,7 @@ impl Services {
             host: TerminalHost::new(),
             config: TomlConfigStore::user_default(),
             locator: RegistryEngineLocator,
+            scm: Arc::new(Subversion::new()),
             next_session: AtomicU64::new(1),
         }
     }
@@ -150,6 +160,12 @@ pub struct Workspace {
     menu_bar: Entity<AppMenuBar>,
     /// Shown in the build pane while it has no build tab.
     build_placeholder: Option<Entity<BuildPlaceholder>>,
+    file_tree: Option<Entity<FileTreePanel>>,
+    editors: Vec<Entity<EditorPanel>>,
+    diffs: Vec<Entity<DiffPanel>>,
+    /// Whether the project folder is a working copy of `Services::scm`.
+    under_scm: bool,
+    subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
@@ -210,6 +226,11 @@ impl Workspace {
             _dock_events: dock_events,
             menu_bar: AppMenuBar::new(cx),
             build_placeholder: None,
+            file_tree: None,
+            editors: Vec::new(),
+            diffs: Vec::new(),
+            under_scm: false,
+            subscriptions: Vec::new(),
         };
         if let Some(path) = path {
             this.open(path, window, cx);
@@ -234,6 +255,7 @@ impl Workspace {
                 self.project = Some(project);
                 self.error = None;
                 self.ensure_build_pane(window, cx);
+                self.show_files(window, cx);
                 self.new_session(&NewSession, window, cx);
             }
             Err(e) => {
@@ -479,13 +501,218 @@ impl Workspace {
         }
     }
 
+    /// Adds the Files panel on the left and loads source-control status.
+    fn show_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let root = project.root().to_path_buf();
+        self.under_scm = cx.global::<Services>().scm.is_working_copy(&root);
+
+        let tree = cx.new(|cx| FileTreePanel::new(root, cx));
+        let events = cx.subscribe_in(&tree, window, |this, _, event, window, cx| match event {
+            FileTreeEvent::Open(path) => this.open_file(path.clone(), window, cx),
+            FileTreeEvent::Diff(path) => this.show_diff(path.clone(), None, window, cx),
+        });
+        self.subscriptions.push(events);
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                Arc::new(PanelHandle::new(tree.clone())),
+                DockPlacement::Left,
+                Some(FILES_PANE_WIDTH),
+                window,
+                cx,
+            )
+        });
+        self.file_tree = Some(tree);
+
+        // Pick up changes made outside Tethys whenever the window comes back.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.refresh_files(cx);
+            }
+        });
+        self.subscriptions.push(activation);
+        self.refresh_status(cx);
+    }
+
+    /// Re-reads the file tree from disk and reloads source-control status.
+    fn refresh_files(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = &self.file_tree {
+            tree.update(cx, |tree, cx| tree.refresh(cx));
+        }
+        self.refresh_status(cx);
+    }
+
+    /// Loads working-copy status in the background and colours the tree with it.
+    fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        let (Some(project), Some(tree)) = (self.project.as_ref(), self.file_tree.clone()) else {
+            return;
+        };
+        if !self.under_scm {
+            return;
+        }
+        let scm = cx.global::<Services>().scm.clone();
+        let root = project.root().to_path_buf();
+        let status = cx
+            .background_executor()
+            .spawn(async move { usecases::working_copy_status(scm.as_ref(), &root) });
+        cx.spawn(async move |this, cx| {
+            let status = status.await;
+            let _ = this.update(cx, |this, cx| match status {
+                Ok(status) => tree.update(cx, |tree, cx| tree.set_status(Arc::new(status), cx)),
+                Err(e) => {
+                    this.error = Some(format!("Can't read source control status: {e}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Opens a file in an editor tab, or focuses its existing tab.
+    fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self
+            .editors
+            .iter()
+            .find(|e| e.read(cx).path() == path)
+            .cloned()
+        {
+            self.focus_panel(&editor, window, cx);
+            return;
+        }
+        let raw = match editor_panel::read_text(&path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                self.error = Some(e);
+                cx.notify();
+                return;
+            }
+        };
+        let editor = cx.new(|cx| EditorPanel::new(path, &raw, window, cx));
+        let events = cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
+            match event {
+                EditorEvent::Saved => this.refresh_status(cx),
+                EditorEvent::Diff(path, text) => {
+                    this.show_diff(path.clone(), Some(text.clone()), window, cx)
+                }
+                EditorEvent::DirtyChanged => {}
+            }
+            // Tab titles (the unsaved marker) are drawn by the dock.
+            this.dock.update(cx, |_, cx| cx.notify());
+        });
+        self.subscriptions.push(events);
+        self.add_center_panel(&editor, window, cx);
+        self.editors.push(editor);
+    }
+
+    /// Shows `path`'s changes against source control. `text` is the current
+    /// content when it differs from disk (an unsaved editor); otherwise the
+    /// file is read.
+    fn show_diff(
+        &mut self,
+        path: PathBuf,
+        text: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.under_scm {
+            self.error = Some(format!(
+                "{} isn't in a {} working copy, so there's nothing to diff against.",
+                path.display(),
+                cx.global::<Services>().scm.name()
+            ));
+            cx.notify();
+            return;
+        }
+        let scm = cx.global::<Services>().scm.clone();
+        let against = format!("against BASE ({})", scm.name());
+        let file = path.clone();
+        let diff = cx.background_executor().spawn(async move {
+            let text = match text {
+                Some(text) => text,
+                None => editor_panel::read_text(&file)?,
+            };
+            usecases::diff_against_base(scm.as_ref(), &file, &text).map_err(|e| e.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let diff = diff.await;
+            let _ = this.update_in(cx, |this, window, cx| match diff {
+                Ok(diff) => this.present_diff(path, against, diff, window, cx),
+                Err(e) => {
+                    this.error = Some(e);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn present_diff(
+        &mut self,
+        path: PathBuf,
+        against: String,
+        diff: FileDiff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = self
+            .diffs
+            .iter()
+            .find(|d| d.read(cx).path() == path)
+            .cloned()
+        {
+            panel.update(cx, |panel, cx| panel.set_diff(diff, cx));
+            self.focus_panel(&panel, window, cx);
+            return;
+        }
+        let panel = cx.new(|cx| DiffPanel::new(path, against, diff, cx));
+        self.add_center_panel(&panel, window, cx);
+        self.diffs.push(panel);
+    }
+
+    fn add_center_panel<P: Panel>(
+        &mut self,
+        panel: &Entity<P>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                Arc::new(PanelHandle::new(panel.clone())),
+                DockPlacement::Center,
+                None,
+                window,
+                cx,
+            )
+        });
+        self.focus_panel(panel, window, cx);
+    }
+
+    /// Selects a panel's tab and moves keyboard focus into it.
+    fn focus_panel<P: Panel>(
+        &mut self,
+        panel: &Entity<P>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dock.update(cx, |dock, cx| {
+            dock.select_panel(PanelId::from(panel.entity_id()), window, cx)
+        });
+        let focus = panel.focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     /// Drops panels the dock no longer holds (closed from their tab).
     fn prune_closed_panels(&mut self, cx: &mut Context<Self>) {
         let dock = self.dock.read(cx);
-        let before = self.panels.len();
-        self.panels
-            .retain(|p| dock.panel(PanelId::from(p.entity_id())).is_some());
-        if self.panels.len() != before {
+        let held = |id: EntityId| dock.panel(PanelId::from(id)).is_some();
+        let before = (self.panels.len(), self.editors.len(), self.diffs.len());
+        self.panels.retain(|p| held(p.entity_id()));
+        self.editors.retain(|p| held(p.entity_id()));
+        self.diffs.retain(|p| held(p.entity_id()));
+        if (self.panels.len(), self.editors.len(), self.diffs.len()) != before {
             cx.notify();
         }
     }

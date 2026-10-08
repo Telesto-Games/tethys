@@ -3,6 +3,9 @@
 
 mod assets;
 mod build_placeholder;
+mod diff_panel;
+mod editor_panel;
+mod file_tree;
 mod keys;
 mod session_panel;
 mod terminal_view;
@@ -17,6 +20,15 @@ use gpui_kit::*;
 fn main() {
     // `tethys path\to\Game.uproject`
     let path = std::env::args_os().nth(1).map(PathBuf::from);
+
+    // GPUI draws through DirectComposition with no redirection bitmap, which
+    // screen capture tools like the Snipping Tool can't see. A plain swap chain
+    // can be captured. Set GPUI_DISABLE_DIRECT_COMPOSITION=0 to opt back in.
+    const NO_DCOMP: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
+    if std::env::var_os(NO_DCOMP).is_none() {
+        // SAFETY: first thing in main, before any threads exist.
+        unsafe { std::env::set_var(NO_DCOMP, "1") };
+    }
 
     application().with_assets(assets::AppAssets).run(move |cx| {
         gpui_kit::init(cx);
