@@ -332,3 +332,12 @@ Things learned while building M0–M3 that aren't obvious from the code.
   `state.toml` (`ConfigStore::build_configuration`). DebugGame builds with
   `Build.bat … DebugGame` and launches `Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe`.
   Installed engines ship that executable; it loads the project's `-Win64-DebugGame` modules.
+- **Docking.** Sessions (Claude and builds) are panels in a gpui-component `DockArea`
+  (`SessionPanel`), so tabs can be dragged into splits and resized. The panel owns its
+  `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. The layout
+  isn't saved yet.
+- **Agent choice.** Without an `agents.toml`, the built-in profiles are Claude Code and opencode,
+  both on the terminal adapter. "New session ▾" lists every profile and Ctrl+Shift+T starts the
+  first. For full-screen TUIs like opencode, the terminal sends mouse-wheel reports (SGR or
+  legacy) when the program enables mouse mode, and arrow keys on the alternate screen. Mouse
+  clicks aren't forwarded yet.

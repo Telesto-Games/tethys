@@ -136,7 +136,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
 }
 
-/// Configured agent profiles, falling back to the built-in Claude profile.
+/// Configured agent profiles, falling back to the built-ins (Claude Code, opencode).
 /// Invalid profiles are dropped and reported.
 pub fn agent_profiles(config: &dyn ConfigStore) -> (Vec<AgentProfile>, Vec<String>) {
     let mut problems = Vec::new();
@@ -155,7 +155,7 @@ pub fn agent_profiles(config: &dyn ConfigStore) -> (Vec<AgentProfile>, Vec<Strin
         })
         .collect();
     if profiles.is_empty() {
-        profiles.push(AgentProfile::claude());
+        profiles = AgentProfile::builtins();
     }
     (profiles, problems)
 }
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn profiles_fall_back_to_claude_and_drop_invalid() {
+    fn profiles_fall_back_to_builtins_and_drop_invalid() {
         let mut bad = AgentProfile::claude();
         bad.adapter = AdapterKind::Acp;
         let config = FakeConfig {
@@ -336,7 +336,8 @@ mod tests {
             ..Default::default()
         };
         let (profiles, problems) = agent_profiles(&config);
-        assert_eq!(profiles, [AgentProfile::claude()]);
+        assert_eq!(profiles, AgentProfile::builtins());
+        assert_eq!(profiles[0], AgentProfile::claude());
         assert_eq!(problems.len(), 1);
     }
 

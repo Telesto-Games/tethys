@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::dock::{
+    DockArea, DockEvent, DockPlacement, DockSkin, PanelHandle, PanelId, PanelStyle,
+};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -20,7 +23,7 @@ use tethys_core::unreal::Configuration;
 use tethys_core::usecases::RecentProject;
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
-use crate::terminal_view::TerminalView;
+use crate::session_panel::{SessionKind, SessionPanel};
 
 gpui_kit::actions!(
     tethys,
@@ -92,59 +95,22 @@ pub fn open_window(path: Option<PathBuf>, cx: &mut App) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TabKind {
-    Agent,
-    Build,
-}
-
-struct SessionTab {
-    id: SessionId,
-    kind: TabKind,
-    /// Fallback label, e.g. "Claude Code 2" or "Build GameEditor".
-    label: String,
-    /// Title set by the agent through escape codes. Ignored for builds.
-    title: String,
-    exit_code: Option<i32>,
-    /// Dropping this stops the process and its tree.
-    _session: Box<dyn AgentSession>,
-    view: Entity<TerminalView>,
-}
-
-impl SessionTab {
-    fn tab_label(&self) -> String {
-        if self.kind == TabKind::Build {
-            return match self.exit_code {
-                None => format!("{} …", self.label),
-                Some(0) => format!("{} ✓", self.label),
-                Some(code) => format!("{} ✗ ({code})", self.label),
-            };
-        }
-        let name = if self.title.trim().is_empty() {
-            &self.label
-        } else {
-            &self.title
-        };
-        match self.exit_code {
-            Some(code) => format!("{name} (exited {code})"),
-            None => name.clone(),
-        }
-    }
-}
-
 pub struct Workspace {
     project: Option<Project>,
     error: Option<String>,
     recent: Vec<RecentProject>,
     profiles: Vec<AgentProfile>,
-    sessions: Vec<SessionTab>,
-    active: usize,
+    /// Session panels in the order they were opened. The dock decides where
+    /// they are shown; panels closed from the dock are pruned on layout change.
+    panels: Vec<Entity<SessionPanel>>,
+    dock: Entity<DockArea>,
     sessions_started: usize,
     /// Configuration for builds and editor launches; saved when changed.
     configuration: Configuration,
     events: UnboundedSender<(SessionId, SessionEvent)>,
     focus: FocusHandle,
     _events: Task<()>,
+    _dock_events: Subscription,
 }
 
 impl Workspace {
@@ -161,6 +127,15 @@ impl Workspace {
             }
         });
 
+        let (dock, skin) = DockSkin::dock_area("sessions", None, window, cx);
+        skin.set_panel_style(PanelStyle::TabBar, cx);
+        skin.set_close_button_visible(true, cx);
+        let dock_events = cx.subscribe(&dock, |this, _, event: &DockEvent, cx| {
+            if let DockEvent::LayoutChanged = event {
+                this.prune_closed_panels(cx);
+            }
+        });
+
         let services = cx.global::<Services>();
         let recent = usecases::recent_projects(&services.config, &services.locator);
         let (profiles, problems) = usecases::agent_profiles(&services.config);
@@ -169,7 +144,11 @@ impl Workspace {
         // Stop sessions as the window closes, so quitting can wait for them.
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
-            let _ = this.update(cx, |this, _| this.sessions.clear());
+            let _ = this.update(cx, |this, cx| {
+                for panel in this.panels.drain(..) {
+                    panel.update(cx, |panel, _| panel.stop());
+                }
+            });
             true
         });
 
@@ -180,13 +159,14 @@ impl Workspace {
             error: (!problems.is_empty()).then(|| problems.join("\n")),
             recent,
             profiles,
-            sessions: Vec::new(),
-            active: 0,
+            panels: Vec::new(),
+            dock,
             sessions_started: 0,
             configuration,
             events: tx,
             focus,
             _events: events,
+            _dock_events: dock_events,
         };
         if let Some(path) = path {
             this.open(path, window, cx);
@@ -252,15 +232,21 @@ impl Workspace {
         .detach();
     }
 
+    /// Starts the default (first) agent profile.
     fn new_session(&mut self, _: &NewSession, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(profile) = self.profiles.first().cloned() else {
+        self.start_agent(0, window, cx);
+    }
+
+    /// Starts the agent profile at `index` in a new tab.
+    fn start_agent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.get(index).cloned() else {
             return;
         };
         self.sessions_started += 1;
         let label = format!("{} {}", profile.name, self.sessions_started);
         self.start_tab(
             label,
-            TabKind::Agent,
+            SessionKind::Agent,
             window,
             cx,
             |host, id, project, sink| {
@@ -275,11 +261,10 @@ impl Workspace {
             return;
         };
         // One build at a time: focus the running one instead.
-        if let Some(i) = self
-            .sessions
-            .iter()
-            .position(|t| t.kind == TabKind::Build && t.exit_code.is_none())
-        {
+        if let Some(i) = self.panels.iter().position(|p| {
+            let p = p.read(cx);
+            p.kind() == SessionKind::Build && p.is_running()
+        }) {
             self.activate(i, window, cx);
             return;
         }
@@ -291,7 +276,7 @@ impl Workspace {
         );
         self.start_tab(
             label,
-            TabKind::Build,
+            SessionKind::Build,
             window,
             cx,
             |host, id, project, sink| {
@@ -323,11 +308,11 @@ impl Workspace {
         }
     }
 
-    /// Starts a terminal session with `start` and shows it in a new tab.
+    /// Starts a terminal session with `start` and adds it to the dock.
     fn start_tab(
         &mut self,
         label: String,
-        kind: TabKind,
+        kind: SessionKind,
         window: &mut Window,
         cx: &mut Context<Self>,
         start: impl FnOnce(
@@ -354,69 +339,99 @@ impl Workspace {
                     self.error = Some("terminal host lost the session".into());
                     return;
                 };
-                let view = cx.new(|cx| TerminalView::new(handle, cx));
-                self.sessions.push(SessionTab {
-                    id,
-                    kind,
-                    label,
-                    title: String::new(),
-                    exit_code: None,
-                    _session: session,
-                    view,
+                let panel = cx.new(|cx| SessionPanel::new(id, kind, label, session, handle, cx));
+                self.dock.update(cx, |dock, cx| {
+                    dock.add_panel_view(
+                        Arc::new(PanelHandle::new(panel.clone())),
+                        DockPlacement::Center,
+                        None,
+                        window,
+                        cx,
+                    )
                 });
-                self.activate(self.sessions.len() - 1, window, cx);
+                self.panels.push(panel);
+                self.activate(self.panels.len() - 1, window, cx);
             }
             Err(e) => self.error = Some(e),
         }
         cx.notify();
     }
 
-    fn close_session(&mut self, _: &CloseSession, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sessions.is_empty() {
-            return;
+    /// Drops panels the dock no longer holds (closed from their tab).
+    fn prune_closed_panels(&mut self, cx: &mut Context<Self>) {
+        let dock = self.dock.read(cx);
+        let before = self.panels.len();
+        self.panels
+            .retain(|p| dock.panel(PanelId::from(p.entity_id())).is_some());
+        if self.panels.len() != before {
+            cx.notify();
         }
-        self.sessions.remove(self.active);
-        if self.sessions.is_empty() {
-            self.active = 0;
+    }
+
+    /// The panel holding keyboard focus, if any.
+    fn focused_panel(&self, window: &Window, cx: &App) -> Option<usize> {
+        self.panels
+            .iter()
+            .position(|p| p.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    fn close_session(&mut self, _: &CloseSession, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .focused_panel(window, cx)
+            .or(self.panels.len().checked_sub(1))
+        else {
+            return;
+        };
+        let panel = self.panels.remove(index);
+        self.dock
+            .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        if self.panels.is_empty() {
             window.focus(&self.focus, cx);
         } else {
-            self.activate(self.active.min(self.sessions.len() - 1), window, cx);
+            self.activate(index.min(self.panels.len() - 1), window, cx);
         }
         cx.notify();
     }
 
     fn next_session(&mut self, _: &NextSession, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.sessions.is_empty() {
-            self.activate((self.active + 1) % self.sessions.len(), window, cx);
+        if !self.panels.is_empty() {
+            let next = self.focused_panel(window, cx).map_or(0, |i| i + 1);
+            self.activate(next % self.panels.len(), window, cx);
         }
     }
 
     fn prev_session(&mut self, _: &PrevSession, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.sessions.is_empty() {
-            let n = self.sessions.len();
-            self.activate((self.active + n - 1) % n, window, cx);
+        if !self.panels.is_empty() {
+            let n = self.panels.len();
+            let prev = self.focused_panel(window, cx).map_or(n - 1, |i| i + n - 1);
+            self.activate(prev % n, window, cx);
         }
     }
 
+    /// Shows a panel in its tab group and focuses it.
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.active = index;
-        if let Some(tab) = self.sessions.get(index) {
-            let focus = tab.view.read(cx).focus_handle().clone();
-            window.focus(&focus, cx);
-        }
+        let Some(panel) = self.panels.get(index).cloned() else {
+            return;
+        };
+        self.dock.update(cx, |dock, cx| {
+            dock.select_panel(PanelId::from(panel.entity_id()), window, cx)
+        });
+        let focus = panel.focus_handle(cx);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
     fn on_session_event(&mut self, id: SessionId, event: SessionEvent, cx: &mut Context<Self>) {
-        let Some(tab) = self.sessions.iter_mut().find(|t| t.id == id) else {
+        let Some(panel) = self.panels.iter().find(|p| p.read(cx).id() == id).cloned() else {
             return;
         };
         match event {
-            SessionEvent::TitleChanged(title) => tab.title = title,
-            SessionEvent::Exited(code) => tab.exit_code = Some(code),
+            SessionEvent::TitleChanged(title) => panel.update(cx, |p, cx| p.set_title(title, cx)),
+            SessionEvent::Exited(code) => panel.update(cx, |p, cx| p.set_exited(code, cx)),
             SessionEvent::Started | SessionEvent::Bell => return,
         }
-        cx.notify();
+        // Tab titles are drawn by the dock.
+        self.dock.update(cx, |_, cx| cx.notify());
     }
 
     fn render_error(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -579,9 +594,9 @@ impl Workspace {
         let header = div()
             .flex()
             .items_center()
-            .gap_4()
-            .px_3()
-            .py_2()
+            .gap_2()
+            .px_4()
+            .py_3()
             .border_b_1()
             .border_color(theme.border)
             .child(
@@ -634,7 +649,12 @@ impl Workspace {
             .child(
                 div()
                     .flex()
-                    .gap_1()
+                    .gap_0p5()
+                    .p_0p5()
+                    .rounded(theme.radius)
+                    .bg(theme.muted)
+                    .border_1()
+                    .border_color(theme.border)
                     .children(Configuration::ALL.map(|configuration| {
                         let button = Button::new(configuration.as_str())
                             .small()
@@ -671,15 +691,26 @@ impl Workspace {
             .child(
                 Button::new("new-session")
                     .small()
-                    .label("New session")
-                    .tooltip("New session (Ctrl+Shift+T)")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.new_session(&NewSession, window, cx)
-                        }),
-                    ),
+                    .label("New session ▾")
+                    .tooltip("Pick an agent (Ctrl+Shift+T starts the first)")
+                    .dropdown_menu({
+                        let this = cx.entity().downgrade();
+                        let names: Vec<String> =
+                            self.profiles.iter().map(|p| p.name.clone()).collect();
+                        move |menu, _, _| {
+                            names.iter().enumerate().fold(menu, |menu, (i, name)| {
+                                let this = this.clone();
+                                menu.item(PopupMenuItem::new(name.clone()).on_click(
+                                    move |_, window, cx| {
+                                        let _ = this
+                                            .update(cx, |this, cx| this.start_agent(i, window, cx));
+                                    },
+                                ))
+                            })
+                        }
+                    }),
             )
-            .when(!self.sessions.is_empty(), |d| {
+            .when(!self.panels.is_empty(), |d| {
                 d.child(
                     Button::new("close-session")
                         .small()
@@ -692,15 +723,17 @@ impl Workspace {
                 )
             });
 
-        let body = match self.sessions.get(self.active) {
-            Some(tab) => div().flex_1().min_h_0().child(tab.view.clone()),
-            None => div()
+        let body = if self.panels.is_empty() {
+            div()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_color(theme.muted_foreground)
-                .child("No sessions. Press Ctrl+Shift+T to start one."),
+                .child("No sessions. Press Ctrl+Shift+T to start one.")
+        } else {
+            // Drag a tab to an edge of a pane to split, or onto another tab bar to move it.
+            div().flex_1().min_h_0().child(self.dock.clone())
         };
 
         div()
@@ -709,20 +742,6 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(header)
-            .when(!self.sessions.is_empty(), |d| {
-                d.child(
-                    TabBar::new("sessions")
-                        .selected_index(self.active)
-                        .on_click(cx.listener(|this, index: &usize, window, cx| {
-                            this.activate(*index, window, cx)
-                        }))
-                        .children(
-                            self.sessions
-                                .iter()
-                                .map(|tab| Tab::new().label(tab.tab_label())),
-                        ),
-                )
-            })
             .child(body)
     }
 }

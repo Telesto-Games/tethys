@@ -2,13 +2,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod keys;
+mod session_panel;
 mod terminal_view;
+mod theme;
 mod workspace;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
 fn main() {
@@ -17,7 +18,7 @@ fn main() {
 
     application().run(move |cx| {
         gpui_kit::init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
+        theme::apply(cx);
         cx.set_global(workspace::Services::new());
         cx.bind_keys(workspace::key_bindings());
 

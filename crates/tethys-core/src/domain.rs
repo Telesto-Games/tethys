@@ -158,7 +158,7 @@ pub struct AgentProfile {
 }
 
 impl AgentProfile {
-    /// The built-in Claude Code profile, used when no config exists.
+    /// The built-in Claude Code profile.
     pub fn claude() -> AgentProfile {
         AgentProfile {
             id: "claude".into(),
@@ -167,6 +167,22 @@ impl AgentProfile {
             command: "claude".into(),
             args: vec![],
         }
+    }
+
+    /// The built-in opencode profile, running its own TUI.
+    pub fn opencode() -> AgentProfile {
+        AgentProfile {
+            id: "opencode".into(),
+            name: "opencode".into(),
+            adapter: AdapterKind::Terminal,
+            command: "opencode".into(),
+            args: vec![],
+        }
+    }
+
+    /// The profiles offered when no config exists. The first is the default.
+    pub fn builtins() -> Vec<AgentProfile> {
+        vec![AgentProfile::claude(), AgentProfile::opencode()]
     }
 
     /// Rejects profiles that would run Claude over ACP.

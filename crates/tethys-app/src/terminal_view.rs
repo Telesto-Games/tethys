@@ -20,9 +20,9 @@ const FONT_SIZE: f32 = 14.;
 const LINE_HEIGHT: f32 = 1.3;
 const PADDING: f32 = 6.;
 const SELECTION: Rgb = Rgb {
-    r: 0x3e,
-    g: 0x44,
-    b: 0x51,
+    r: 0x26,
+    g: 0x4f,
+    b: 0x78,
 };
 
 pub struct TerminalView {
@@ -205,11 +205,37 @@ impl TerminalView {
         let line_height = self.metrics.get().line_height;
         self.scroll_lines += event.delta.pixel_delta(line_height).y / line_height;
         let lines = self.scroll_lines.trunc();
-        if lines != 0. {
-            self.scroll_lines -= lines;
-            self.handle.scroll(lines as i32);
-            cx.notify();
+        if lines == 0. {
+            return;
         }
+        self.scroll_lines -= lines;
+        let up = lines > 0.;
+        let count = lines.abs() as usize;
+
+        let mode = *self.handle.term().lock().mode();
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            // Full-screen TUIs (opencode) ask for mouse reports: send wheel events.
+            let (point, _) = self.grid_point(event.position);
+            let report = wheel_report(
+                up,
+                point.column.0 + 1,
+                point.line.0.max(0) as usize + 1,
+                mode.contains(TermMode::SGR_MOUSE),
+            );
+            self.handle.write(report.repeat(count));
+        } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+            // The alternate screen has no history; programs expect arrow keys.
+            let arrow: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            self.handle.write(arrow.repeat(count));
+        } else {
+            self.handle.scroll(lines as i32);
+        }
+        cx.notify();
     }
 }
 
@@ -553,5 +579,32 @@ fn block_rects(c: char) -> Option<(&'static [Rect], f32)> {
         '\u{259E}' => solid(&[UR, LL]),
         '\u{259F}' => solid(&[UR, LL, LR]),
         _ => None,
+    }
+}
+
+/// An xterm mouse wheel report at 1-based `col`/`row`: SGR (`ESC [ < 64 ; c ; r M`)
+/// when the program enabled it, otherwise the legacy `ESC [ M` byte encoding.
+fn wheel_report(up: bool, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+    let button = if up { 64 } else { 65 };
+    if sgr {
+        return format!("\x1b[<{button};{col};{row}M").into_bytes();
+    }
+    // Legacy encoding offsets by 32 and can't go past 223.
+    let enc = |v: usize| (32 + v.min(223)) as u8;
+    vec![0x1b, b'[', b'M', enc(button), enc(col), enc(row)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wheel_report;
+
+    #[test]
+    fn wheel_reports() {
+        assert_eq!(wheel_report(true, 3, 7, true), b"\x1b[<64;3;7M");
+        assert_eq!(wheel_report(false, 1, 1, true), b"\x1b[<65;1;1M");
+        assert_eq!(
+            wheel_report(true, 1, 2, false),
+            [0x1b, b'[', b'M', 96, 33, 34]
+        );
     }
 }

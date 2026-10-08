@@ -19,12 +19,13 @@ cargo build --release                  # target\release\tethys.exe, no console w
 |---|---|
 | Open a project | Start `tethys.exe` with no argument for the project browser (picker + recent projects), or pass a `.uproject`. Also **Ctrl+Shift+O**, or drop a `.uproject` on the window |
 | Project browser from a project | **Ctrl+Shift+P** opens it in a new window |
-| New Claude session | **Ctrl+Shift+T** |
+| New agent session | **New session ▾** → Claude Code or opencode. **Ctrl+Shift+T** starts the first (Claude Code) |
 | Close session | **Ctrl+Shift+W** |
 | Pick the build configuration | **Development** / **DebugGame** toggle in the project header (remembered between runs) |
 | Build the editor target | **Ctrl+Shift+B**: runs `Build.bat <Project>Editor Win64 <Configuration>` in a tab (✓ or ✗ when done) |
 | Launch the Unreal Editor | **Ctrl+Shift+E**: starts `UnrealEditor.exe` (or `UnrealEditor-Win64-DebugGame.exe`) on the project, independent of Tethys |
 | Switch session | **Ctrl+Tab** / **Ctrl+Shift+Tab**, or click the tab |
+| Arrange sessions side by side | Drag a tab onto the edge of a pane to split it, or onto another tab bar to move it. Drag the divider to resize; close a tab with its × |
 | Copy | Drag to select, then **Ctrl+C** (or Ctrl+Shift+C) |
 | Paste | **Ctrl+V** or right-click |
 
@@ -32,7 +33,7 @@ Every other key goes straight to the agent.
 
 ## Configuration
 
-Optional. Without it, Tethys runs `claude` from `PATH`.
+Optional. Without it, Tethys offers Claude Code (`claude`) and opencode (`opencode`), both from `PATH`.
 
 `%APPDATA%\tethys\agents.toml`:
 
@@ -45,5 +46,5 @@ command = "claude"
 args = []
 ```
 
-The first profile is used for new sessions. Tethys keeps recent projects in
+Profiles appear in the New session menu; the first is the Ctrl+Shift+T default. opencode installs with `npm i -g opencode-ai`. Tethys keeps recent projects in
 `%APPDATA%\tethys\state.toml`.

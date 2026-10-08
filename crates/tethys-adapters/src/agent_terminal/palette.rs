@@ -32,7 +32,7 @@ const BASE: [Rgb; 16] = [
 ];
 
 pub const FOREGROUND: Rgb = rgb(0xdcdfe4);
-pub const BACKGROUND: Rgb = rgb(0x1e2127);
+pub const BACKGROUND: Rgb = rgb(0x16191f);
 pub const CURSOR: Rgb = rgb(0x74ade8);
 
 /// The default colour for a palette index (0..269, see `NamedColor`).
