@@ -1,0 +1,18 @@
+[package]
+name = "tethys-app"
+description = "Tethys GPUI application: composition root and views."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tethys"
+path = "src/main.rs"
+
+[dependencies]
+tethys-core.workspace = true
+tethys-adapters.workspace = true
+gpui-kit.workspace = true
+rfd.workspace = true
+futures.workspace = true

@@ -1,6 +1,6 @@
 # Tethys — High-Level Design
 
-> Status: **draft** · 2026-10-08
+> Status: **M0–M3 implemented** · 2026-10-08 (see [Implementation notes](#implementation-notes))
 
 Tethys is a small, native, LLM-first IDE for Telesto Games' Unreal Engine projects.
 It is **not** a general-purpose IDE. Everything it does starts from a `.uproject`.
@@ -102,8 +102,8 @@ All versions checked on crates.io on 2026-10-08.
   solves this by pinning `gpui-pre`, Longbridge's republished build of upstream GPUI
   (0.3.8 as of 2026-10-05). We lock `gpui-kit` to an exact version.
 - **Fallback:** if GPUI's churn hurts too much, egui + `egui_term` is the plan B. The UI layer
-  will be thin enough to swap. The M0 spike (see [Milestones](#milestones)) is where we find
-  out: **if a terminal grid isn't rendering in GPUI on Windows after two days, switch to egui.**
+  will be thin enough to swap. **Result:** the M0 spike worked first time (an alacritty grid
+  drawn by GPUI, running `claude` through ConPTY on Windows), so the fallback isn't needed.
 
 ### Why not C++
 
@@ -162,22 +162,27 @@ composition root in `tethys-app` registers the available hosts. The core rejects
 so that rule lives in the domain and not in the UI.
 
 ```rust
-// tethys-core::ports (sketch)
+// tethys-core::ports
+pub type EventSink = Arc<dyn Fn(SessionId, SessionEvent) + Send + Sync>;
+
 pub trait AgentHost {
     fn kind(&self) -> AdapterKind;                       // Terminal | Acp
-    fn start(&self, profile: &AgentProfile, project: &Project,
-             events: Sender<SessionEvent>) -> Result<Box<dyn AgentSession>>;
+    fn start(&self, id: SessionId, profile: &AgentProfile, project: &Project,
+             events: EventSink) -> PortResult<Box<dyn AgentSession>>;
 }
 
-pub trait AgentSession: Send {
+pub trait AgentSession: Send {                           // dropping it stops the agent
+    fn id(&self) -> SessionId;
     fn status(&self) -> SessionStatus;                   // Starting | Running | Exited(code)
-    fn stop(&mut self) -> Result<()>;
+    fn stop(&mut self) -> PortResult<()>;
 }
 
 pub enum SessionEvent { Started, TitleChanged(String), Bell, Exited(i32) }
 ```
 
-Sessions **push** events through the channel the core hands them. The UI doesn't poll.
+Sessions **push** events through the sink the core hands them, from any thread. The UI doesn't
+poll. The sink is a callback rather than a channel so the core doesn't pick a channel type; the
+app forwards it into its own async channel.
 
 **Rendering a session.** The terminal adapter's output is a character grid. A future ACP
 adapter's output is structured chat. These are different enough that pushing both through one
@@ -191,7 +196,8 @@ but the GPUI terminal view needs it to draw cells. `tethys-app` is the compositi
 allowed to depend on `tethys-adapters` directly. The terminal adapter exposes a concrete
 `TerminalHandle` alongside its `AgentHost` impl. The app creates the adapter, gives the core the
 trait object, and keeps the concrete handle for the view. Nobody downcasts and no alacritty type
-leaks into `tethys-core`.
+leaks into `tethys-core`. Concretely, the app starts a session through the core, then calls
+`TerminalHost::take_handle(id)` on its own concrete host to get the handle for that session.
 
 ### Crate layout
 
@@ -264,6 +270,14 @@ M1 is built on top of it.
 | **M2** | One Claude Code session in a terminal pane, started in the project root | Run a real task with `claude` inside Tethys, end to end |
 | **M3** | Several sessions as tabs. Remember recent projects. | Two Claude sessions on one project at once |
 
+**Status (2026-10-08):** M0–M3 are implemented. There was no separate throwaway spike: the
+terminal view was written properly from the start, since the spike worked first time.
+Tested by hand so far: opening ArcadeDemo (from the CLI argument and from the recent list),
+the engine resolving to `C:\Engines\UE_5.8`, Claude starting in the project root and rendering, typing,
+a clear error for a broken `.uproject`, and Claude exiting cleanly when the window closes.
+Still to test by hand: the file dialog, drag-and-drop, two sessions at once, copy/paste, and a
+full real task.
+
 **Candidates after M3, in no fixed order and only when needed:** opencode profile
 (terminal); `agent_acp` adapter + chat view for opencode; an agent picker for new sessions; Explorer "Open with Tethys"; buttons to build or launch the
 editor (UBT / `UnrealEditor.exe`); feeding project context (modules, plugins, engine path) to
@@ -273,10 +287,48 @@ the agent; a read-only file viewer.
 
 - Is Windows the only target for now? (We assume yes, but GPUI keeps macOS and Linux possible.)
 - Do sessions need to survive an IDE restart (`claude --resume`), or are fresh sessions fine for the MVP?
-- What happens to running sessions when Tethys closes: kill them (the Job Object default), or warn first?
+- ~~What happens to running sessions when Tethys closes?~~ Closing a tab or window closes the
+  agent's console first (Windows sends it `CTRL_CLOSE_EVENT`, so it can clean up), then kills
+  whatever is still in its Job Object after 3 seconds. Tethys waits for this before quitting.
+  There's no warning yet.
 - Should Tethys inject anything into the agent at startup (e.g. a Tethys-specific `CLAUDE.md` or MCP server), or leave the project's own config alone?
 
 ## Prerequisites
 
 - Rust stable (MSVC target) via rustup.
 - Rust needs the MSVC linker. The Visual Studio C++ toolchain that UE development needs should already provide it.
+
+## Implementation notes
+
+Things learned while building M0–M3 that aren't obvious from the code.
+
+- **Stopping agents gently.** A hard kill (`TerminateJobObject`, or `taskkill /F`) makes Claude
+  Code think its fullscreen renderer crashed, so the next launch falls back to the classic
+  renderer. `TerminalSession::stop` closes the ConPTY first and only kills the job after a grace
+  period.
+- **Block characters** (U+2580–U+259F, e.g. Claude's logo) are drawn as rectangles, not font
+  glyphs, so they tile without gaps at our line height.
+- **Grid alignment.** Each run of same-styled cells is shaped with `force_width` set to the cell
+  width and painted at its column. Wide characters get their own run.
+- **Command resolution.** CreateProcess only finds `.exe` files. The adapter searches `PATH` with
+  `PATHEXT` itself and runs `.cmd`/`.bat` shims through `cmd /d /s /c`.
+- **Environment.** Sessions inherit Tethys's environment plus `TERM=xterm-256color` and
+  `COLORTERM=truecolor`. If Tethys is launched from inside a Claude Code session, the child Claude
+  inherits its `CLAUDE_CODE_*` markers and warns that transcript saving is off. Launch Tethys from
+  Explorer or a plain terminal.
+- **Keys.** Ctrl+Shift+… is reserved for Tethys (O open, T new session, W close session) and
+  Ctrl+Tab / Ctrl+Shift+Tab switch tabs. Everything else goes to the agent. Ctrl+C copies when
+  there's a selection; Ctrl+V pastes text, or sends `^V` when the clipboard has no text so Claude
+  can paste images. Shift+Enter sends `ESC CR` (a newline in Claude Code). Right-click pastes.
+- **Windows.** One project per window. Opening a second project opens a second window.
+- **Build and launch (post-M3).** `tethys-core::unreal` builds the command lines as pure
+  functions. A build runs `Build.bat <Target> Win64 Development -Project=… -WaitMutex` as a
+  terminal session through the same `AgentHost`, so UBT output is live and the exit code marks
+  the tab ✓/✗. Only one build runs at a time. The editor target is `<Name>Editor` if
+  `Source/<Name>Editor.Target.cs` exists, otherwise the first `*Editor` target. The editor
+  starts through a new `ProcessLauncher` port as a detached process, outside any Job Object, so
+  it outlives Tethys.
+- **Build configuration.** Development or DebugGame, picked in the project header and saved in
+  `state.toml` (`ConfigStore::build_configuration`). DebugGame builds with
+  `Build.bat … DebugGame` and launches `Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe`.
+  Installed engines ship that executable; it loads the project's `-Win64-DebugGame` modules.
