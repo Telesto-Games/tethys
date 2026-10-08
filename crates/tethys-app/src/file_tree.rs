@@ -86,10 +86,10 @@ impl FileTreePanel {
         let line = || div().text_xs().truncate().text_color(muted);
         let (provider, ok, lines): (String, bool, Vec<String>) = match &self.scm {
             None => ("Source control".into(), true, vec!["Checking…".into()]),
-            Some(ScmSummary::NotUnderControl { provider }) => (
+            Some(ScmSummary::NotUnderControl { providers }) => (
                 "No source control".into(),
                 false,
-                vec![format!("Not a {provider} working copy")],
+                vec![format!("Not a {} working copy", providers.join(" or "))],
             ),
             Some(ScmSummary::Failed { provider, error }) => {
                 ((*provider).into(), false, vec![error.clone()])
@@ -100,8 +100,9 @@ impl FileTreePanel {
                     // ISO date to "2026-10-06".
                     let when = last.date.get(..10).unwrap_or(&last.date);
                     lines.push(format!(
-                        "changed r{} · {} · {when}",
-                        last.revision, last.author
+                        "changed {} · {} · {when}",
+                        revision_label(&last.revision),
+                        last.author
                     ));
                 }
                 let mut title = (*provider).to_string();
@@ -109,7 +110,7 @@ impl FileTreePanel {
                     title.push_str(&format!("  {branch}"));
                 }
                 if let Some(rev) = &info.revision {
-                    title.push_str(&format!("  r{rev}"));
+                    title.push_str(&format!("  {}", revision_label(rev)));
                 }
                 (title, true, lines)
             }
@@ -355,6 +356,15 @@ pub fn change_color(kind: ChangeKind) -> Hsla {
         ChangeKind::Added => rgb(0x98c379).into(),
         ChangeKind::Deleted | ChangeKind::Missing | ChangeKind::Conflicted => rgb(0xe06c75).into(),
         ChangeKind::Unversioned => rgb(0x6b7280).into(),
+    }
+}
+
+/// SVN revision numbers read as `r712`; git hashes as they are.
+fn revision_label(rev: &str) -> String {
+    if rev.bytes().all(|b| b.is_ascii_digit()) {
+        format!("r{rev}")
+    } else {
+        rev.to_string()
     }
 }
 

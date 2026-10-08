@@ -21,11 +21,12 @@ use tethys_adapters::agent_terminal::TerminalHost;
 use tethys_adapters::config_toml::TomlConfigStore;
 use tethys_adapters::engine_registry::RegistryEngineLocator;
 use tethys_adapters::process_launcher::DetachedLauncher;
+use tethys_adapters::scm_git::Git;
 use tethys_adapters::scm_svn::Subversion;
 use tethys_core::diff::FileDiff;
 use tethys_core::ports::{AgentSession, ConfigStore, EventSink, SessionEvent, SourceControl};
 use tethys_core::unreal::Configuration;
-use tethys_core::usecases::RecentProject;
+use tethys_core::usecases::{RecentProject, ScmSummary};
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
 use crate::build_placeholder::BuildPlaceholder;
@@ -104,7 +105,8 @@ pub struct Services {
     pub host: TerminalHost,
     pub config: TomlConfigStore,
     pub locator: RegistryEngineLocator,
-    pub scm: Arc<dyn SourceControl>,
+    /// Every source control Tethys knows; each project uses the one managing it.
+    pub scms: Vec<Arc<dyn SourceControl>>,
     next_session: AtomicU64,
 }
 
@@ -114,7 +116,7 @@ impl Services {
             host: TerminalHost::new(),
             config: TomlConfigStore::user_default(),
             locator: RegistryEngineLocator,
-            scm: Arc::new(Subversion::new()),
+            scms: vec![Arc::new(Git::new()), Arc::new(Subversion::new())],
             next_session: AtomicU64::new(1),
         }
     }
@@ -166,8 +168,8 @@ pub struct Workspace {
     file_tree: Option<Entity<FileTreePanel>>,
     editors: Vec<Entity<EditorPanel>>,
     diffs: Vec<Entity<DiffPanel>>,
-    /// Whether the project folder is a working copy of `Services::scm`.
-    under_scm: bool,
+    /// The source control managing the project folder, if any.
+    scm: Option<Arc<dyn SourceControl>>,
     subscriptions: Vec<Subscription>,
 }
 
@@ -232,7 +234,7 @@ impl Workspace {
             file_tree: None,
             editors: Vec::new(),
             diffs: Vec::new(),
-            under_scm: false,
+            scm: None,
             subscriptions: Vec::new(),
         };
         if let Some(path) = path {
@@ -510,7 +512,7 @@ impl Workspace {
             return;
         };
         let root = project.root().to_path_buf();
-        self.under_scm = cx.global::<Services>().scm.is_working_copy(&root);
+        self.scm = usecases::detect_source_control(&cx.global::<Services>().scms, &root);
 
         let tree = cx.new(|cx| FileTreePanel::new(root, cx));
         let events = cx.subscribe_in(&tree, window, |this, _, event, window, cx| match event {
@@ -552,14 +554,23 @@ impl Workspace {
         let (Some(project), Some(tree)) = (self.project.as_ref(), self.file_tree.clone()) else {
             return;
         };
-        let scm = cx.global::<Services>().scm.clone();
+        let scm = self.scm.clone();
+        let providers = cx
+            .global::<Services>()
+            .scms
+            .iter()
+            .map(|s| s.name())
+            .collect();
         let root = project.root().to_path_buf();
-        let under_scm = self.under_scm;
         // Summary (footer) and file status (colours) together, off the UI thread.
         let loaded = cx.background_executor().spawn(async move {
-            let summary = usecases::scm_summary(scm.as_ref(), &root);
-            let status = under_scm.then(|| usecases::working_copy_status(scm.as_ref(), &root));
-            (summary, status)
+            match scm {
+                Some(scm) => (
+                    usecases::scm_summary(scm.as_ref(), &root),
+                    Some(usecases::working_copy_status(scm.as_ref(), &root)),
+                ),
+                None => (ScmSummary::NotUnderControl { providers }, None),
+            }
         });
         cx.spawn(async move |this, cx| {
             let (summary, status) = loaded.await;
@@ -626,17 +637,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.under_scm {
+        let Some(scm) = self.scm.clone() else {
             self.error = Some(format!(
-                "{} isn't in a {} working copy, so there's nothing to diff against.",
+                "{} isn't under source control, so there's nothing to diff against.",
                 path.display(),
-                cx.global::<Services>().scm.name()
             ));
             cx.notify();
             return;
-        }
-        let scm = cx.global::<Services>().scm.clone();
-        let against = format!("against BASE ({})", scm.name());
+        };
+        let against = format!("against {} ({})", scm.base_label(), scm.name());
         let file = path.clone();
         let diff = cx.background_executor().spawn(async move {
             let text = match text {

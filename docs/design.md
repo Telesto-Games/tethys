@@ -351,18 +351,25 @@ Things learned while building M0–M3 that aren't obvious from the code.
   and agents open in the center. Before the first build, and after the last build tab closes, it
   holds a `BuildPlaceholder` that can't be closed. Starting a build closes finished build tabs, so
   the pane shows the latest log.
-- **Files, editor and diff.** A `SourceControl` port (`is_working_copy`, `status`, `base_text`)
+- **Files, editor and diff.** A `SourceControl` port (`working_copy_root`, `info`, `status`, `base_text`)
   with a Subversion adapter (`scm_svn`) that runs the `svn` CLI read-only: `status --xml` and
   `cat -r BASE`, which reads the pristine copy with no network access, and no console windows.
-  The core's `diff` module turns BASE and the current text into hunks (with `similar`).
-  - **Files pane:** loads folders lazily and colours them from `WorkingCopyStatus`. Its footer shows the provider and where the working copy points (`SourceControl::info`, `svn info --xml`, local only): branch, revision, URL and last change, or "No source control". An All / Changes toggle switches to a flat list of local edits (`WorkingCopyStatus::local_edits`: added, modified, replaced, conflicted). Status
+  A git adapter (`scm_git`) does the same with the `git` CLI: `status --porcelain=v2 -z`
+  limited to the project folder (which may be below the repository root), and
+  `cat-file --filters HEAD:<path>` for the base, so `core.autocrlf` line endings match the
+  working file. Every git command runs with `--no-optional-locks`, so a status refresh never
+  writes the index while an agent is using git. Each project uses whichever source control
+  manages it (`detect_source_control`: the nearest working copy root wins, git first on a tie).
+  The core's `diff` module turns the base and the current text into hunks (with `similar`).
+  - **Files pane:** loads folders lazily and colours them from `WorkingCopyStatus`. Its footer shows the provider and where the working copy points (`SourceControl::info`, local only: `svn info --xml`, or for git the branch, HEAD, the upstream or origin URL and the last commit touching the project folder): branch, revision, URL and last change, or "No source control". An All / Changes toggle switches to a flat list of local edits (`WorkingCopyStatus::local_edits`: added, modified, replaced, conflicted). Status
     refreshes on project open, after each save, and when the window regains focus.
   - **Editor:** gpui-component's code editor. That editor can't draw tab stops, so `TextCodec`
     expands tabs for display and writes unedited lines back verbatim. Line endings and BOM are
     preserved too. Every text file in a large game's `Source` (707 files) round-trips byte for
     byte (`TETHYS_ROUNDTRIP_DIR=… cargo test -- --ignored`).
-  - **Diff:** a unified diff against BASE in the main area.
-  - **Not done yet:** nothing is ever committed, reverted or updated through SVN; syntax
+  - **Diff:** a unified diff against BASE (SVN) or HEAD (git) in the main area. Git renames show
+    as the new path added and the old one deleted; the diff of a renamed file is against nothing.
+  - **Not done yet:** nothing is ever committed, reverted or updated through source control; syntax
     highlighting is the editor library's default and fairly sparse; there's no prompt for unsaved
     edits when closing the window.
 - **Visual identity.** Follows the Telesto Games brand (telesto.games):

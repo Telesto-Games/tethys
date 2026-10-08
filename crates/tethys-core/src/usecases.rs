@@ -1,6 +1,8 @@
 //! Use cases: what the app asks the core to do.
 
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::diff::{self, FileDiff};
 use crate::domain::{AdapterKind, AgentProfile, DomainError, Project, ProjectError, SessionId};
@@ -22,12 +24,29 @@ pub fn working_copy_status(
     Ok(WorkingCopyStatus::new(scm.status(root)?))
 }
 
+/// Picks the source control managing `root` from `candidates`: the one whose
+/// working copy root is nearest, so a git repository inside an SVN working
+/// copy (or the reverse) goes to the inner one. Ties go to the earlier one.
+pub fn detect_source_control(
+    candidates: &[Arc<dyn SourceControl>],
+    root: &Path,
+) -> Option<Arc<dyn SourceControl>> {
+    candidates
+        .iter()
+        .filter_map(|scm| {
+            let depth = scm.working_copy_root(root)?.components().count();
+            Some((Reverse(depth), scm))
+        })
+        .min_by_key(|(depth, _)| *depth)
+        .map(|(_, scm)| scm.clone())
+}
+
 /// What the Files pane shows about source control: the provider and where the
 /// working copy points, or why there's nothing to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScmSummary {
-    /// The project folder isn't managed by the configured source control.
-    NotUnderControl { provider: &'static str },
+    /// The project folder isn't managed by any of these source controls.
+    NotUnderControl { providers: Vec<&'static str> },
     Ready {
         provider: &'static str,
         info: WorkingCopyInfo,
@@ -42,7 +61,9 @@ pub enum ScmSummary {
 pub fn scm_summary(scm: &dyn SourceControl, root: &Path) -> ScmSummary {
     let provider = scm.name();
     if !scm.is_working_copy(root) {
-        return ScmSummary::NotUnderControl { provider };
+        return ScmSummary::NotUnderControl {
+            providers: vec![provider],
+        };
     }
     match scm.info(root) {
         Ok(info) => ScmSummary::Ready { provider, info },
@@ -557,8 +578,8 @@ mod scm_tests {
         fn name(&self) -> &'static str {
             "Fake"
         }
-        fn is_working_copy(&self, _: &Path) -> bool {
-            true
+        fn working_copy_root(&self, dir: &Path) -> Option<PathBuf> {
+            Some(dir.to_path_buf())
         }
         fn info(&self, _: &Path) -> PortResult<WorkingCopyInfo> {
             Ok(WorkingCopyInfo {
@@ -588,6 +609,45 @@ mod scm_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Claims the working copy rooted at a fixed folder.
+    struct RootedScm(&'static str, &'static str);
+    impl SourceControl for RootedScm {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn working_copy_root(&self, dir: &Path) -> Option<PathBuf> {
+            dir.starts_with(self.1).then(|| PathBuf::from(self.1))
+        }
+        fn info(&self, _: &Path) -> PortResult<WorkingCopyInfo> {
+            unimplemented!()
+        }
+        fn status(&self, _: &Path) -> PortResult<Vec<FileStatus>> {
+            unimplemented!()
+        }
+        fn base_text(&self, _: &Path) -> PortResult<Option<String>> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn detects_the_nearest_working_copy() {
+        let scms: Vec<Arc<dyn SourceControl>> = vec![
+            Arc::new(RootedScm("Git", r"D:\svn\game")),
+            Arc::new(RootedScm("Subversion", r"D:\svn")),
+        ];
+        let name = |root: &str| detect_source_control(&scms, Path::new(root)).map(|s| s.name());
+        assert_eq!(name(r"D:\svn\game\Proj"), Some("Git"));
+        assert_eq!(name(r"D:\svn\other"), Some("Subversion"));
+        assert_eq!(name(r"D:\elsewhere"), None);
+
+        let tied: Vec<Arc<dyn SourceControl>> = vec![
+            Arc::new(RootedScm("Git", r"D:\p")),
+            Arc::new(RootedScm("Subversion", r"D:\p")),
+        ];
+        let first = detect_source_control(&tied, Path::new(r"D:\p\Proj")).unwrap();
+        assert_eq!(first.name(), "Git");
     }
 
     #[test]

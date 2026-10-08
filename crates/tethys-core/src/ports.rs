@@ -28,20 +28,29 @@ pub trait ConfigStore {
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()>;
 }
 
-/// A source control system (Subversion now; Perforce or git later).
+/// A source control system (Subversion and git now; Perforce later).
 ///
 /// Read-only: Tethys shows what changed but never commits, reverts or updates.
 pub trait SourceControl: Send + Sync {
     /// Display name, e.g. "Subversion".
     fn name(&self) -> &'static str;
+    /// The root of the working copy this system manages that contains `dir`,
+    /// if any. Only looks at the disk, so it's cheap enough for the UI thread.
+    fn working_copy_root(&self, dir: &Path) -> Option<PathBuf>;
     /// Whether `dir` is inside a working copy this system manages.
-    fn is_working_copy(&self, dir: &Path) -> bool;
+    fn is_working_copy(&self, dir: &Path) -> bool {
+        self.working_copy_root(dir).is_some()
+    }
+    /// What `base_text` returns, for display: "BASE" for Subversion.
+    fn base_label(&self) -> &'static str {
+        "BASE"
+    }
     /// Where the working copy at `root` points (URL, branch, revision).
     fn info(&self, root: &Path) -> PortResult<WorkingCopyInfo>;
     /// Changed and unversioned files under `root`. Paths are absolute.
     fn status(&self, root: &Path) -> PortResult<Vec<FileStatus>>;
-    /// The file as last checked out (BASE), or `None` if it has no base
-    /// (unversioned or newly added).
+    /// The file as last checked out (BASE, or HEAD for git), or `None` if it
+    /// has no base (unversioned or newly added).
     fn base_text(&self, file: &Path) -> PortResult<Option<String>>;
 }
 

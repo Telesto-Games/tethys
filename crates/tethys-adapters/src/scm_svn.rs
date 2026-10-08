@@ -60,8 +60,11 @@ impl SourceControl for Subversion {
         "Subversion"
     }
 
-    fn is_working_copy(&self, dir: &Path) -> bool {
-        dir.ancestors().any(|d| d.join(".svn").is_dir())
+    fn working_copy_root(&self, dir: &Path) -> Option<PathBuf> {
+        // Subversion 1.7+ keeps a single `.svn` at the working copy root.
+        dir.ancestors()
+            .find(|d| d.join(".svn").is_dir())
+            .map(Path::to_path_buf)
     }
 
     fn info(&self, root: &Path) -> PortResult<WorkingCopyInfo> {

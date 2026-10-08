@@ -1,6 +1,6 @@
 [package]
 name = "tethys-adapters"
-description = "Adapters implementing tethys-core ports (engine registry, config, agent terminal)."
+description = "Adapters implementing tethys-core ports (engine registry, config, agent terminal, source control)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
