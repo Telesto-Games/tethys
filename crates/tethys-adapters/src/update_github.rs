@@ -246,10 +246,24 @@ mod live {
     /// Talks to GitHub: `cargo test -p tethys-adapters live -- --ignored`.
     #[test]
     #[ignore]
-    fn reads_the_latest_release() {
-        let latest = GitHubReleases::new("Telesto-Games/tethys")
-            .latest()
-            .unwrap();
-        eprintln!("latest: {latest:?}");
+    fn reads_and_downloads_the_latest_release() {
+        let source = GitHubReleases::new("Telesto-Games/tethys");
+        let Some(release) = source.latest().unwrap() else {
+            return;
+        };
+        eprintln!("latest: {} {}", release.version, release.exe_url);
+        let dest = std::env::temp_dir().join(format!("tethys-live-{}.exe", std::process::id()));
+        source.download(&release, &dest).unwrap();
+        assert!(std::fs::metadata(&dest).unwrap().len() > 1_000_000);
+        std::fs::remove_file(&dest).unwrap();
+
+        // A wrong hash is rejected and leaves nothing behind.
+        let tampered = Release {
+            sha256: "0".repeat(64),
+            ..release
+        };
+        let err = source.download(&tampered, &dest).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        assert!(!dest.exists());
     }
 }
