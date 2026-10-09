@@ -21,7 +21,7 @@ use std::time::Duration;
 use gpui_kit::*;
 
 fn main() {
-    // `tethys path\to\Game.uproject`
+    // `tethys path\to\Game.uproject` or `tethys path\to\folder`
     let path = std::env::args_os().nth(1).map(PathBuf::from);
 
     // GPUI draws through DirectComposition with no redirection bitmap, which
