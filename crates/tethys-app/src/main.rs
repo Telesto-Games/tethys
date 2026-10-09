@@ -10,6 +10,7 @@ mod file_tree;
 mod keys;
 mod session_panel;
 mod settings_ui;
+mod tab_skin;
 mod terminal_view;
 mod theme;
 mod update_ui;
@@ -46,6 +47,7 @@ fn main() {
         theme::apply(cx);
         workspace::install_menus(cx);
         cx.set_global(workspace::Services::new());
+        tab_skin::init(cx);
         cx.bind_keys(workspace::key_bindings());
 
         // File > Exit: closing every window stops its sessions; the last close quits.

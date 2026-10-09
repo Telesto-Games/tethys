@@ -10,7 +10,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable, GlobalState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
-    DockArea, DockEvent, DockPlacement, DockSkin, Panel, PanelHandle, PanelId, PanelStyle,
+    DockArea, DockEvent, DockPlacement, Panel, PanelHandle, PanelId, PanelStyle,
 };
 use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
@@ -46,6 +46,7 @@ use crate::editor_panel::{self, EditorEvent, EditorPanel};
 use crate::file_tree::{FileTreeEvent, FileTreePanel};
 use crate::session_panel::{SessionKind, SessionPanel};
 use crate::settings_ui;
+use crate::tab_skin;
 use crate::theme;
 use crate::update_ui;
 
@@ -280,7 +281,7 @@ impl Workspace {
         })
         .detach();
 
-        let (dock, skin) = DockSkin::dock_area("sessions", None, window, cx);
+        let (dock, skin) = tab_skin::dock_area("sessions", window, cx);
         skin.set_panel_style(PanelStyle::TabBar, cx);
         skin.set_close_button_visible(true, cx);
         let dock_events =

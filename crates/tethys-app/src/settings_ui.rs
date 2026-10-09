@@ -4,11 +4,15 @@ use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
+use std::cell::Cell;
+use std::rc::Rc;
 use tethys_core::ports::ConfigStore;
 use tethys_core::unreal;
 
+use crate::tab_skin::{self, TabLayout};
 use crate::workspace::Services;
 
 /// The extra editor arguments to launch with, as saved.
@@ -32,6 +36,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
             .placeholder("No extra arguments")
             .default_value(saved)
     });
+    let vertical = Rc::new(Cell::new(cx.global::<TabLayout>().vertical));
 
     window.open_dialog(cx, move |dialog, _, cx| {
         let muted = cx.theme().muted_foreground;
@@ -43,6 +48,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
         };
         let reset = args.clone();
         let save = args.clone();
+        let toggle = vertical.clone();
+        let save_vertical = vertical.clone();
         dialog.title("Settings").w(px(560.)).child(
             div()
                 .flex()
@@ -68,6 +75,19 @@ pub fn open(window: &mut Window, cx: &mut App) {
                             unreal::DEFAULT_EDITOR_ARGS
                         )),
                 )
+                .child(div().pt_2().child(section("TABS")))
+                .child(
+                    Checkbox::new("vertical-tabs")
+                        .label("Vertical tabs")
+                        .checked(vertical.get())
+                        .on_click(move |checked, window, _| {
+                            toggle.set(*checked);
+                            window.refresh();
+                        }),
+                )
+                .child(div().text_xs().text_color(muted).whitespace_normal().child(
+                    "List sessions and open files down the left of the main area instead of \n                     along the top. Side panes keep their tabs along the top.",
+                ))
                 .child(
                     div()
                         .flex()
@@ -98,9 +118,16 @@ pub fn open(window: &mut Window, cx: &mut App) {
                                 .label("Save")
                                 .on_click(move |_, window, cx| {
                                     let line = save.read(cx).value().to_string();
+                                    let vertical = save_vertical.get();
                                     let config = &cx.global::<Services>().config;
-                                    match config.set_editor_args(&line) {
-                                        Ok(()) => window.close_dialog(cx),
+                                    match config
+                                        .set_editor_args(&line)
+                                        .and_then(|()| config.set_vertical_tabs(vertical))
+                                    {
+                                        Ok(()) => {
+                                            tab_skin::set_vertical(vertical, cx);
+                                            window.close_dialog(cx)
+                                        }
                                         Err(e) => {
                                             eprintln!("tethys: can't save settings: {e}")
                                         }
