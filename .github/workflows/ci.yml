@@ -1,8 +1,7 @@
 name: CI
 
+# Pull requests only: a merge to main runs Release, which tests and builds again.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 env:

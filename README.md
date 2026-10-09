@@ -53,18 +53,24 @@ Every other key goes straight to the agent.
 
 ## Releasing
 
-`main` is protected: every change, including a version bump, goes in through a pull request
-once CI (`licenses` and `build`) passes.
+Every merge to `main` ships. `main` is protected, so changes go in through a pull request once
+CI (`licenses` and `build`) passes. The **Release** workflow then bumps the latest `v*` tag,
+stamps that version into the build, tests, tags the merged commit and publishes a GitHub
+Release with `tethys-<version>-windows-x64.zip` (exe, LICENSE, notices, README) and the bare
+`tethys.exe` the updater downloads.
 
-1. Bump `version` under `[workspace.package]` in `Cargo.toml` in a PR ("Release 0.2.0") and
-   merge it.
-2. Tag the merged commit and push the tag:
-   `git checkout main && git pull && git tag v0.2.0 && git push origin v0.2.0`.
+Label the PR to choose the bump:
 
-The **Release** workflow checks the tag matches the version, builds, and publishes a GitHub
-Release with `tethys-0.2.0-windows-x64.zip` (exe, LICENSE, notices, README) and the bare
-`tethys.exe` the updater downloads. Release notes are generated from the commits; edit them on
-GitHub afterwards if you like, since they appear in the update dialog.
+| Label | Bump |
+|---|---|
+| none | patch (0.4.0 → 0.4.1) |
+| `minor` | 0.4.0 → 0.5.0 |
+| `major` | 0.4.0 → 1.0.0 |
+| `no-release` | merge without releasing; it ships with the next release |
+
+The tags hold the version: `Cargo.toml` isn't bumped, so local builds report whatever it says.
+Release notes are generated from the merged PRs; edit them on GitHub afterwards if you like,
+since they appear in the update dialog.
 
 To try the updater against the latest release, run an older build or pretend to be one:
 `TETHYS_PRETEND_VERSION=0.0.1` (this also enables the startup check in debug builds).

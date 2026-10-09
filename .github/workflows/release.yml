@@ -1,15 +1,25 @@
 name: Release
 
-# Push a tag like v0.2.0 (matching [workspace.package] version) to publish a
-# GitHub Release. The in-app updater installs its `tethys.exe` asset, checked
-# against the SHA-256 GitHub records for it.
+# Every merge to main ships. This picks the next version after the latest v*
+# tag, stamps it into the build, tests, then tags the merged commit and
+# publishes a GitHub Release. The in-app updater installs its `tethys.exe`
+# asset, checked against the SHA-256 GitHub records for it.
+#
+# The merged PR's labels pick the bump: `major`, `minor`, otherwise patch.
+# `no-release` skips releasing.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: read
+
+# One release at a time, so each run sees the tag the previous one made.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,22 +29,63 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      # rustup reads rust-toolchain.toml
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - name: Check the tag matches the version
+        with:
+          # The tags, to find the latest version.
+          fetch-depth: 0
+      - name: Pick the version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$(git tag --points-at HEAD --list 'v*')" ]; then
+            echo "Already released: $(git tag --points-at HEAD --list 'v*')"
+            exit 0
+          fi
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[].labels[].name] | join(" ")')
+          echo "PR labels: $labels"
+          if [[ " $labels " == *" no-release "* ]]; then
+            echo "Labelled no-release, skipping"
+            exit 0
+          fi
+          latest=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)
+          IFS=. read -r major minor patch <<< "${latest#v}"
+          major=${major:-0} minor=${minor:-0} patch=${patch:-0}
+          if [[ " $labels " == *" major "* ]]; then
+            major=$((major + 1)) minor=0 patch=0
+          elif [[ " $labels " == *" minor "* ]]; then
+            minor=$((minor + 1)) patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          version="$major.$minor.$patch"
+          echo "${latest:-none} -> $version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+      - name: Stamp the version
+        if: steps.version.outputs.release
         shell: bash
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
+          perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]+/${1}$ENV{VERSION}/' Cargo.toml
+          perl -0pi -e 's/(name = "tethys-[a-z-]+"\nversion = ")[^"]+/${1}$ENV{VERSION}/g' Cargo.lock
+          stamped=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "tethys-app") | .version')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml ($version)"
+          if [ "$stamped" != "$VERSION" ]; then
+            echo "::error::Stamped $stamped, wanted $VERSION"
             exit 1
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-      - run: cargo test --workspace --locked
-      - run: cargo build --release --locked
+      # rustup reads rust-toolchain.toml
+      - if: steps.version.outputs.release
+        run: rustup show
+      - if: steps.version.outputs.release
+        uses: Swatinem/rust-cache@v2
+      - if: steps.version.outputs.release
+        run: cargo test --workspace --locked
+      - if: steps.version.outputs.release
+        run: cargo build --release --locked
       - name: Package
+        if: steps.version.outputs.release
         shell: bash
         run: |
           dir="tethys-$VERSION-windows-x64"
@@ -43,10 +94,11 @@ jobs:
           7z a "$dir.zip" "$dir" > /dev/null
           cp target/release/tethys.exe tethys.exe
       - name: Publish
+        if: steps.version.outputs.release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "v$VERSION" \
             "tethys-$VERSION-windows-x64.zip" tethys.exe \
-            --title "Tethys $VERSION" --generate-notes
+            --target "$GITHUB_SHA" --title "Tethys $VERSION" --generate-notes
