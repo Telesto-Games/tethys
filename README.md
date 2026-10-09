@@ -51,8 +51,13 @@ Every other key goes straight to the agent.
 
 ## Releasing
 
-1. Bump `version` under `[workspace.package]` in `Cargo.toml` and commit ("Release 0.2.0").
-2. Tag and push: `git tag v0.2.0 && git push origin main v0.2.0`.
+`main` is protected: every change, including a version bump, goes in through a pull request
+once CI (`licenses` and `build`) passes.
+
+1. Bump `version` under `[workspace.package]` in `Cargo.toml` in a PR ("Release 0.2.0") and
+   merge it.
+2. Tag the merged commit and push the tag:
+   `git checkout main && git pull && git tag v0.2.0 && git push origin v0.2.0`.
 
 The **Release** workflow checks the tag matches the version, builds, and publishes a GitHub
 Release with `tethys-0.2.0-windows-x64.zip` (exe, LICENSE, notices, README) and the bare
