@@ -33,6 +33,14 @@ fn main() {
         unsafe { std::env::set_var(NO_DCOMP, "1") };
     }
 
+    // Launched from inside a Claude Code session? Sessions shouldn't inherit
+    // its NO_COLOR and nesting markers.
+    let keys = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok());
+    for key in tethys_adapters::agent_terminal::leaked_agent_vars(keys) {
+        // SAFETY: still before any threads exist.
+        unsafe { std::env::remove_var(key) };
+    }
+
     application().with_assets(assets::AppAssets).run(move |cx| {
         gpui_kit::init(cx);
         theme::apply(cx);
