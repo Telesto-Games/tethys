@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tethys_core::AgentProfile;
 use tethys_core::ports::{ConfigStore, PortResult};
-use tethys_core::unreal::Configuration;
+use tethys_core::unreal::{self, Configuration};
 use tethys_core::update::Version;
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,10 @@ struct StateFile {
     recent_projects: Vec<PathBuf>,
     #[serde(default)]
     build_configuration: Configuration,
+    /// Extra editor arguments; `None` until the user sets them (then the
+    /// default applies), so an empty string means "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    editor_args: Option<String>,
     /// A release the user chose to skip, e.g. "0.2.0".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skipped_version: Option<String>,
@@ -94,6 +98,17 @@ impl ConfigStore for TomlConfigStore {
 
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()> {
         self.update_state(|s| s.build_configuration = configuration)
+    }
+
+    fn editor_args(&self) -> PortResult<String> {
+        let state = self.read::<StateFile>("state.toml")?;
+        Ok(state
+            .editor_args
+            .unwrap_or_else(|| unreal::DEFAULT_EDITOR_ARGS.to_string()))
+    }
+
+    fn set_editor_args(&self, args: &str) -> PortResult<()> {
+        self.update_state(|s| s.editor_args = Some(args.trim().to_string()))
     }
 
     fn skipped_version(&self) -> PortResult<Option<Version>> {
@@ -202,5 +217,18 @@ mod state_tests {
         assert_eq!(store.skipped_version().unwrap(), v);
         store.set_skipped_version(None).unwrap();
         assert_eq!(store.skipped_version().unwrap(), None);
+    }
+
+    #[test]
+    fn editor_args_default_until_set_even_to_nothing() {
+        let dir = std::env::temp_dir().join(format!("tethys-config-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        assert_eq!(store.editor_args().unwrap(), unreal::DEFAULT_EDITOR_ARGS);
+        store.set_editor_args("  -log -NoSplash ").unwrap();
+        assert_eq!(store.editor_args().unwrap(), "-log -NoSplash");
+        // Cleared on purpose: no arguments, not the default.
+        store.set_editor_args("").unwrap();
+        assert_eq!(store.editor_args().unwrap(), "");
     }
 }

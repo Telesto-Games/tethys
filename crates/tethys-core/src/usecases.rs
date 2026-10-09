@@ -146,13 +146,15 @@ pub fn start_build(
     Ok(start_session(hosts, id, &profile, project, events)?)
 }
 
-/// Starts the Unreal Editor on the project, detached from Tethys.
+/// Starts the Unreal Editor on the project, detached from Tethys, with the
+/// user's extra `editor_args`.
 pub fn launch_editor(
     project: &Project,
     configuration: Configuration,
+    editor_args: &[String],
     launcher: &dyn ProcessLauncher,
 ) -> Result<(), ToolRunError> {
-    let cmd = unreal::editor_command(project, configuration)?;
+    let cmd = unreal::editor_command(project, configuration, editor_args)?;
     launcher
         .spawn_detached(&cmd, project.root())
         .map_err(|source| ToolRunError::Launch {
@@ -202,6 +204,7 @@ pub fn debug_editor(
     debugger: &dyn Debugger,
     project: &Project,
     configuration: Configuration,
+    editor_args: &[String],
     how: DebugStart,
     breakpoints: Vec<SourceBreakpoint>,
     events: DebugEventSink,
@@ -231,7 +234,7 @@ pub fn debug_editor(
         };
         return Ok((debuggee, session));
     }
-    let cmd = unreal::editor_command(project, configuration)?;
+    let cmd = unreal::editor_command(project, configuration, editor_args)?;
     let session = debugger
         .launch(&cmd, project.root(), breakpoints, events)
         .map_err(|source| DebugStartError::Launch {
@@ -400,6 +403,12 @@ mod tests {
             Ok(Configuration::Development)
         }
         fn set_build_configuration(&self, _: Configuration) -> PortResult<()> {
+            Ok(())
+        }
+        fn editor_args(&self) -> PortResult<String> {
+            Ok(String::new())
+        }
+        fn set_editor_args(&self, _: &str) -> PortResult<()> {
             Ok(())
         }
         fn skipped_version(&self) -> PortResult<Option<crate::update::Version>> {
@@ -649,7 +658,11 @@ mod tool_tests {
             _: DebugEventSink,
         ) -> PortResult<Box<dyn DebugSession>> {
             assert_eq!(cwd, Path::new(r"D:\g"));
-            let call = format!("launch:{}", command.program.display());
+            let call = format!(
+                "launch:{} {}",
+                command.program.display(),
+                command.args.join(" ")
+            );
             self.1.lock().unwrap().push(call);
             Ok(Box::new(FakeDebugSession(77)))
         }
@@ -668,6 +681,7 @@ mod tool_tests {
             debugger,
             &project(),
             Configuration::DebugGame,
+            &["-ModelContextProtocolStartServer".to_string()],
             how,
             Vec::new(),
             Arc::new(|_| {}),
@@ -699,7 +713,9 @@ mod tool_tests {
         assert_eq!(debuggee.process.exe, "UnrealEditor-Win64-DebugGame.exe");
         assert_eq!(
             *debugger.1.lock().unwrap(),
-            vec![r"launch:D:\UE\Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe"]
+            vec![
+                r"launch:D:\UE\Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe D:\g\Game.uproject -ModelContextProtocolStartServer"
+            ]
         );
     }
 
@@ -717,12 +733,14 @@ mod tool_tests {
     #[test]
     fn launch_editor_runs_detached_in_project_root() {
         let launcher = FakeLauncher::default();
-        launch_editor(&project(), Configuration::Development, &launcher).unwrap();
+        let args = vec!["-log".to_string()];
+        launch_editor(&project(), Configuration::Development, &args, &launcher).unwrap();
         let calls = launcher.0.lock().unwrap();
         assert_eq!(
             calls[0].0.program,
             Path::new(r"D:\UE\Engine\Binaries\Win64\UnrealEditor.exe")
         );
+        assert_eq!(calls[0].0.args, [r"D:\g\Game.uproject", "-log"]);
         assert_eq!(calls[0].1, Path::new(r"D:\g"));
     }
 

@@ -28,6 +28,10 @@ pub trait ConfigStore {
     /// The build configuration last chosen, for builds and editor launches.
     fn build_configuration(&self) -> PortResult<Configuration>;
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()>;
+    /// Extra arguments for every editor launch, as typed (see `unreal::split_args`).
+    /// [`crate::unreal::DEFAULT_EDITOR_ARGS`] until the user sets them.
+    fn editor_args(&self) -> PortResult<String>;
+    fn set_editor_args(&self, args: &str) -> PortResult<()>;
     /// The release the user chose not to be offered again, if any.
     fn skipped_version(&self) -> PortResult<Option<Version>>;
     fn set_skipped_version(&self, version: Option<Version>) -> PortResult<()>;

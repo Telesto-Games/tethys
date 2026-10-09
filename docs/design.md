@@ -559,6 +559,17 @@ Things learned while building M0–M3 that aren't obvious from the code.
   `state.toml` (`ConfigStore::build_configuration`). DebugGame builds with
   `Build.bat … DebugGame` and launches `Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe`.
   Installed engines ship that executable; it loads the project's `-Win64-DebugGame` modules.
+- **Settings.** File → Settings… (Ctrl+,) opens an app-wide dialog (`settings_ui.rs`). It
+  currently has one setting: **extra command-line arguments for the editor**. They're added
+  after the `.uproject` whenever Tethys starts the editor, whether through Launch editor or
+  through Debug when Debug launches it.
+  - They're stored as typed in `state.toml` (`ConfigStore::editor_args`) and split at launch by
+    `unreal::split_args` (spaces separate arguments, double quotes group them).
+  - Until the user saves a value, the default `unreal::DEFAULT_EDITOR_ARGS`
+    (`-ModelContextProtocolStartServer`) applies. That switch starts UE 5.8's Unreal MCP server
+    (the experimental `ModelContextProtocol` plugin) with the editor, and the editor ignores it
+    when the plugin isn't enabled.
+  - Saving an empty value means no extra arguments, not the default.
 - **Docking.** Sessions (Claude and builds) are panels in a gpui-component `DockArea`
   (`SessionPanel`), so tabs can be dragged into splits and resized. The panel owns its
   `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. The layout
