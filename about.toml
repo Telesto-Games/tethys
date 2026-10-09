@@ -2,6 +2,9 @@
 targets = ["x86_64-pc-windows-msvc"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+# Tethys's own crates (publish = false) aren't third-party, and listing them
+# would change this file on every version bump.
+private = { ignore = true }
 accepted = [
     "MIT",
     "MIT-0",
