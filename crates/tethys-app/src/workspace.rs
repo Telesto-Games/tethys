@@ -10,7 +10,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable, GlobalState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
-    DockArea, DockEvent, DockPlacement, DockSkin, Panel, PanelHandle, PanelId, PanelStyle,
+    DockArea, DockEvent, DockPlacement, Panel, PanelHandle, PanelId, PanelStyle,
 };
 use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
@@ -46,6 +46,7 @@ use crate::editor_panel::{self, EditorEvent, EditorPanel};
 use crate::file_tree::{FileTreeEvent, FileTreePanel};
 use crate::session_panel::{SessionKind, SessionPanel};
 use crate::settings_ui;
+use crate::tab_skin;
 use crate::theme;
 use crate::update_ui;
 
@@ -280,7 +281,7 @@ impl Workspace {
         })
         .detach();
 
-        let (dock, skin) = DockSkin::dock_area("sessions", None, window, cx);
+        let (dock, skin) = tab_skin::dock_area("sessions", window, cx);
         skin.set_panel_style(PanelStyle::TabBar, cx);
         skin.set_close_button_visible(true, cx);
         let dock_events =
@@ -504,12 +505,10 @@ impl Workspace {
 
     /// Opens a plain shell in the project folder, with no agent.
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        self.sessions_started += 1;
-        let label = format!("Terminal {}", self.sessions_started);
         let shell = agent_terminal::default_shell();
         self.start_tab(
-            label,
-            SessionKind::Agent,
+            "Terminal".into(),
+            SessionKind::Terminal,
             window,
             cx,
             move |host, id, project, sink| {
@@ -635,9 +634,10 @@ impl Workspace {
                     return;
                 };
                 let panel = cx.new(|cx| SessionPanel::new(id, kind, label, session, handle, cx));
-                // Agents go in the main area; builds go in the build pane on the right.
+                // Agents and terminals go in the main area; builds go in the
+                // build pane on the right.
                 let placement = match kind {
-                    SessionKind::Agent => DockPlacement::Center,
+                    SessionKind::Agent | SessionKind::Terminal => DockPlacement::Center,
                     SessionKind::Build => DockPlacement::Right,
                 };
                 if kind == SessionKind::Build {

@@ -33,6 +33,9 @@ struct StateFile {
     /// default applies), so an empty string means "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     editor_args: Option<String>,
+    /// Tabs down the side of the main area rather than along the top.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    vertical_tabs: bool,
     /// A release the user chose to skip, e.g. "0.2.0".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skipped_version: Option<String>,
@@ -109,6 +112,14 @@ impl ConfigStore for TomlConfigStore {
 
     fn set_editor_args(&self, args: &str) -> PortResult<()> {
         self.update_state(|s| s.editor_args = Some(args.trim().to_string()))
+    }
+
+    fn vertical_tabs(&self) -> PortResult<bool> {
+        Ok(self.read::<StateFile>("state.toml")?.vertical_tabs)
+    }
+
+    fn set_vertical_tabs(&self, vertical: bool) -> PortResult<()> {
+        self.update_state(|s| s.vertical_tabs = vertical)
     }
 
     fn skipped_version(&self) -> PortResult<Option<Version>> {
@@ -230,5 +241,17 @@ mod state_tests {
         // Cleared on purpose: no arguments, not the default.
         store.set_editor_args("").unwrap();
         assert_eq!(store.editor_args().unwrap(), "");
+    }
+
+    #[test]
+    fn vertical_tabs_off_until_turned_on() {
+        let dir = std::env::temp_dir().join(format!("tethys-config-tabs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        assert!(!store.vertical_tabs().unwrap());
+        store.set_vertical_tabs(true).unwrap();
+        assert!(store.vertical_tabs().unwrap());
+        store.set_vertical_tabs(false).unwrap();
+        assert!(!store.vertical_tabs().unwrap());
     }
 }

@@ -433,6 +433,12 @@ mod tests {
         fn set_editor_args(&self, _: &str) -> PortResult<()> {
             Ok(())
         }
+        fn vertical_tabs(&self) -> PortResult<bool> {
+            Ok(false)
+        }
+        fn set_vertical_tabs(&self, _: bool) -> PortResult<()> {
+            Ok(())
+        }
         fn skipped_version(&self) -> PortResult<Option<crate::update::Version>> {
             Ok(None)
         }

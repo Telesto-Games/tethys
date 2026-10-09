@@ -560,7 +560,7 @@ Things learned while building M0–M3 that aren't obvious from the code.
   `Build.bat … DebugGame` and launches `Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe`.
   Installed engines ship that executable; it loads the project's `-Win64-DebugGame` modules.
 - **Settings.** File → Settings… (Ctrl+,) opens an app-wide dialog (`settings_ui.rs`). It
-  currently has one setting: **extra command-line arguments for the editor**. They're added
+  has two settings. The first is **extra command-line arguments for the editor**. They're added
   after the `.uproject` whenever Tethys starts the editor, whether through Launch editor or
   through Debug when Debug launches it.
   - They're stored as typed in `state.toml` (`ConfigStore::editor_args`) and split at launch by
@@ -570,6 +570,10 @@ Things learned while building M0–M3 that aren't obvious from the code.
     (the experimental `ModelContextProtocol` plugin) with the editor, and the editor ignores it
     when the plugin isn't enabled.
   - Saving an empty value means no extra arguments, not the default.
+  - The second, **Vertical tabs** (`ConfigStore::vertical_tabs`, off by default), lists the main
+    area's tabs down its left side. The dock always lays a tab group out as a column, so
+    `tab_skin.rs` wraps gpui-component's `DockSkin`, draws the tab list over the group's left
+    edge and moves the content over by its width. Docks keep their tabs along the top.
 - **Docking.** Sessions (Claude and builds) are panels in a gpui-component `DockArea`
   (`SessionPanel`), so tabs can be dragged into splits and resized. The panel owns its
   `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. The layout

@@ -32,6 +32,9 @@ pub trait ConfigStore {
     /// [`crate::unreal::DEFAULT_EDITOR_ARGS`] until the user sets them.
     fn editor_args(&self) -> PortResult<String>;
     fn set_editor_args(&self, args: &str) -> PortResult<()>;
+    /// Whether the main area lists its tabs down the side instead of along the top.
+    fn vertical_tabs(&self) -> PortResult<bool>;
+    fn set_vertical_tabs(&self, vertical: bool) -> PortResult<()>;
     /// The release the user chose not to be offered again, if any.
     fn skipped_version(&self) -> PortResult<Option<Version>>;
     fn set_skipped_version(&self, version: Option<Version>) -> PortResult<()>;

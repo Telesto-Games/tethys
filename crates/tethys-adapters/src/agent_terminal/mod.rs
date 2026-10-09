@@ -42,6 +42,28 @@ pub fn default_shell() -> &'static str {
     }
 }
 
+/// Variables a parent Claude Code session leaves in Tethys's environment
+/// when Tethys is launched from one (e.g. `cargo run` in its Bash tool).
+/// Sessions inherit the environment, so these would turn their colours off
+/// (`NO_COLOR`) and make `claude` think it's nested. `NO_COLOR` only counts
+/// when it came from Claude Code; a user who set it themselves keeps it.
+pub fn leaked_agent_vars(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    let keys: Vec<String> = keys.into_iter().collect();
+    let from_claude = keys.iter().any(|k| k == "CLAUDECODE");
+    keys.into_iter()
+        .filter(|k| {
+            k == "CLAUDECODE"
+                || k == "AI_AGENT"
+                || k.starts_with("CLAUDE_CODE_")
+                || matches!(
+                    k.as_str(),
+                    "CLAUDE_PID" | "CLAUDE_EFFORT" | "CLAUDE_JOB_DIR"
+                )
+                || (from_claude && k == "NO_COLOR")
+        })
+        .collect()
+}
+
 /// The terminal model a view draws.
 pub type TerminalModel = Term<Listener>;
 
@@ -358,6 +380,22 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn strips_vars_leaked_by_a_parent_claude() {
+        let keys = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            leaked_agent_vars(keys(&[
+                "PATH",
+                "CLAUDECODE",
+                "NO_COLOR",
+                "CLAUDE_CODE_SESSION_ID"
+            ])),
+            ["CLAUDECODE", "NO_COLOR", "CLAUDE_CODE_SESSION_ID"]
+        );
+        // NO_COLOR the user set themselves stays.
+        assert!(leaked_agent_vars(keys(&["PATH", "NO_COLOR"])).is_empty());
+    }
 
     /// Runs `cmd /c echo` in a real ConPTY and waits for its output and exit.
     #[test]
