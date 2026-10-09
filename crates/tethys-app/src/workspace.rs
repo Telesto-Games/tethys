@@ -505,12 +505,10 @@ impl Workspace {
 
     /// Opens a plain shell in the project folder, with no agent.
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        self.sessions_started += 1;
-        let label = format!("Terminal {}", self.sessions_started);
         let shell = agent_terminal::default_shell();
         self.start_tab(
-            label,
-            SessionKind::Agent,
+            "Terminal".into(),
+            SessionKind::Terminal,
             window,
             cx,
             move |host, id, project, sink| {
@@ -636,9 +634,10 @@ impl Workspace {
                     return;
                 };
                 let panel = cx.new(|cx| SessionPanel::new(id, kind, label, session, handle, cx));
-                // Agents go in the main area; builds go in the build pane on the right.
+                // Agents and terminals go in the main area; builds go in the
+                // build pane on the right.
                 let placement = match kind {
-                    SessionKind::Agent => DockPlacement::Center,
+                    SessionKind::Agent | SessionKind::Terminal => DockPlacement::Center,
                     SessionKind::Build => DockPlacement::Right,
                 };
                 if kind == SessionKind::Build {

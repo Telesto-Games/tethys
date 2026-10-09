@@ -21,6 +21,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use tethys_core::ports::ConfigStore;
 
+use crate::session_panel::SESSION_PANEL_NAME;
 use crate::workspace::Services;
 
 /// Width of the side tab list.
@@ -214,17 +215,26 @@ impl Tabs {
             theme.tokens.drop_target,
         );
 
-        let visible: Vec<usize> = group
+        // Terminal sessions first, then files, each in tab order, with a
+        // divider between them. `None` marks the divider.
+        let (sessions, files): (Vec<usize>, Vec<usize>) = group
             .panels()
             .iter()
             .enumerate()
             .filter(|(_, panel)| panel.visible(cx))
             .map(|(ix, _)| ix)
+            .partition(|ix| group.panels()[*ix].panel_name(cx) == SESSION_PANEL_NAME);
+        let divided = !sessions.is_empty() && !files.is_empty();
+        let rows: Vec<Option<usize>> = sessions
+            .into_iter()
+            .map(Some)
+            .chain(divided.then_some(None))
+            .chain(files.into_iter().map(Some))
             .collect();
         let active_ix = group.active_ix();
         let shown = group.active_panel().map(|panel| panel.panel_id(cx));
         if self.last_active_ix.replace(Some(active_ix)) != Some(active_ix)
-            && let Some(pos) = visible.iter().position(|ix| *ix == active_ix)
+            && let Some(pos) = rows.iter().position(|row| *row == Some(active_ix))
         {
             self.scroll.scroll_to_item(pos);
         }
@@ -246,7 +256,16 @@ impl Tabs {
                 .child(div().children(right))
         });
 
-        let tabs = visible.into_iter().map(|ix| {
+        let tabs = rows.into_iter().map(|row| {
+            let Some(ix) = row else {
+                return div()
+                    .flex_none()
+                    .h_px()
+                    .mx_2()
+                    .my_1()
+                    .bg(border)
+                    .into_any_element();
+            };
             let panel = group.panels()[ix].clone();
             let id = panel.panel_id(cx);
             let selected = Some(id) == shown;
@@ -329,6 +348,7 @@ impl Tabs {
                         }
                     })
                 })
+                .into_any_element()
         });
 
         // Room below the last tab to drop a panel at the end.

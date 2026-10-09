@@ -15,6 +15,8 @@ use crate::terminal_view::TerminalView;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     Agent,
+    /// A plain shell, always labelled "Terminal".
+    Terminal,
     Build,
 }
 
@@ -23,7 +25,8 @@ pub struct SessionPanel {
     kind: SessionKind,
     /// Fallback label, e.g. "Claude Code 2" or "Build GameEditor Development".
     label: String,
-    /// Title set by the agent through escape codes. Ignored for builds.
+    /// Title set by the agent through escape codes. Ignored for builds and
+    /// plain terminals, whose shell sets it to the current folder.
     title: String,
     exit_code: Option<i32>,
     /// Dropping this stops the process and its tree. `None` once removed.
@@ -86,7 +89,7 @@ impl SessionPanel {
                 Some(code) => format!("{} ✗ ({code})", self.label),
             };
         }
-        let name = if self.title.trim().is_empty() {
+        let name = if self.kind == SessionKind::Terminal || self.title.trim().is_empty() {
             &self.label
         } else {
             &self.title
@@ -98,9 +101,12 @@ impl SessionPanel {
     }
 }
 
+/// `panel_name` of every session panel, so the dock can tell them from files.
+pub const SESSION_PANEL_NAME: &str = "TethysSession";
+
 impl gpui_kit::component::dock::BasePanel for SessionPanel {
     fn panel_name(&self) -> &'static str {
-        "TethysSession"
+        SESSION_PANEL_NAME
     }
 
     fn on_removed(&mut self, _: &mut Window, _: &mut Context<Self>) {
