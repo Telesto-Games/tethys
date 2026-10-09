@@ -99,16 +99,57 @@ pub fn build_command(
     })
 }
 
-/// `UnrealEditor.exe <uproject>`, or `UnrealEditor-Win64-DebugGame.exe` for DebugGame.
+/// Extra editor arguments when the user hasn't set any: start the Unreal MCP
+/// server (the `ModelContextProtocol` plugin). The editor ignores the switch
+/// when the plugin isn't enabled.
+pub const DEFAULT_EDITOR_ARGS: &str = "-ModelContextProtocolStartServer";
+
+/// `UnrealEditor.exe <uproject> <extra_args…>`, or
+/// `UnrealEditor-Win64-DebugGame.exe` for DebugGame.
 pub fn editor_command(
     project: &Project,
     configuration: Configuration,
+    extra_args: &[String],
 ) -> Result<CommandSpec, ToolError> {
     let engine = engine_root(project)?;
+    let mut args = vec![project.path.display().to_string()];
+    args.extend(extra_args.iter().cloned());
     Ok(CommandSpec {
         program: engine.join(configuration.editor_exe()),
-        args: vec![project.path.display().to_string()],
+        args,
     })
+}
+
+/// Splits arguments typed on one line: separated by whitespace, with double
+/// quotes grouping an argument that contains spaces (the quotes are dropped;
+/// launching quotes again as needed).
+pub fn split_args(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_arg = false;
+    let mut quoted = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                in_arg = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+            }
+            c => {
+                current.push(c);
+                in_arg = true;
+            }
+        }
+    }
+    if in_arg {
+        args.push(current);
+    }
+    args
 }
 
 /// Target names (`Foo` for `Foo.Target.cs`) from file names in `Source`.
@@ -180,12 +221,29 @@ mod tests {
     #[test]
     fn editor_command_opens_uproject() {
         let p = project(Ok(r"D:\UE_5.8"), &[], &[]);
-        let cmd = editor_command(&p, Configuration::Development).unwrap();
+        let extra = vec!["-ModelContextProtocolStartServer".to_string()];
+        let cmd = editor_command(&p, Configuration::Development, &extra).unwrap();
         assert_eq!(
             cmd.program,
             Path::new(r"D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe")
         );
-        assert_eq!(cmd.args, [r"D:\dev\Arcade\Arcade.uproject"]);
+        assert_eq!(
+            cmd.args,
+            [
+                r"D:\dev\Arcade\Arcade.uproject",
+                "-ModelContextProtocolStartServer"
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_argument_lines() {
+        assert_eq!(
+            split_args(r#"  -log -ExecCmds="stat fps" "-Path=C:\My Dir" -x=""  "#),
+            ["-log", "-ExecCmds=stat fps", r"-Path=C:\My Dir", "-x="]
+        );
+        assert!(split_args("   ").is_empty());
+        assert_eq!(split_args(DEFAULT_EDITOR_ARGS), [DEFAULT_EDITOR_ARGS]);
     }
 
     #[test]
@@ -193,7 +251,7 @@ mod tests {
         let p = project(Ok(r"D:\UE_5.8"), &["Arcade"], &[]);
         let build = build_command(&p, Configuration::DebugGame).unwrap();
         assert_eq!(build.args[2], "DebugGame");
-        let editor = editor_command(&p, Configuration::DebugGame).unwrap();
+        let editor = editor_command(&p, Configuration::DebugGame, &[]).unwrap();
         assert_eq!(
             editor.program,
             Path::new(r"D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe")

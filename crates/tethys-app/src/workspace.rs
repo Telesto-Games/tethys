@@ -45,6 +45,7 @@ use crate::diff_panel::DiffPanel;
 use crate::editor_panel::{self, EditorEvent, EditorPanel};
 use crate::file_tree::{FileTreeEvent, FileTreePanel};
 use crate::session_panel::{SessionKind, SessionPanel};
+use crate::settings_ui;
 use crate::theme;
 use crate::update_ui;
 
@@ -69,6 +70,7 @@ gpui_kit::actions!(
         LiveCode,
         LaunchEditor,
         ShowProjects,
+        OpenSettings,
         Exit,
         About,
         CheckForUpdates,
@@ -90,6 +92,8 @@ pub fn install_menus(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("New Session", NewSession),
                 MenuItem::action("Close Session", CloseSession),
+                MenuItem::separator(),
+                MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),
                 MenuItem::action("Exit", Exit),
             ])
@@ -127,6 +131,7 @@ pub fn install_menus(cx: &mut App) {
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-shift-p", ShowProjects, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("ctrl-s", crate::editor_panel::Save, None),
         KeyBinding::new("f9", crate::editor_panel::ToggleBreakpoint, None),
         KeyBinding::new("f5", AttachOrContinue, None),
@@ -548,7 +553,10 @@ impl Workspace {
         let Some(project) = self.project.as_ref() else {
             return;
         };
-        if let Err(e) = usecases::launch_editor(project, self.configuration, &DetachedLauncher) {
+        let args = settings_ui::editor_args(cx);
+        if let Err(e) =
+            usecases::launch_editor(project, self.configuration, &args, &DetachedLauncher)
+        {
             self.error = Some(e.to_string());
             cx.notify();
         }
@@ -1031,12 +1039,14 @@ impl Workspace {
         let debugger = cx.global::<Services>().debugger.clone();
         let configuration = self.configuration;
         let breakpoints = self.breakpoint_requests();
+        let editor_args = settings_ui::editor_args(cx);
         // Listing processes and attaching take a few seconds on a big editor.
         let start = cx.background_executor().spawn(async move {
             usecases::debug_editor(
                 debugger.as_ref(),
                 &project,
                 configuration,
+                &editor_args,
                 how,
                 breakpoints,
                 sink,
@@ -1685,6 +1695,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::launch_editor))
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(|_, _: &OpenSettings, window, cx| settings_ui::open(window, cx)))
             .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::attach_or_continue))
             .on_action(cx.listener(Self::attach_to_editor))

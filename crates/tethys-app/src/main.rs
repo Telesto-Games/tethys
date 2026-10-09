@@ -9,6 +9,7 @@ mod editor_panel;
 mod file_tree;
 mod keys;
 mod session_panel;
+mod settings_ui;
 mod terminal_view;
 mod theme;
 mod update_ui;
