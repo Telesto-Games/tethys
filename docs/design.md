@@ -257,6 +257,143 @@ A `.uproject` is JSON. The fields we care about at first are:
    This is deliberately **not** the default double-click action, because that belongs to
    UnrealVersionSelector and we shouldn't break it.
 
+## Debugging the editor
+
+> Status: **designed 2026-10-09**, MVP being implemented.
+
+Tethys attaches a native debugger to the running Unreal Editor. It catches crashes, `check`s and
+`ensure`s, shows the stack of the thread that stopped, and stops at source-line breakpoints set
+in Tethys's editor. That covers most of what UE programmers use Visual Studio's debugger for while
+working with an agent.
+
+### Which debugger engine
+
+| Option | Verdict |
+|---|---|
+| **Visual Studio's debugger** (Concord / `vsdebugeng`, or `vsdbg` from VS Code's C++ extension) | **Ruled out.** `vsdbg`'s licence only allows use with Microsoft's own products, and Microsoft enforces it against third-party editors. Concord can't be hosted outside Visual Studio. |
+| **DbgEng** (`dbgeng.dll`, the engine behind WinDbg and cdb) | **Chosen.** It's the most reliable engine for MSVC binaries and PDBs, and it ships in every Windows install (`System32`), so Tethys doesn't redistribute anything. It has a documented COM API, which the `windows` crate (MIT/Apache) binds. It also loads `.natvis` files, so UE's `Unreal.natvis` is available when we add variable inspection. |
+| **lldb-dap** over the Debug Adapter Protocol | Later, if ever. LLDB's PDB support for MSVC is still rough, it can't read natvis, and it hasn't been proven at UE's scale (about 700 DLLs and gigabytes of PDBs). |
+| **Drive Visual Studio through DTE** (COM automation) | Not needed for now. It's legal, but debugging would happen in Visual Studio, not in Tethys. It could be a cheap "Debug in Visual Studio" button later. |
+| **RAD Debugger** (Epic, MIT) | A complete app, not an engine we can embed. It could be a "launch external debugger" option later. |
+
+### Port
+
+The core owns the vocabulary and the decisions. The adapter only talks to DbgEng.
+
+```rust
+// tethys-core::ports
+pub trait Debugger {
+    /// Running processes, so the core can pick the project's editor.
+    fn processes(&self) -> PortResult<Vec<ProcessInfo>>;
+    fn attach(&self, pid: u32, options: AttachOptions, events: DebugEventSink)
+        -> PortResult<Box<dyn DebugSession>>;
+}
+
+pub trait DebugSession: Send {          // dropping it detaches; it never kills the editor
+    fn set_breakpoints(&self, breakpoints: Vec<SourceBreakpoint>);  // the full desired set
+    fn resume(&self);
+    fn pause(&self);
+    fn detach(&self);
+}
+
+pub enum DebugEvent {
+    Attached,
+    Running,
+    Stopped { reason: StopReason, thread: u32, frames: Vec<StackFrame> },
+    Breakpoints(Vec<(BreakpointId, BreakpointState)>),   // Bound | Pending | Failed
+    Ended(DebugEnd),                                     // Detached | Exited(code) | Failed(msg)
+}
+```
+
+Like `AgentSession`, a session **pushes** events through a sink from its own thread.
+`set_breakpoints` always sends the full set of breakpoints Tethys wants, so the adapter can
+compare it with what it has already set and never drifts from the UI.
+
+The core's `debug` module holds the plain logic, all of it unit-tested:
+
+- **Finding the editor:** `find_editor` picks an `UnrealEditor*.exe` whose command line names
+  this project's `.uproject`. If none does and only one editor is running, it picks that one.
+- **The module that owns a source file:** UE compiles each module into its own DLL
+  (`UnrealEditor-<Module>.dll`, or `UnrealEditor-<Module>-Win64-DebugGame.dll`). The module
+  is named after the nearest folder above the file that holds a `<Folder>.Build.cs`.
+  `module_for_source` walks up from the file, using a callback to check whether the
+  `Build.cs` exists.
+- **Breakpoint location:** `breakpoint_location` qualifies a file and line by module, so DbgEng
+  only has to load that one module's PDB. Without the module, it would search the symbols of
+  every loaded module.
+- **Source paths in stack frames:** engines installed from the Launcher record paths from
+  Epic's build machine (e.g. `D:\build\++UE5\Sync\Engine\Source\…`). `local_source` maps any
+  path containing an `Engine\` segment onto the local engine root when the original path
+  doesn't exist.
+
+### DbgEng adapter (`tethys-adapters::debug_dbgeng`)
+
+- **One thread owns the engine.** DbgEng's COM objects aren't thread-safe, so a dedicated thread
+  creates the client and makes every call. The UI talks to it through a channel.
+- **Event loop.** While the editor runs, the thread calls `WaitForEvent` with a 100 ms timeout,
+  then checks the execution status: `GO` means the wait timed out, `BREAK` means an event
+  happened. Between waits it handles commands. A command that needs the target stopped (changing
+  breakpoints, detaching) first breaks in with `SetInterrupt`, applies the change, and resumes,
+  without the UI ever seeing a stop. `Pause` uses the same break-in but reports `Stopped(Pause)`.
+- **Attach.** `AttachProcess` with `DEBUG_ENGOPT_INITIAL_BREAK`, so the first stop is
+  predictable. The thread then sets breakpoints and resumes. `DEBUG_PROCESS_DETACH_ON_EXIT` is
+  set straight away, so **if Tethys crashes or quits, the editor keeps running**.
+- **Stopping.** The thread reads the event with `GetLastEventInformation`:
+  - **Exceptions:** an exception is reported if DbgEng's filters say to break on it. By default
+    that means first-chance access violations, breakpoint instructions and every second-chance
+    exception. UE's `check` and `ensure` call `__debugbreak()` when a debugger is attached, so
+    they stop here too.
+  - **Breakpoints:** a stop at one of our breakpoints is reported with its ID.
+  - **Stack:** the stack of the thread that stopped comes from `GetStackTrace`, then
+    `GetNameByOffset` and `GetLineByOffset` for each frame. For frames below the top, the
+    lookup uses the return address minus one, so the line is the call, not the line after it.
+- **Breakpoints** are added with ``bu<id> `<module>!<file>:<line>` `` through `Execute`, using
+  IDs that Tethys chooses. This is the unresolved form, so a breakpoint in a module that hasn't
+  loaded yet binds when the module loads. After setting them, the adapter reads each
+  breakpoint's flags: `DEBUG_BREAKPOINT_DEFERRED` means **Pending**, an `Execute` failure means
+  **Failed**, and otherwise it's **Bound**. The module name comes from the loaded module whose
+  image is `UnrealEditor-<Module>[-Win64-<Config>].dll`. If none is loaded, the name is
+  guessed (`UnrealEditor_<Module>`).
+- **Symbols** come from the PDBs next to each module, which is where UBT writes them, plus
+  `_NT_SYMBOL_PATH` if it's set. Line information is turned on (`SYMOPT_LOAD_LINES`) and
+  loading is deferred, so the first stop in a module loads its PDB. That can take a few seconds
+  for `UnrealEditor-Engine`.
+- **Detach** uses `DetachProcesses` and then `EndSession(DEBUG_END_ACTIVE_DETACH)`. The editor
+  keeps running.
+
+### UI
+
+- **Debug button** in the project header. If no debugger is attached, it attaches to this
+  project's running editor; otherwise it detaches.
+- **Debug panel** at the bottom of the dock:
+  - A status line: attached to which process ID, and whether the editor is running or stopped,
+    and why.
+  - Buttons: Continue, Pause and Detach.
+  - The stack of the thread that stopped: click a frame to open its source at that line.
+  - The breakpoint list, with each breakpoint's state; click one to open it, or remove it.
+- **Editor:** F9 or a toolbar button toggles a breakpoint on the cursor's line. Breakpoint lines
+  get a red fill and the current stop line gets an orange one, both through the editor's range
+  decorations. Breakpoints belong to the window, not to an attach, so they persist across
+  attach and detach, but they aren't saved to disk yet.
+
+### MVP scope
+
+**In:** attach to the running editor, stop on exceptions, `check` and `ensure`, show the stack
+of the thread that stopped, file:line breakpoints, continue, pause and detach.
+
+**Later, in rough order:**
+- Launching the editor under the debugger (UE skips its own crash handler in that case).
+- Stepping (over, into, out).
+- A thread list.
+- Locals and watches, using `Unreal.natvis` through DbgEng's data model.
+- Saving breakpoints in `state.toml`.
+- Breakpoints on Live Coding patches.
+- Showing the crash stack from `Saved/Crashes` when no debugger is attached.
+
+**Known limits:** breakpoints in headers bind only in the module that owns the header, not in
+every module that inlines it. A Launcher engine only has engine symbols if the user installed
+"Editor symbols for debugging", so without them engine frames have no names.
+
 ## Milestones
 
 Each milestone is the smallest useful step. M0 carries a spike that isn't a feature: it exists to
