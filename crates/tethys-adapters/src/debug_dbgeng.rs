@@ -304,13 +304,11 @@ mod engine {
         move |e| format!("{context}: {}", e.message())
     }
 
-    /// Whether a frame is in the OS (`ntdll!…`), by its symbol's module.
-    fn is_system_frame(frame: &StackFrame) -> bool {
-        frame.function.split_once('!').is_some_and(|(module, _)| {
-            SYSTEM_MODULES
-                .iter()
-                .any(|m| module.eq_ignore_ascii_case(m))
-        })
+    /// Whether a DbgEng module name (`ntdll`, `KERNELBASE`) is one of the OS's.
+    fn is_system_module(module: &str) -> bool {
+        SYSTEM_MODULES
+            .iter()
+            .any(|m| module.eq_ignore_ascii_case(m))
     }
 
     /// Tethys's environment plus `_NO_DEBUG_HEAP=1`, as a block for
@@ -725,14 +723,21 @@ mod engine {
                 _ => return Ok(Seen::Ignore),
             };
             self.refresh_symbol_path();
-            let frames = self.stack();
-            if reason == StopReason::DebugBreak && frames.iter().all(is_system_frame) {
+            let raw = self.raw_stack();
+            // By module, not symbol: symbols for a stop nobody sees would only
+            // cost time (seconds, with a symbol server on the path).
+            if reason == StopReason::DebugBreak
+                && raw.iter().all(|f| {
+                    self.module_of(f.InstructionOffset)
+                        .is_some_and(|m| is_system_module(&m))
+                })
+            {
                 return Ok(Seen::Ignore);
             }
             Ok(Seen::Stop(DebugEvent::Stopped {
                 reason,
                 thread: self.current_thread(),
-                frames,
+                frames: self.describe(&raw),
             }))
         }
 
@@ -818,6 +823,11 @@ mod engine {
 
         /// The current thread's stack, innermost first.
         fn stack(&self) -> Vec<StackFrame> {
+            self.describe(&self.raw_stack())
+        }
+
+        /// The current thread's stack as addresses, without loading symbols.
+        fn raw_stack(&self) -> Vec<DEBUG_STACK_FRAME> {
             let mut frames = vec![DEBUG_STACK_FRAME::default(); MAX_FRAMES];
             let mut filled = 0;
             // SAFETY: `frames` outlives the call.
@@ -829,6 +839,23 @@ mod engine {
                 return Vec::new();
             }
             frames.truncate(filled as usize);
+            frames
+        }
+
+        /// DbgEng's name for the module at `offset`, e.g. `ntdll`. Needs no symbols.
+        fn module_of(&self, offset: u64) -> Option<String> {
+            let mut index = 0;
+            // SAFETY: DbgEng call on an object this thread owns.
+            unsafe {
+                self.symbols
+                    .GetModuleByOffset(offset, 0, Some(&mut index), None)
+                    .ok()?;
+            }
+            self.module_name(DEBUG_MODNAME_MODULE, index)
+        }
+
+        /// Frames with names and source lines, which loads their modules' symbols.
+        fn describe(&self, frames: &[DEBUG_STACK_FRAME]) -> Vec<StackFrame> {
             frames
                 .iter()
                 .enumerate()
@@ -1111,6 +1138,9 @@ mod engine {
             }
         }
 
+        /// Generous: a cold CI runner can take a while to load symbols for a stop.
+        const CI_TIMEOUT_SECS: u64 = 120;
+
         fn is_paused(e: &DebugEvent) -> bool {
             matches!(e, DebugEvent::Stopped { reason: StopReason::Pause, frames, .. } if !frames.is_empty())
         }
@@ -1121,12 +1151,12 @@ mod engine {
 
         /// Pauses, resumes and detaches, then checks the process lives on.
         fn pause_and_detach(session: &dyn tethys_core::ports::DebugSession, events: &Events) {
-            events.wait_for("running", 20, &|e| *e == DebugEvent::Running);
+            events.wait_for("running", CI_TIMEOUT_SECS, &|e| *e == DebugEvent::Running);
             session.pause();
-            events.wait_for("pause", 20, &is_paused);
+            events.wait_for("pause", CI_TIMEOUT_SECS, &is_paused);
             session.resume();
             session.detach();
-            events.wait_for("detach", 20, &|e| {
+            events.wait_for("detach", CI_TIMEOUT_SECS, &|e| {
                 *e == DebugEvent::Ended(DebugEnd::Detached)
             });
             assert!(
@@ -1204,7 +1234,9 @@ mod engine {
             let _session = super::super::DbgEng
                 .launch(&cmd, &std::env::temp_dir(), Vec::new(), sink)
                 .unwrap();
-            events.wait_for("exit", 20, &|e| *e == DebugEvent::Ended(DebugEnd::Exited));
+            events.wait_for("exit", CI_TIMEOUT_SECS, &|e| {
+                *e == DebugEvent::Ended(DebugEnd::Exited)
+            });
             let env = std::fs::read_to_string(&out).unwrap();
             let _ = std::fs::remove_file(&out);
             assert!(env.contains("_NO_DEBUG_HEAP=1"), "{env}");
@@ -1312,11 +1344,13 @@ mod engine {
             events.clear();
             session.set_breakpoints(Vec::new());
             session.resume();
-            events.wait_for("running again", 20, &|e| *e == DebugEvent::Running);
+            events.wait_for("running again", CI_TIMEOUT_SECS, &|e| {
+                *e == DebugEvent::Running
+            });
             session.pause();
-            print(&events.wait_for("pause", 20, &is_paused));
+            print(&events.wait_for("pause", CI_TIMEOUT_SECS, &is_paused));
             session.detach();
-            events.wait_for("detach", 20, &|e| {
+            events.wait_for("detach", CI_TIMEOUT_SECS, &|e| {
                 *e == DebugEvent::Ended(DebugEnd::Detached)
             });
             std::thread::sleep(std::time::Duration::from_secs(2));
