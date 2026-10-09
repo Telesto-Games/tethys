@@ -30,6 +30,18 @@ pub use alacritty_terminal as backend;
 
 pub use command::{CommandLine, resolve as resolve_command};
 
+/// The shell for a plain terminal: PowerShell 7 (`pwsh`) when it's on PATH,
+/// otherwise Windows PowerShell, which every Windows has.
+pub fn default_shell() -> &'static str {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    if command::find_executable("pwsh", &path, &pathext).is_some() {
+        "pwsh"
+    } else {
+        "powershell"
+    }
+}
+
 /// The terminal model a view draws.
 pub type TerminalModel = Term<Listener>;
 

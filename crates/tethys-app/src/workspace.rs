@@ -17,7 +17,7 @@ use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::component::{Icon, WindowExt};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use tethys_adapters::agent_terminal::TerminalHost;
+use tethys_adapters::agent_terminal::{self, TerminalHost};
 use tethys_adapters::config_toml::TomlConfigStore;
 use tethys_adapters::debug_dbgeng::DbgEng;
 use tethys_adapters::engine_registry::RegistryEngineLocator;
@@ -63,6 +63,7 @@ gpui_kit::actions!(
     [
         OpenProject,
         NewSession,
+        NewTerminal,
         CloseSession,
         NextSession,
         PrevSession,
@@ -91,6 +92,7 @@ pub fn install_menus(cx: &mut App) {
                 MenuItem::action("Projects…", ShowProjects),
                 MenuItem::separator(),
                 MenuItem::action("New Session", NewSession),
+                MenuItem::action("New Terminal", NewTerminal),
                 MenuItem::action("Close Session", CloseSession),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
@@ -140,6 +142,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-e", LaunchEditor, None),
         KeyBinding::new("ctrl-shift-o", OpenProject, None),
         KeyBinding::new("ctrl-shift-t", NewSession, None),
+        KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-shift-w", CloseSession, None),
         KeyBinding::new("ctrl-tab", NextSession, None),
         KeyBinding::new("ctrl-shift-tab", PrevSession, None),
@@ -473,6 +476,23 @@ impl Workspace {
             cx,
             |host, id, project, sink| {
                 usecases::start_session(&[host], id, &profile, project, sink)
+                    .map_err(|e| e.to_string())
+            },
+        );
+    }
+
+    /// Opens a plain shell in the project folder, with no agent.
+    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.sessions_started += 1;
+        let label = format!("Terminal {}", self.sessions_started);
+        let shell = agent_terminal::default_shell();
+        self.start_tab(
+            label,
+            SessionKind::Agent,
+            window,
+            cx,
+            move |host, id, project, sink| {
+                usecases::start_terminal(&[host], id, shell, project, sink)
                     .map_err(|e| e.to_string())
             },
         );
@@ -1637,13 +1657,15 @@ impl Workspace {
                     .primary()
                     .icon(Icon::new(IconName::Plus))
                     .label("New session")
-                    .tooltip("Pick an agent (Ctrl+Shift+T starts the first)")
+                    .tooltip(
+                        "Pick an agent or a plain terminal (Ctrl+Shift+T starts the first agent)",
+                    )
                     .dropdown_menu({
                         let this = cx.entity().downgrade();
                         let names: Vec<String> =
                             self.profiles.iter().map(|p| p.name.clone()).collect();
                         move |menu, _, _| {
-                            names.iter().enumerate().fold(menu, |menu, (i, name)| {
+                            let menu = names.iter().enumerate().fold(menu, |menu, (i, name)| {
                                 let this = this.clone();
                                 menu.item(PopupMenuItem::new(name.clone()).on_click(
                                     move |_, window, cx| {
@@ -1651,7 +1673,17 @@ impl Workspace {
                                             .update(cx, |this, cx| this.start_agent(i, window, cx));
                                     },
                                 ))
-                            })
+                            });
+                            let this = this.clone();
+                            menu.separator().item(
+                                PopupMenuItem::new("Terminal (Ctrl+Shift+`)").on_click(
+                                    move |_, window, cx| {
+                                        let _ = this.update(cx, |this, cx| {
+                                            this.new_terminal(&NewTerminal, window, cx)
+                                        });
+                                    },
+                                ),
+                            )
                         }
                     }),
             );
@@ -1687,6 +1719,7 @@ impl Render for Workspace {
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::prompt_open))
             .on_action(cx.listener(Self::new_session))
+            .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::close_session))
             .on_action(cx.listener(Self::next_session))
             .on_action(cx.listener(Self::prev_session))
