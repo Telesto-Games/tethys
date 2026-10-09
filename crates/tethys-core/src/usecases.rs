@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::debug::{self, FindEditorError, ProcessInfo};
+use crate::debug::{self, FindEditorError, ProcessInfo, SourceBreakpoint};
 use crate::diff::{self, FileDiff};
 use crate::domain::{AdapterKind, AgentProfile, DomainError, Project, ProjectError, SessionId};
 use crate::ports::{
@@ -162,9 +162,11 @@ pub fn launch_editor(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum AttachError {
+pub enum DebugStartError {
     #[error(transparent)]
     Find(#[from] FindEditorError),
+    #[error(transparent)]
+    Tool(#[from] ToolError),
     #[error("can't list processes: {0}")]
     List(PortError),
     #[error("can't attach to {exe} (process {pid}): {source}")]
@@ -173,24 +175,83 @@ pub enum AttachError {
         pid: u32,
         source: PortError,
     },
+    #[error("can't start {program} under the debugger: {source}")]
+    Launch { program: String, source: PortError },
 }
 
-/// Attaches the debugger to the Unreal Editor that has `project` open.
-pub fn attach_to_editor(
+/// How to start debugging the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugStart {
+    /// Attach if this project's editor is running, otherwise launch it.
+    Auto,
+    Attach,
+    Launch,
+}
+
+/// The debugged editor: which process, and whether Tethys started it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Debuggee {
+    pub process: ProcessInfo,
+    pub launched: bool,
+}
+
+/// Starts debugging the Unreal Editor for `project`: attaching to the one that
+/// has it open, or launching one under the debugger (in `configuration`).
+/// `breakpoints` are set before the editor runs on.
+pub fn debug_editor(
     debugger: &dyn Debugger,
     project: &Project,
+    configuration: Configuration,
+    how: DebugStart,
+    breakpoints: Vec<SourceBreakpoint>,
     events: DebugEventSink,
-) -> Result<(ProcessInfo, Box<dyn DebugSession>), AttachError> {
-    let processes = debugger.processes().map_err(AttachError::List)?;
-    let editor = debug::find_editor(&processes, &project.path)?.clone();
+) -> Result<(Debuggee, Box<dyn DebugSession>), DebugStartError> {
+    let running = match how {
+        DebugStart::Launch => None,
+        DebugStart::Attach | DebugStart::Auto => {
+            let processes = debugger.processes().map_err(DebugStartError::List)?;
+            match debug::find_editor(&processes, &project.path) {
+                Ok(editor) => Some(editor.clone()),
+                Err(FindEditorError::NoneRunning) if how == DebugStart::Auto => None,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    if let Some(editor) = running {
+        let session = debugger
+            .attach(editor.pid, breakpoints, events)
+            .map_err(|source| DebugStartError::Attach {
+                exe: editor.exe.clone(),
+                pid: editor.pid,
+                source,
+            })?;
+        let debuggee = Debuggee {
+            process: editor,
+            launched: false,
+        };
+        return Ok((debuggee, session));
+    }
+    let cmd = unreal::editor_command(project, configuration)?;
     let session = debugger
-        .attach(editor.pid, events)
-        .map_err(|source| AttachError::Attach {
-            exe: editor.exe.clone(),
-            pid: editor.pid,
+        .launch(&cmd, project.root(), breakpoints, events)
+        .map_err(|source| DebugStartError::Launch {
+            program: cmd.program.display().to_string(),
             source,
         })?;
-    Ok((editor, session))
+    let exe = cmd
+        .program
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let debuggee = Debuggee {
+        process: ProcessInfo {
+            pid: session.pid(),
+            exe,
+            details: String::new(),
+        },
+        launched: true,
+    };
+    Ok((debuggee, session))
 }
 
 /// Moves `path` to the front of the recent projects list and saves it.
@@ -554,10 +615,15 @@ mod tool_tests {
         p
     }
 
-    struct FakeDebugger(Vec<ProcessInfo>, Mutex<Vec<u32>>);
-    struct FakeDebugSession;
+    /// Records what it was asked to do: `attach:<pid>` or `launch:<program>`.
+    #[derive(Default)]
+    struct FakeDebugger(Vec<ProcessInfo>, Mutex<Vec<String>>);
+    struct FakeDebugSession(u32);
     impl DebugSession for FakeDebugSession {
-        fn set_breakpoints(&self, _: Vec<crate::debug::SourceBreakpoint>) {}
+        fn pid(&self) -> u32 {
+            self.0
+        }
+        fn set_breakpoints(&self, _: Vec<SourceBreakpoint>) {}
         fn resume(&self) {}
         fn pause(&self) {}
         fn detach(&self) {}
@@ -566,19 +632,51 @@ mod tool_tests {
         fn processes(&self) -> PortResult<Vec<ProcessInfo>> {
             Ok(self.0.clone())
         }
-        fn attach(&self, pid: u32, _: DebugEventSink) -> PortResult<Box<dyn DebugSession>> {
-            self.1.lock().unwrap().push(pid);
-            Ok(Box::new(FakeDebugSession))
+        fn attach(
+            &self,
+            pid: u32,
+            _: Vec<SourceBreakpoint>,
+            _: DebugEventSink,
+        ) -> PortResult<Box<dyn DebugSession>> {
+            self.1.lock().unwrap().push(format!("attach:{pid}"));
+            Ok(Box::new(FakeDebugSession(pid)))
+        }
+        fn launch(
+            &self,
+            command: &CommandSpec,
+            cwd: &Path,
+            _: Vec<SourceBreakpoint>,
+            _: DebugEventSink,
+        ) -> PortResult<Box<dyn DebugSession>> {
+            assert_eq!(cwd, Path::new(r"D:\g"));
+            let call = format!("launch:{}", command.program.display());
+            self.1.lock().unwrap().push(call);
+            Ok(Box::new(FakeDebugSession(77)))
         }
     }
 
-    #[test]
-    fn attaches_to_the_projects_editor() {
-        let editor = |pid, uproject: &str| ProcessInfo {
+    fn editor(pid: u32, uproject: &str) -> ProcessInfo {
+        ProcessInfo {
             pid,
             exe: "UnrealEditor.exe".into(),
             details: format!("UnrealEditor.exe {uproject}"),
-        };
+        }
+    }
+
+    fn debug(debugger: &FakeDebugger, how: DebugStart) -> Result<Debuggee, DebugStartError> {
+        let started = debug_editor(
+            debugger,
+            &project(),
+            Configuration::DebugGame,
+            how,
+            Vec::new(),
+            Arc::new(|_| {}),
+        );
+        started.map(|(debuggee, _)| debuggee)
+    }
+
+    #[test]
+    fn debugging_attaches_to_the_projects_running_editor() {
         let debugger = FakeDebugger(
             vec![
                 editor(5, r"D:\o\Other.uproject"),
@@ -586,18 +684,34 @@ mod tool_tests {
             ],
             Mutex::default(),
         );
-        let (found, _) = attach_to_editor(&debugger, &project(), Arc::new(|_| {})).unwrap();
-        assert_eq!(found.pid, 9);
-        assert_eq!(*debugger.1.lock().unwrap(), vec![9]);
+        let debuggee = debug(&debugger, DebugStart::Auto).unwrap();
+        assert_eq!(debuggee.process.pid, 9);
+        assert!(!debuggee.launched);
+        assert_eq!(*debugger.1.lock().unwrap(), vec!["attach:9"]);
+    }
 
-        let none = FakeDebugger(vec![], Mutex::default());
-        let err = attach_to_editor(&none, &project(), Arc::new(|_| {}))
-            .err()
-            .unwrap();
+    #[test]
+    fn debugging_launches_the_editor_when_none_is_running() {
+        let debugger = FakeDebugger::default();
+        let debuggee = debug(&debugger, DebugStart::Auto).unwrap();
+        assert!(debuggee.launched);
+        assert_eq!(debuggee.process.pid, 77);
+        assert_eq!(debuggee.process.exe, "UnrealEditor-Win64-DebugGame.exe");
+        assert_eq!(
+            *debugger.1.lock().unwrap(),
+            vec![r"launch:D:\UE\Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe"]
+        );
+    }
+
+    #[test]
+    fn explicit_attach_and_launch_do_only_that() {
+        let none = FakeDebugger::default();
         assert!(matches!(
-            err,
-            AttachError::Find(FindEditorError::NoneRunning)
+            debug(&none, DebugStart::Attach),
+            Err(DebugStartError::Find(FindEditorError::NoneRunning))
         ));
+        let running = FakeDebugger(vec![editor(9, r"D:\g\Game.uproject")], Mutex::default());
+        assert!(debug(&running, DebugStart::Launch).unwrap().launched);
     }
 
     #[test]

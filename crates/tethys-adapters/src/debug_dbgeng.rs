@@ -5,12 +5,15 @@
 //! its own that makes every call, and the UI talks to it over a channel. See
 //! "Debugging the editor" in `docs/design.md`.
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
 use tethys_core::debug::{DebugEvent, ProcessInfo, SourceBreakpoint};
 use tethys_core::ports::{DebugEventSink, DebugSession, Debugger, PortResult};
+use tethys_core::unreal::CommandSpec;
 
 /// How long dropping a session waits for the detach.
 const DETACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,13 +28,24 @@ enum Command {
     Detach,
 }
 
+/// What a session debugs.
+enum Target {
+    Attach(u32),
+    Launch { command_line: String, cwd: PathBuf },
+}
+
 struct Session {
+    pid: u32,
     commands: Sender<Command>,
     /// Disconnects when the session's thread ends.
     done: Receiver<()>,
 }
 
 impl DebugSession for Session {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
     fn set_breakpoints(&self, breakpoints: Vec<SourceBreakpoint>) {
         let _ = self.commands.send(Command::SetBreakpoints(breakpoints));
     }
@@ -60,37 +74,163 @@ impl Drop for Session {
 
 impl Debugger for DbgEng {
     fn processes(&self) -> PortResult<Vec<ProcessInfo>> {
+        // Listing uses the engine too.
+        let _busy = BusyGuard::claim()?;
         engine::processes()
     }
 
-    /// Blocks until the attach completes, which can take a few seconds for
-    /// the editor, so call it off the UI thread.
-    fn attach(&self, pid: u32, events: DebugEventSink) -> PortResult<Box<dyn DebugSession>> {
-        let (commands, received) = mpsc::channel();
-        let (ready_tx, ready) = mpsc::channel();
-        let (done_tx, done) = mpsc::channel::<()>();
-        thread::Builder::new()
-            .name(format!("tethys-debug-{pid}"))
-            .spawn(move || {
-                let _done = done_tx;
-                let engine = match engine::Engine::attach(pid) {
-                    Ok(engine) => {
-                        let _ = ready_tx.send(Ok(()));
-                        engine
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                let end = engine.run(&received, &*events);
-                events(DebugEvent::Ended(end));
-            })?;
-        match ready.recv() {
-            Ok(Ok(())) => Ok(Box::new(Session { commands, done })),
-            Ok(Err(e)) => Err(e.into()),
-            Err(_) => Err("the debugger thread stopped unexpectedly".into()),
+    /// Blocks until the attach completes, so call it off the UI thread.
+    fn attach(
+        &self,
+        pid: u32,
+        breakpoints: Vec<SourceBreakpoint>,
+        events: DebugEventSink,
+    ) -> PortResult<Box<dyn DebugSession>> {
+        start(Target::Attach(pid), breakpoints, events)
+    }
+
+    /// Blocks until the process has started, so call it off the UI thread.
+    fn launch(
+        &self,
+        command: &CommandSpec,
+        cwd: &Path,
+        breakpoints: Vec<SourceBreakpoint>,
+        events: DebugEventSink,
+    ) -> PortResult<Box<dyn DebugSession>> {
+        let target = Target::Launch {
+            command_line: command_line(command),
+            cwd: cwd.to_path_buf(),
+        };
+        start(target, breakpoints, events)
+    }
+}
+
+/// DbgEng is one engine per process, not per client: a second session at the
+/// same time breaks the first. Set while a session's thread runs.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+const BUSY_MESSAGE: &str =
+    "Tethys can debug one editor at a time. Detach in the other window first";
+
+/// Clears [`BUSY`] when the session's thread ends.
+struct BusyGuard;
+
+impl BusyGuard {
+    fn claim() -> PortResult<Self> {
+        BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| BusyGuard)
+            .map_err(|_| BUSY_MESSAGE.into())
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// Starts a session's thread and waits until it's attached.
+fn start(
+    target: Target,
+    breakpoints: Vec<SourceBreakpoint>,
+    events: DebugEventSink,
+) -> PortResult<Box<dyn DebugSession>> {
+    let busy = BusyGuard::claim()?;
+    let (commands, received) = mpsc::channel();
+    let (ready_tx, ready) = mpsc::channel();
+    let (done_tx, done) = mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("tethys-debug".into())
+        .spawn(move || {
+            // Dropped in reverse order: the engine is released, then `busy`,
+            // then `done` tells a dropped session it may start another.
+            let _done = done_tx;
+            let busy = busy;
+            let end = match engine::Engine::start(&target, breakpoints) {
+                Ok(engine) => {
+                    let _ = ready_tx.send(Ok(engine.pid()));
+                    engine.run(&received, &*events)
+                }
+                Err(e) => {
+                    drop(busy);
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            drop(busy);
+            events(DebugEvent::Ended(end));
+        })?;
+    match ready.recv() {
+        Ok(Ok(pid)) => Ok(Box::new(Session {
+            pid,
+            commands,
+            done,
+        })),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err("the debugger thread stopped unexpectedly".into()),
+    }
+}
+
+/// A Windows command line for `command`, quoting each part the way
+/// `CommandLineToArgvW` reads it back.
+fn command_line(command: &CommandSpec) -> String {
+    let program = command.program.display().to_string();
+    std::iter::once(program.as_str())
+        .chain(command.args.iter().map(String::as_str))
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are escaped, and so is the quote.
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+                continue;
+            }
+            _ => {}
         }
+        if c != '\\' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+            backslashes = 0;
+            quoted.push(c);
+        }
+    }
+    // Backslashes before the closing quote are escaped.
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quotes_command_lines_like_argv() {
+        let command = CommandSpec {
+            program: PathBuf::from(r"C:\Program Files\UE\UnrealEditor.exe"),
+            args: vec![
+                r"D:\g\Game.uproject".into(),
+                r"D:\My Game\".into(),
+                r#"say "hi""#.into(),
+                String::new(),
+            ],
+        };
+        assert_eq!(
+            command_line(&command),
+            r#""C:\Program Files\UE\UnrealEditor.exe" D:\g\Game.uproject "D:\My Game\\" "say \"hi\"" """#
+        );
     }
 }
 
@@ -98,10 +238,10 @@ impl Debugger for DbgEng {
 mod engine {
     use std::sync::mpsc::Receiver;
 
-    use tethys_core::debug::{DebugEnd, DebugEvent, ProcessInfo};
+    use tethys_core::debug::{DebugEnd, DebugEvent, ProcessInfo, SourceBreakpoint};
     use tethys_core::ports::PortResult;
 
-    use super::Command;
+    use super::{Command, Target};
 
     pub fn processes() -> PortResult<Vec<ProcessInfo>> {
         Err("debugging is only available on Windows".into())
@@ -110,8 +250,12 @@ mod engine {
     pub struct Engine;
 
     impl Engine {
-        pub fn attach(_: u32) -> Result<Self, String> {
+        pub fn start(_: &Target, _: Vec<SourceBreakpoint>) -> Result<Self, String> {
             Err("debugging is only available on Windows".into())
+        }
+
+        pub fn pid(&self) -> u32 {
+            0
         }
 
         pub fn run(self, _: &Receiver<Command>, _: &dyn Fn(DebugEvent)) -> DebugEnd {
@@ -136,18 +280,21 @@ mod engine {
     use windows::Win32::System::Diagnostics::Debug::DebugBreakProcess;
     use windows::Win32::System::Diagnostics::Debug::Extensions::*;
     use windows::Win32::System::Diagnostics::Debug::SYMOPT_LOAD_LINES;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
-    use windows::core::{Interface, PCSTR};
+    use windows::Win32::System::Threading::{
+        DEBUG_ONLY_THIS_PROCESS, OpenProcess, PROCESS_ALL_ACCESS,
+    };
+    use windows::core::{HSTRING, Interface, PCSTR, PCWSTR};
 
-    use super::Command;
+    use super::{Command, Target};
 
     /// `int 3`: a breakpoint instruction, including the OS's break-in thread.
     const STATUS_BREAKPOINT: i32 = 0x8000_0003_u32 as i32;
     /// The same, from a 32-bit program under WOW64.
     const STATUS_WX86_BREAKPOINT: i32 = 0x4000_001F;
-    /// The function the OS runs in a new thread to break into a running
-    /// process, on attach and for `break_in`. Stops in it are ours.
-    const BREAK_IN_THREAD: &str = "DbgUiRemoteBreakin";
+    /// Modules of the OS's own breakpoints: the break-in thread (on attach and
+    /// for `break_in`) and the loader's breakpoint in a new process. A
+    /// breakpoint with only these on the stack is ours, not the program's.
+    const SYSTEM_MODULES: [&str; 3] = ["ntdll", "kernel32", "kernelbase"];
     const INFINITE: u32 = u32::MAX;
     /// How long a wait lasts while the program runs, before checking for commands.
     const POLL_MS: u32 = 100;
@@ -155,6 +302,35 @@ mod engine {
 
     fn failed(context: &str) -> impl Fn(windows::core::Error) -> String + '_ {
         move |e| format!("{context}: {}", e.message())
+    }
+
+    /// Whether a frame is in the OS (`ntdll!…`), by its symbol's module.
+    fn is_system_frame(frame: &StackFrame) -> bool {
+        frame.function.split_once('!').is_some_and(|(module, _)| {
+            SYSTEM_MODULES
+                .iter()
+                .any(|m| module.eq_ignore_ascii_case(m))
+        })
+    }
+
+    /// Tethys's environment plus `_NO_DEBUG_HEAP=1`, as a block for
+    /// CreateProcess. Processes started under a debugger otherwise get the NT
+    /// debug heap, which makes the editor much slower. (DbgEng's own
+    /// `DEBUG_CREATE_PROCESS_NO_DEBUG_HEAP` flag makes the System32 engine fail.)
+    fn environment_without_debug_heap() -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut block = Vec::new();
+        let vars = std::env::vars_os().filter(|(k, _)| !k.eq_ignore_ascii_case("_NO_DEBUG_HEAP"));
+        for (key, value) in vars {
+            block.extend(key.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
+        block.extend("_NO_DEBUG_HEAP=1".encode_utf16());
+        block.extend([0, 0]);
+        block
     }
 
     /// Reads a NUL-terminated ANSI string out of `buf`.
@@ -235,6 +411,8 @@ mod engine {
         /// Ours or uninteresting: carry on.
         Ignore,
         Stop(DebugEvent),
+        /// A module that a waiting breakpoint is in has loaded.
+        Rebind,
         Exited,
     }
 
@@ -246,37 +424,49 @@ mod engine {
         /// For breaking in. DbgEng's own `SetInterrupt` only works from
         /// another thread while this one waits.
         process: HANDLE,
+        pid: u32,
         wanted: Vec<SourceBreakpoint>,
         /// Breakpoint ids currently set in the engine.
         applied: Vec<u32>,
+        /// Modules of breakpoints waiting for their module to load. While
+        /// there are any, the engine stops on each module load.
+        waiting: Vec<String>,
+        /// Folders already on the symbol path.
+        symbol_folders: Vec<String>,
     }
 
     impl Drop for Engine {
         fn drop(&mut self) {
-            // SAFETY: `process` was opened by `attach` and is closed once.
-            let _ = unsafe { CloseHandle(self.process) };
+            if !self.process.is_invalid() {
+                // SAFETY: `process` was opened by `start` and is closed once.
+                let _ = unsafe { CloseHandle(self.process) };
+            }
         }
     }
 
     impl Engine {
-        /// Attaches and waits for the attach break. Returns stopped there.
-        pub fn attach(pid: u32) -> Result<Self, String> {
-            // SAFETY: DbgEng calls on objects this thread owns.
+        /// Attaches or launches, and waits for the first break (the attach
+        /// break, or the loader's breakpoint in a new process). Returns stopped
+        /// there.
+        pub fn start(target: &Target, breakpoints: Vec<SourceBreakpoint>) -> Result<Self, String> {
+            // SAFETY: DbgEng calls on objects this thread owns; the strings and
+            // options passed outlive the calls.
             unsafe {
                 let client: IDebugClient = DebugCreate().map_err(failed("can't start DbgEng"))?;
                 let control: IDebugControl = client.cast().map_err(failed("DbgEng"))?;
                 let symbols: IDebugSymbols3 = client.cast().map_err(failed("DbgEng"))?;
                 let system: IDebugSystemObjects = client.cast().map_err(failed("DbgEng"))?;
-                let process = OpenProcess(PROCESS_ALL_ACCESS, false, pid)
-                    .map_err(failed("can't open the process"))?;
-                let engine = Engine {
+                let mut engine = Engine {
                     client,
                     control,
                     symbols,
                     system,
-                    process,
-                    wanted: Vec::new(),
+                    process: HANDLE::default(),
+                    pid: 0,
+                    wanted: breakpoints,
                     applied: Vec::new(),
+                    waiting: Vec::new(),
+                    symbol_folders: Vec::new(),
                 };
                 engine
                     .control
@@ -286,23 +476,60 @@ mod engine {
                     .symbols
                     .AddSymbolOptions(SYMOPT_LOAD_LINES)
                     .map_err(failed("DbgEng"))?;
-                engine
-                    .client
-                    .AttachProcess(0, pid, DEBUG_ATTACH_DEFAULT)
-                    .map_err(failed("attach failed"))?;
+                match target {
+                    Target::Attach(pid) => engine
+                        .client
+                        .AttachProcess(0, *pid, DEBUG_ATTACH_DEFAULT)
+                        .map_err(failed("attach failed"))?,
+                    Target::Launch { command_line, cwd } => {
+                        let client: IDebugClient5 =
+                            engine.client.cast().map_err(failed("DbgEng"))?;
+                        // Child processes (shader compilers, the crash
+                        // reporter) aren't debugged.
+                        let options = DEBUG_CREATE_PROCESS_OPTIONS {
+                            CreateFlags: DEBUG_ONLY_THIS_PROCESS.0,
+                            EngCreateFlags: DEBUG_ECREATE_PROCESS_DEFAULT,
+                            VerifierFlags: 0,
+                            Reserved: 0,
+                        };
+                        let environment = environment_without_debug_heap();
+                        client
+                            .CreateProcessAndAttach2Wide(
+                                0,
+                                &HSTRING::from(command_line.as_str()),
+                                &options as *const _ as *const c_void,
+                                size_of::<DEBUG_CREATE_PROCESS_OPTIONS>() as u32,
+                                &HSTRING::from(cwd.as_os_str()),
+                                PCWSTR::from_raw(environment.as_ptr()),
+                                0,
+                                DEBUG_ATTACH_DEFAULT,
+                            )
+                            .map_err(failed("can't start the program"))?;
+                    }
+                }
                 match engine.wait(INFINITE)? {
                     Wait::Event => {}
-                    Wait::Exited => return Err("the process exited while attaching".into()),
-                    Wait::TimedOut => return Err("the attach didn't complete".into()),
+                    Wait::Exited => return Err("the process exited while starting".into()),
+                    Wait::TimedOut => return Err("the debugger didn't get control".into()),
                 }
+                engine.pid = engine
+                    .system
+                    .GetCurrentProcessSystemId()
+                    .map_err(failed("DbgEng"))?;
+                engine.process = OpenProcess(PROCESS_ALL_ACCESS, false, engine.pid)
+                    .map_err(failed("can't open the process"))?;
                 // If Tethys exits without detaching, the editor keeps running.
                 engine
                     .client
                     .SetProcessOptions(DEBUG_PROCESS_DETACH_ON_EXIT)
                     .map_err(failed("DbgEng"))?;
-                engine.add_module_folders_to_symbol_path();
+                engine.refresh_symbol_path();
                 Ok(engine)
             }
+        }
+
+        pub fn pid(&self) -> u32 {
+            self.pid
         }
 
         /// Serves commands until the session ends.
@@ -326,7 +553,11 @@ mod engine {
             commands: &Receiver<Command>,
             events: &dyn Fn(DebugEvent),
         ) -> Result<DebugEnd, String> {
-            // Starts at the attach break, which the user doesn't see.
+            // Starts at the first break, which the user doesn't see. Breakpoints
+            // passed to `start` go in before the program runs on.
+            if !self.wanted.is_empty() {
+                events(DebugEvent::Breakpoints(self.apply_breakpoints()));
+            }
             let mut stopped = true;
             // Whether the user sees the current stop (else it's resumed once
             // the queued commands are handled).
@@ -393,6 +624,9 @@ mod engine {
                         stopped = true;
                         match self.inspect_event()? {
                             Seen::Ignore => {}
+                            Seen::Rebind => {
+                                events(DebugEvent::Breakpoints(self.apply_breakpoints()))
+                            }
                             Seen::Exited => return Ok(self.end_session(false)),
                             Seen::Stop(event) => {
                                 shown = true;
@@ -428,7 +662,7 @@ mod engine {
         }
 
         /// Makes the OS start a thread in the program that hits a breakpoint;
-        /// the next wait returns with it ([`BREAK_IN_THREAD`]).
+        /// the next wait returns with it (see [`SYSTEM_MODULES`]).
         fn break_in(&self) -> Result<(), String> {
             // SAFETY: `process` is a live handle with all access.
             unsafe { DebugBreakProcess(self.process) }.map_err(failed("can't break in"))
@@ -441,7 +675,7 @@ mod engine {
         }
 
         /// Classifies the event the engine just stopped on.
-        fn inspect_event(&self) -> Result<Seen, String> {
+        fn inspect_event(&mut self) -> Result<Seen, String> {
             let mut kind = 0;
             let (mut process, mut thread) = (0, 0);
             // The largest extra information we read; a breakpoint's id is its first u32.
@@ -481,16 +715,18 @@ mod engine {
                         StopReason::Exception(c_text(&description))
                     }
                 }
+                DEBUG_EVENT_LOAD_MODULE => {
+                    // SAFETY: for module loads the extra information is a
+                    // DEBUG_LAST_EVENT_INFO_LOAD_MODULE, which starts with the base.
+                    let base = unsafe { *(&info as *const _ as *const u64) };
+                    return Ok(self.module_loaded(base));
+                }
                 DEBUG_EVENT_EXIT_PROCESS => return Ok(Seen::Exited),
                 _ => return Ok(Seen::Ignore),
             };
+            self.refresh_symbol_path();
             let frames = self.stack();
-            if reason == StopReason::DebugBreak
-                && frames
-                    .iter()
-                    .take(4)
-                    .any(|f| f.function.contains(BREAK_IN_THREAD))
-            {
+            if reason == StopReason::DebugBreak && frames.iter().all(is_system_frame) {
                 return Ok(Seen::Ignore);
             }
             Ok(Seen::Stop(DebugEvent::Stopped {
@@ -500,8 +736,62 @@ mod engine {
             }))
         }
 
+        /// Whether a waiting breakpoint is in the module loaded at `base`.
+        fn module_loaded(&self, base: u64) -> Seen {
+            let mut name = vec![0u8; 1024];
+            // SAFETY: the buffer outlives the call.
+            let found = unsafe {
+                self.symbols.GetModuleNameString(
+                    DEBUG_MODNAME_IMAGE,
+                    DEBUG_ANY_ID,
+                    base,
+                    Some(&mut name),
+                    None,
+                )
+            };
+            if found.is_err() {
+                return Seen::Ignore;
+            }
+            let image = PathBuf::from(c_text(&name));
+            let stem = image.file_stem().unwrap_or_default().to_string_lossy();
+            if self
+                .waiting
+                .iter()
+                .any(|m| debug::is_module_image(m, &stem))
+            {
+                Seen::Rebind
+            } else {
+                Seen::Ignore
+            }
+        }
+
+        /// Stops on every module load while breakpoints wait for one.
+        fn stop_on_module_loads(&self, stop: bool) {
+            let mut params = [DEBUG_SPECIFIC_FILTER_PARAMETERS::default()];
+            // SAFETY: DbgEng calls on objects this thread owns; `params` holds
+            // the one filter asked for.
+            unsafe {
+                if self
+                    .control
+                    .GetSpecificFilterParameters(DEBUG_FILTER_LOAD_MODULE, &mut params)
+                    .is_err()
+                {
+                    return;
+                }
+                params[0].ExecutionOption = if stop {
+                    DEBUG_FILTER_BREAK
+                } else {
+                    DEBUG_FILTER_IGNORE
+                };
+                let _ = self
+                    .control
+                    .SetSpecificFilterParameters(DEBUG_FILTER_LOAD_MODULE, &params);
+            }
+        }
+
         /// A pause stops in the OS's break-in thread, so show the main (game) thread.
-        fn paused(&self) -> DebugEvent {
+        fn paused(&mut self) -> DebugEvent {
+            self.refresh_symbol_path();
             let (mut id, mut system_id) = (0, 0);
             // SAFETY: DbgEng calls on objects this thread owns; the outputs
             // are single u32s and the count is 1.
@@ -618,23 +908,32 @@ mod engine {
 
         /// UBT writes each PDB next to its DLL, but Launcher engines record
         /// build-machine PDB paths, so search every loaded module's folder.
-        fn add_module_folders_to_symbol_path(&self) {
-            let mut folders: Vec<String> = Vec::new();
+        /// Symbols load lazily, so adding folders before each lookup is enough.
+        fn refresh_symbol_path(&mut self) {
+            let mut added = Vec::new();
             for (image, _) in self.modules() {
                 let Some(folder) = image.parent().map(|f| f.display().to_string()) else {
                     continue;
                 };
-                if !folder.is_empty() && !folders.iter().any(|f| f.eq_ignore_ascii_case(&folder)) {
-                    folders.push(folder);
+                let known = |f: &String| f.eq_ignore_ascii_case(&folder);
+                if !folder.is_empty()
+                    && !self.symbol_folders.iter().any(known)
+                    && !added.iter().any(known)
+                {
+                    added.push(folder);
                 }
             }
-            if let Ok(path) = CString::new(folders.join(";")) {
+            if added.is_empty() {
+                return;
+            }
+            if let Ok(path) = CString::new(added.join(";")) {
                 // SAFETY: `path` outlives the call.
                 let _ = unsafe {
                     self.symbols
                         .AppendSymbolPath(PCSTR::from_raw(path.as_ptr().cast()))
                 };
             }
+            self.symbol_folders.extend(added);
         }
 
         /// The engine's breakpoint `id`. The engine owns breakpoint objects and
@@ -663,8 +962,9 @@ mod engine {
                     Some((image.file_stem()?.to_string_lossy().into_owned(), name))
                 })
                 .collect();
+            self.refresh_symbol_path();
             let wanted = self.wanted.clone();
-            wanted
+            let states: Vec<_> = wanted
                 .iter()
                 .map(|b| {
                     let state = self.set_breakpoint(b, &modules);
@@ -673,7 +973,17 @@ mod engine {
                     }
                     (b.id, state)
                 })
-                .collect()
+                .collect();
+            // A pending breakpoint's module may load under a name the engine
+            // can't guess (e.g. `-Win64-DebugGame`), so bind it when it loads.
+            self.waiting = wanted
+                .iter()
+                .zip(&states)
+                .filter(|(_, (_, state))| *state == BreakpointState::Pending)
+                .filter_map(|(b, _)| b.module.clone())
+                .collect();
+            self.stop_on_module_loads(!self.waiting.is_empty());
+            states
         }
 
         fn set_breakpoint(
@@ -743,8 +1053,15 @@ mod engine {
     mod tests {
         use super::*;
 
+        /// DbgEng allows one session per process, and tests run in parallel.
+        fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+            static ENGINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            ENGINE.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
         #[test]
         fn lists_processes_including_this_one() {
+            let _engine = one_at_a_time();
             let me = std::process::id();
             let processes = processes().unwrap();
             assert!(processes.iter().any(|p| p.pid == me && !p.exe.is_empty()));
@@ -756,13 +1073,73 @@ mod engine {
             assert_eq!(c_text(b"full"), "full");
         }
 
+        /// Collects a session's events and waits for them.
+        struct Events(std::sync::Arc<std::sync::Mutex<Vec<DebugEvent>>>);
+
+        impl Events {
+            fn new() -> (Self, tethys_core::ports::DebugEventSink) {
+                let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = {
+                    let seen = seen.clone();
+                    std::sync::Arc::new(move |e: DebugEvent| seen.lock().unwrap().push(e))
+                };
+                (Events(seen), sink)
+            }
+
+            fn wait_for(
+                &self,
+                what: &str,
+                timeout_secs: u64,
+                pred: &dyn Fn(&DebugEvent) -> bool,
+            ) -> DebugEvent {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(timeout_secs) {
+                    if let Some(e) = self.0.lock().unwrap().iter().find(|e| pred(e)) {
+                        eprintln!("{what} after {:?}", start.elapsed());
+                        return e.clone();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                panic!(
+                    "timed out waiting for {what}; saw {:?}",
+                    self.0.lock().unwrap()
+                );
+            }
+
+            fn clear(&self) {
+                self.0.lock().unwrap().clear();
+            }
+        }
+
+        fn is_paused(e: &DebugEvent) -> bool {
+            matches!(e, DebugEvent::Stopped { reason: StopReason::Pause, frames, .. } if !frames.is_empty())
+        }
+
+        fn is_running(pid: u32) -> bool {
+            processes().unwrap().iter().any(|p| p.pid == pid)
+        }
+
+        /// Pauses, resumes and detaches, then checks the process lives on.
+        fn pause_and_detach(session: &dyn tethys_core::ports::DebugSession, events: &Events) {
+            events.wait_for("running", 20, &|e| *e == DebugEvent::Running);
+            session.pause();
+            events.wait_for("pause", 20, &is_paused);
+            session.resume();
+            session.detach();
+            events.wait_for("detach", 20, &|e| {
+                *e == DebugEvent::Ended(DebugEnd::Detached)
+            });
+            assert!(
+                is_running(session.pid()),
+                "the process died after detaching"
+            );
+        }
+
         /// Attaching to a real process, breaking in and detaching leaves it
         /// running. Starts and kills a `ping` of its own.
         #[test]
         fn attaches_pauses_and_detaches() {
-            use std::sync::{Arc, Mutex};
-            use std::time::{Duration, Instant};
-
+            let _engine = one_at_a_time();
             use tethys_core::ports::Debugger;
 
             let mut child = std::process::Command::new("ping")
@@ -770,49 +1147,87 @@ mod engine {
                 .stdout(std::process::Stdio::null())
                 .spawn()
                 .unwrap();
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let sink = {
-                let seen = seen.clone();
-                Arc::new(move |e: DebugEvent| seen.lock().unwrap().push(e))
-            };
-            let session = super::super::DbgEng.attach(child.id(), sink).unwrap();
-            let wait_for = |pred: &dyn Fn(&DebugEvent) -> bool| {
-                let start = Instant::now();
-                while start.elapsed() < Duration::from_secs(20) {
-                    if seen.lock().unwrap().iter().any(pred) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                panic!("timed out; saw {:?}", seen.lock().unwrap());
-            };
-            wait_for(&|e| *e == DebugEvent::Running);
-            session.pause();
-            wait_for(
-                &|e| matches!(e, DebugEvent::Stopped { reason: StopReason::Pause, frames, .. } if !frames.is_empty()),
-            );
-            session.resume();
-            session.detach();
-            wait_for(&|e| *e == DebugEvent::Ended(DebugEnd::Detached));
-            // Still alive after the detach.
-            assert!(child.try_wait().unwrap().is_none());
+            let (events, sink) = Events::new();
+            let session = super::super::DbgEng
+                .attach(child.id(), Vec::new(), sink)
+                .unwrap();
+            assert_eq!(session.pid(), child.id());
+            pause_and_detach(session.as_ref(), &events);
             child.kill().unwrap();
+            child.wait().unwrap();
         }
 
-        /// Against a running Unreal Editor: a breakpoint on code that runs
-        /// every frame binds and is hit, a pause shows the game thread, and
-        /// detaching leaves the editor running.
+        /// Launching under the debugger, then pausing and detaching, leaves the
+        /// program running.
+        #[test]
+        fn launches_pauses_and_detaches() {
+            let _engine = one_at_a_time();
+            use tethys_core::ports::Debugger;
+            use tethys_core::unreal::CommandSpec;
+
+            let system = std::env::var_os("SystemRoot").unwrap();
+            let ping = CommandSpec {
+                program: PathBuf::from(system).join(r"System32\PING.EXE"),
+                args: vec!["-n".into(), "30".into(), "127.0.0.1".into()],
+            };
+            let (events, sink) = Events::new();
+            let session = super::super::DbgEng
+                .launch(&ping, &std::env::temp_dir(), Vec::new(), sink)
+                .unwrap();
+            pause_and_detach(session.as_ref(), &events);
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &session.pid().to_string()])
+                .output();
+        }
+
+        /// A launched program gets Tethys's environment plus `_NO_DEBUG_HEAP`,
+        /// and its exit ends the session.
+        #[test]
+        fn launched_programs_skip_the_debug_heap() {
+            let _engine = one_at_a_time();
+            use tethys_core::ports::Debugger;
+            use tethys_core::unreal::CommandSpec;
+
+            let out = std::env::temp_dir().join(format!("tethys-env-{}.txt", std::process::id()));
+            let system = std::env::var_os("SystemRoot").unwrap();
+            let cmd = CommandSpec {
+                program: PathBuf::from(system).join(r"System32\cmd.exe"),
+                // cmd doesn't read argv-style quoting, so no part needs quotes.
+                args: vec![
+                    "/c".into(),
+                    "set".into(),
+                    ">".into(),
+                    out.display().to_string(),
+                ],
+            };
+            let (events, sink) = Events::new();
+            let _session = super::super::DbgEng
+                .launch(&cmd, &std::env::temp_dir(), Vec::new(), sink)
+                .unwrap();
+            events.wait_for("exit", 20, &|e| *e == DebugEvent::Ended(DebugEnd::Exited));
+            let env = std::fs::read_to_string(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert!(env.contains("_NO_DEBUG_HEAP=1"), "{env}");
+            assert!(env.to_ascii_uppercase().contains("SYSTEMROOT="), "{env}");
+        }
+
+        /// Against an Unreal Editor: a breakpoint on code that runs every frame
+        /// binds and is hit, a pause shows the game thread, and detaching
+        /// leaves the editor running. Attaches to the editor that has the
+        /// project open, or with `TETHYS_DEBUG_EDITOR=<UnrealEditor.exe>`
+        /// launches one (and leaves it running).
         ///
         /// `TETHYS_DEBUG_UPROJECT=<.uproject> TETHYS_DEBUG_BREAKPOINT=<file>:<line>
         /// cargo test -p tethys-adapters live_editor -- --ignored --nocapture`
         #[test]
         #[ignore]
         fn live_editor() {
+            let _engine = one_at_a_time();
             use std::path::Path;
-            use std::sync::{Arc, Mutex};
-            use std::time::{Duration, Instant};
+            use std::time::Instant;
 
             use tethys_core::ports::Debugger;
+            use tethys_core::unreal::CommandSpec;
 
             let (Some(uproject), Some(breakpoint)) = (
                 std::env::var_os("TETHYS_DEBUG_UPROJECT"),
@@ -820,35 +1235,42 @@ mod engine {
             ) else {
                 return;
             };
+            let uproject = PathBuf::from(uproject);
             let (file, line) = breakpoint.rsplit_once(':').unwrap();
             let file = PathBuf::from(file);
             let module = debug::module_for_source(&file, Path::is_file);
             eprintln!("breakpoint in module {module:?}");
+            let breakpoints = vec![SourceBreakpoint {
+                id: BreakpointId(1),
+                file: file.clone(),
+                line: line.parse().unwrap(),
+                module,
+            }];
 
-            let running = processes().unwrap();
-            let editor = debug::find_editor(&running, Path::new(&uproject)).unwrap();
-            eprintln!("attaching to {} ({})", editor.exe, editor.pid);
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let sink = {
-                let seen = seen.clone();
-                Arc::new(move |e: DebugEvent| seen.lock().unwrap().push(e))
-            };
+            let (events, sink) = Events::new();
             let started = Instant::now();
-            let session = super::super::DbgEng.attach(editor.pid, sink).unwrap();
-            let wait_for = |what: &str, pred: &dyn Fn(&DebugEvent) -> bool| -> DebugEvent {
-                let start = Instant::now();
-                while start.elapsed() < Duration::from_secs(120) {
-                    if let Some(e) = seen.lock().unwrap().iter().find(|e| pred(e)) {
-                        eprintln!("{what} after {:?}", start.elapsed());
-                        return e.clone();
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
+            let session = match std::env::var_os("TETHYS_DEBUG_EDITOR") {
+                Some(editor) => {
+                    let command = CommandSpec {
+                        program: PathBuf::from(editor),
+                        args: vec![uproject.display().to_string()],
+                    };
+                    let cwd = uproject.parent().unwrap();
+                    eprintln!("launching {}", command.program.display());
+                    super::super::DbgEng
+                        .launch(&command, cwd, breakpoints, sink)
+                        .unwrap()
                 }
-                panic!(
-                    "timed out waiting for {what}; saw {:?}",
-                    seen.lock().unwrap()
-                );
+                None => {
+                    let running = processes().unwrap();
+                    let editor = debug::find_editor(&running, &uproject).unwrap();
+                    eprintln!("attaching to {} ({})", editor.exe, editor.pid);
+                    super::super::DbgEng
+                        .attach(editor.pid, breakpoints, sink)
+                        .unwrap()
+                }
             };
+            eprintln!("started in {:?}", started.elapsed());
             let print = |event: &DebugEvent| {
                 if let DebugEvent::Stopped { reason, frames, .. } = event {
                     eprintln!("  stopped: {reason:?}");
@@ -857,20 +1279,11 @@ mod engine {
                     }
                 }
             };
-            wait_for("running", &|e| *e == DebugEvent::Running);
-            eprintln!("attached in {:?}", started.elapsed());
-
-            session.set_breakpoints(vec![SourceBreakpoint {
-                id: BreakpointId(1),
-                file: file.clone(),
-                line: line.parse().unwrap(),
-                module,
-            }]);
-            let states = wait_for("breakpoint states", &|e| {
-                matches!(e, DebugEvent::Breakpoints(_))
+            let bound = events.wait_for("breakpoint bound", 600, &|e| {
+                matches!(e, DebugEvent::Breakpoints(s) if s.iter().all(|(_, s)| *s == BreakpointState::Bound))
             });
-            eprintln!("  {states:?}");
-            let hit = wait_for("breakpoint hit", &|e| {
+            eprintln!("  {bound:?}");
+            let hit = events.wait_for("breakpoint hit", 600, &|e| {
                 matches!(
                     e,
                     DebugEvent::Stopped {
@@ -880,27 +1293,34 @@ mod engine {
                 )
             });
             print(&hit);
+            let other_stops: Vec<DebugEvent> = events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    matches!(e, DebugEvent::Stopped { reason, .. }
+                        if !matches!(reason, StopReason::Breakpoint(_)))
+                })
+                .cloned()
+                .collect();
+            assert!(
+                other_stops.is_empty(),
+                "stopped before the breakpoint: {other_stops:?}"
+            );
 
-            seen.lock().unwrap().clear();
+            events.clear();
             session.set_breakpoints(Vec::new());
             session.resume();
-            wait_for("running again", &|e| *e == DebugEvent::Running);
+            events.wait_for("running again", 20, &|e| *e == DebugEvent::Running);
             session.pause();
-            let paused = wait_for("pause", &|e| {
-                matches!(
-                    e,
-                    DebugEvent::Stopped {
-                        reason: StopReason::Pause,
-                        ..
-                    }
-                )
-            });
-            print(&paused);
+            print(&events.wait_for("pause", 20, &is_paused));
             session.detach();
-            wait_for("detach", &|e| *e == DebugEvent::Ended(DebugEnd::Detached));
-            std::thread::sleep(Duration::from_secs(2));
-            let still_running = processes().unwrap().iter().any(|p| p.pid == editor.pid);
-            assert!(still_running, "the editor died after detaching");
+            events.wait_for("detach", 20, &|e| {
+                *e == DebugEvent::Ended(DebugEnd::Detached)
+            });
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            assert!(is_running(session.pid()), "the editor died after detaching");
         }
     }
 }

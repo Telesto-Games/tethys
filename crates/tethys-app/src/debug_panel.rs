@@ -261,7 +261,9 @@ impl Render for DebugPanel {
         let status = &self.view.status;
         let (text, color) = match status {
             DebugStatus::Detached => ("Not attached".to_string(), theme.muted_foreground),
-            DebugStatus::Attaching => ("Attaching…".to_string(), theme.muted_foreground),
+            DebugStatus::Attaching => {
+                ("Starting the debugger…".to_string(), theme.muted_foreground)
+            }
             DebugStatus::Running => ("Running".to_string(), theme.foreground),
             DebugStatus::Stopped(reason) => (format!("Stopped: {reason}"), theme.primary),
         };
@@ -320,8 +322,10 @@ impl Render for DebugPanel {
                 Button::new("attach")
                     .xsmall()
                     .outline()
-                    .label("Attach")
-                    .tooltip("Attach to this project's Unreal Editor (F5)")
+                    .label("Debug")
+                    .tooltip(
+                        "Attach to this project's editor, or launch it under the debugger (F5)",
+                    )
                     .disabled(*status == DebugStatus::Attaching)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DebugPanelEvent::Attach)))
             });

@@ -33,7 +33,7 @@ use tethys_core::ports::{
     SessionEvent, SourceControl, UpdateSource,
 };
 use tethys_core::unreal::Configuration;
-use tethys_core::usecases::{RecentProject, ScmSummary};
+use tethys_core::usecases::{DebugStart, RecentProject, ScmSummary};
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
 use crate::build_placeholder::BuildPlaceholder;
@@ -71,6 +71,8 @@ gpui_kit::actions!(
         About,
         CheckForUpdates,
         AttachOrContinue,
+        AttachToEditor,
+        LaunchWithDebugger,
         PauseDebugger,
         DetachDebugger
     ]
@@ -98,7 +100,10 @@ pub fn install_menus(cx: &mut App) {
             .owned(),
         Menu::new("Debug")
             .items([
-                MenuItem::action("Attach to Editor / Continue", AttachOrContinue),
+                MenuItem::action("Debug Editor / Continue", AttachOrContinue),
+                MenuItem::action("Launch Editor with Debugger", LaunchWithDebugger),
+                MenuItem::action("Attach to Running Editor", AttachToEditor),
+                MenuItem::separator(),
                 MenuItem::action("Pause", PauseDebugger),
                 MenuItem::action("Detach", DetachDebugger),
                 MenuItem::separator(),
@@ -922,7 +927,7 @@ impl Workspace {
         self.dock.update(cx, |_, cx| cx.notify());
     }
 
-    /// F5: attach to the editor, or continue after a stop.
+    /// F5: start debugging (attach, or launch the editor), or continue after a stop.
     fn attach_or_continue(
         &mut self,
         _: &AttachOrContinue,
@@ -930,7 +935,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match self.debug.status {
-            DebugStatus::Detached => self.attach_debugger(window, cx),
+            DebugStatus::Detached => self.start_debugging(DebugStart::Auto, window, cx),
             DebugStatus::Stopped(_) => {
                 if let Some(session) = &self.debug.session {
                     session.resume();
@@ -938,6 +943,24 @@ impl Workspace {
             }
             DebugStatus::Attaching | DebugStatus::Running => {}
         }
+    }
+
+    fn attach_to_editor(
+        &mut self,
+        _: &AttachToEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_debugging(DebugStart::Attach, window, cx);
+    }
+
+    fn launch_with_debugger(
+        &mut self,
+        _: &LaunchWithDebugger,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_debugging(DebugStart::Launch, window, cx);
     }
 
     fn pause_debugger(&mut self, _: &PauseDebugger, _: &mut Window, _: &mut Context<Self>) {
@@ -952,8 +975,9 @@ impl Workspace {
         }
     }
 
-    /// Attaches to the running editor that has this project open.
-    fn attach_debugger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Attaches to this project's running editor, or launches it under the
+    /// debugger in the chosen configuration.
+    fn start_debugging(&mut self, how: DebugStart, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(project), Some(tx)) = (self.project.clone(), self.debug.events.clone()) else {
             return;
         };
@@ -971,17 +995,35 @@ impl Workspace {
         self.refresh_debug(cx);
 
         let debugger = cx.global::<Services>().debugger.clone();
+        let configuration = self.configuration;
+        let breakpoints = self.breakpoint_requests();
         // Listing processes and attaching take a few seconds on a big editor.
-        let attach = cx.background_executor().spawn(async move {
-            usecases::attach_to_editor(debugger.as_ref(), &project, sink).map_err(|e| e.to_string())
+        let start = cx.background_executor().spawn(async move {
+            usecases::debug_editor(
+                debugger.as_ref(),
+                &project,
+                configuration,
+                how,
+                breakpoints,
+                sink,
+            )
+            .map_err(|e| e.to_string())
         });
         cx.spawn(async move |this, cx| {
-            let attached = attach.await;
+            let started = start.await;
             let _ = this.update(cx, |this, cx| {
-                match attached {
-                    Ok((process, session)) => {
+                match started {
+                    Ok((debuggee, session)) => {
+                        // Breakpoints changed while starting are sent now.
                         session.set_breakpoints(this.breakpoint_requests());
-                        this.debug.process = Some(format!("{} (pid {})", process.exe, process.pid));
+                        let process = &debuggee.process;
+                        let how = if debuggee.launched {
+                            "launched"
+                        } else {
+                            "attached"
+                        };
+                        this.debug.process =
+                            Some(format!("{} (pid {}, {how})", process.exe, process.pid));
                         this.debug.session = Some(session);
                     }
                     Err(e) => {
@@ -1138,7 +1180,7 @@ impl Workspace {
         }
         let panel = cx.new(DebugPanel::new);
         let events = cx.subscribe_in(&panel, window, |this, _, event, window, cx| match event {
-            DebugPanelEvent::Attach => this.attach_debugger(window, cx),
+            DebugPanelEvent::Attach => this.start_debugging(DebugStart::Auto, window, cx),
             DebugPanelEvent::Detach => this.detach_debugger(&DetachDebugger, window, cx),
             DebugPanelEvent::Continue => this.attach_or_continue(&AttachOrContinue, window, cx),
             DebugPanelEvent::Pause => this.pause_debugger(&PauseDebugger, window, cx),
@@ -1226,9 +1268,11 @@ impl Workspace {
         match self.debug.status {
             DebugStatus::Detached => button
                 .label("Debug")
-                .tooltip("Attach to this project's running editor (F5)")
-                .on_click(cx.listener(|this, _, window, cx| this.attach_debugger(window, cx))),
-            DebugStatus::Attaching => button.label("Attaching…").disabled(true),
+                .tooltip("Attach to this project's editor, or launch it under the debugger (F5)")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.start_debugging(DebugStart::Auto, window, cx)
+                })),
+            DebugStatus::Attaching => button.label("Starting…").disabled(true),
             DebugStatus::Running | DebugStatus::Stopped(_) => button
                 .label("Detach")
                 .tooltip("Detach, leaving the editor running (Shift+F5)")
@@ -1596,6 +1640,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::attach_or_continue))
+            .on_action(cx.listener(Self::attach_to_editor))
+            .on_action(cx.listener(Self::launch_with_debugger))
             .on_action(cx.listener(Self::pause_debugger))
             .on_action(cx.listener(Self::detach_debugger))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {

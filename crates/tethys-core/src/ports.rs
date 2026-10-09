@@ -71,13 +71,30 @@ pub type DebugEventSink = Arc<dyn Fn(DebugEvent) + Send + Sync>;
 pub trait Debugger: Send + Sync {
     /// Processes that could be debugged.
     fn processes(&self) -> PortResult<Vec<ProcessInfo>>;
-    /// Attaches to `pid`. Events, starting with `Attached`, go to `events`.
-    fn attach(&self, pid: u32, events: DebugEventSink) -> PortResult<Box<dyn DebugSession>>;
+    /// Attaches to `pid`, with `breakpoints` set before it runs on. Events,
+    /// starting with `Attached`, go to `events`.
+    fn attach(
+        &self,
+        pid: u32,
+        breakpoints: Vec<SourceBreakpoint>,
+        events: DebugEventSink,
+    ) -> PortResult<Box<dyn DebugSession>>;
+    /// Starts `command` in `cwd` under the debugger, with `breakpoints` set
+    /// before it runs, so breakpoints in startup code are hit.
+    fn launch(
+        &self,
+        command: &CommandSpec,
+        cwd: &Path,
+        breakpoints: Vec<SourceBreakpoint>,
+        events: DebugEventSink,
+    ) -> PortResult<Box<dyn DebugSession>>;
 }
 
 /// One attached program. Every call returns at once; results arrive as
 /// events. Dropping it detaches: it never kills the program.
 pub trait DebugSession: Send {
+    /// The debugged process.
+    fn pid(&self) -> u32;
     /// Replaces every breakpoint with `breakpoints`.
     fn set_breakpoints(&self, breakpoints: Vec<SourceBreakpoint>);
     /// Continues after a stop.
