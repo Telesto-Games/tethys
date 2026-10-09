@@ -6892,7 +6892,7 @@ dependencies = [
 
 [[package]]
 name = "tethys-adapters"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "quick-xml 0.42.0",
@@ -6911,7 +6911,7 @@ dependencies = [
 
 [[package]]
 name = "tethys-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "futures",
  "gpui-component",
@@ -6924,7 +6924,7 @@ dependencies = [
 
 [[package]]
 name = "tethys-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
