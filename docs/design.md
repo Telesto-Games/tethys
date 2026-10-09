@@ -241,10 +241,20 @@ Things we know will bite in M2, written down now so they aren't rediscovered:
 A `.uproject` is JSON. The fields we care about at first are:
 
 - `EngineAssociation`, which has three forms:
-  - A version string (`"5.6"`): a Launcher install. Look up
-    `HKLM\SOFTWARE\EpicGames\Unreal Engine\<ver>\InstalledDirectory`.
-  - A GUID: a registered source build. Look up the value of that name under
-    `HKCU\Software\Epic Games\Unreal Engine\Builds`.
+  - A version string (`"5.6"`): a Launcher install.
+  - A GUID: a registered source build.
+
+  Both forms are looked up the way UE's own tools do it
+  (`FDesktopPlatformWindows::EnumerateEngineInstallations`), in this order:
+  1. The Epic Launcher's install list, `%ProgramData%\Epic\UnrealEngineLauncher\LauncherInstalled.dat`
+     (app `UE_<ver>`). This is UE's main source for Launcher engines.
+  2. `HKCU\Software\Epic Games\Unreal Engine\Builds`, by value name (any name, usually a GUID).
+  3. `HKLM\SOFTWARE\EpicGames\Unreal Engine\<ver>\InstalledDirectory`.
+
+  The first recorded folder that actually holds an engine (`Engine\Binaries`) wins. Nothing
+  else about engine paths is assumed, so each machine resolves its own install location.
+  (Until 0.2.1 Tethys read only the `HKLM` key, so a machine with the engine in the Launcher's
+  list but a missing or stale key couldn't find it.)
   - **Empty**: a "native" project that lives inside a source engine tree. Walk up from the
     `.uproject` until a directory contains `Engine\Build\Build.version`. Studio source builds
     often look like this, so M1 must handle it.
