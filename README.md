@@ -34,6 +34,7 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Project browser from a project | **File → Projects…** or **Ctrl+Shift+P** opens it in a new window |
 | Menus | **File** (Open Project, Projects, New/Close Session, Exit), **Build** (Build, Launch Editor), **Help** (About) |
 | New agent session | **New session ▾** → Claude Code or opencode. **Ctrl+Shift+T** starts the first (Claude Code) |
+| Plain terminal | **New session ▾** → Terminal, or **Ctrl+Shift+\`**. Runs PowerShell 7 (`pwsh`) if installed, otherwise Windows PowerShell, in the project folder |
 | Close session | **Ctrl+Shift+W** |
 | Pick the build configuration | **Development** / **DebugGame** toggle in the project header (remembered between runs) |
 | Build the editor target | **Ctrl+Shift+B**: runs `Build.bat <Project>Editor Win64 <Configuration>` in the **Build pane** on the right (✓ or ✗ when done). Each new build replaces the previous finished log |

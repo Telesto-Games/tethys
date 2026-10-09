@@ -146,6 +146,24 @@ pub fn start_build(
     Ok(start_session(hosts, id, &profile, project, events)?)
 }
 
+/// Starts a plain shell (no agent) in the project folder as a terminal session.
+pub fn start_terminal(
+    hosts: &[&dyn AgentHost],
+    id: SessionId,
+    shell: &str,
+    project: &Project,
+    events: EventSink,
+) -> Result<Box<dyn AgentSession>, StartError> {
+    let profile = AgentProfile {
+        id: "terminal".into(),
+        name: "Terminal".into(),
+        adapter: AdapterKind::Terminal,
+        command: shell.into(),
+        args: vec![],
+    };
+    start_session(hosts, id, &profile, project, events)
+}
+
 /// Starts the Unreal Editor on the project, detached from Tethys, with the
 /// user's extra `editor_args`.
 pub fn launch_editor(
@@ -761,6 +779,17 @@ mod tool_tests {
         assert_eq!(profile.args[2], "DebugGame");
         assert_eq!(profile.command, r"D:\UE\Engine\Build\BatchFiles\Build.bat");
         assert_eq!(profile.args[0], "GameEditor");
+    }
+
+    #[test]
+    fn terminal_runs_the_shell_without_an_agent() {
+        let host = RecordingHost::default();
+        let sink: EventSink = Arc::new(|_, _| {});
+        start_terminal(&[&host], SessionId(1), "pwsh", &project(), sink).unwrap();
+        let profile = host.0.lock().unwrap().clone().unwrap();
+        assert_eq!(profile.name, "Terminal");
+        assert_eq!(profile.command, "pwsh");
+        assert!(profile.args.is_empty());
     }
 
     #[test]

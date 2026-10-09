@@ -543,7 +543,7 @@ Things learned while building M0–M3 that aren't obvious from the code.
   `COLORTERM=truecolor`. If Tethys is launched from inside a Claude Code session, the child Claude
   inherits its `CLAUDE_CODE_*` markers and warns that transcript saving is off. Launch Tethys from
   Explorer or a plain terminal.
-- **Keys.** Ctrl+Shift+… is reserved for Tethys (O open, T new session, W close session) and
+- **Keys.** Ctrl+Shift+… is reserved for Tethys (O open, T new session, \` plain terminal, W close session) and
   Ctrl+Tab / Ctrl+Shift+Tab switch tabs. Everything else goes to the agent. Ctrl+C copies when
   there's a selection; Ctrl+V pastes text, or sends `^V` when the clipboard has no text so Claude
   can paste images. Shift+Enter sends `ESC CR` (a newline in Claude Code). Right-click pastes.
