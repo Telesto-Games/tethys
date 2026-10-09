@@ -451,6 +451,29 @@ When the editor is started under the debugger, UE skips its own crash handler, s
 in the debugger instead of opening the crash reporter. A crash in an attached editor still stops
 first, as a first-chance exception.
 
+## Live Coding
+
+A **Live Coding** button in the project header (and Build → Live Coding) recompiles changed C++
+into the running editor. While the editor runs, Live Coding is the only way to build: UBT
+refuses to build while a Live Coding session is active.
+
+- **How it's triggered:** the `LiveCoding` port's `live_coding_hotkey` adapter presses UE's
+  Live Coding shortcut, Ctrl+Alt+F11, with `SendInput`, holding it for 100 ms. Both of UE's
+  implementations watch the keyboard globally. `LiveCodingModule2` uses raw input with
+  `RIDEV_INPUTSINK`. The older Live++ server polls `GetAsyncKeyState` every 10 ms. So the editor
+  doesn't need focus, and no plugin or project setting is needed. Checked on UE 5.8: the
+  editor log shows `Starting Live Coding compile.`
+- **Alternatives not taken:** the `LiveCoding.Compile` console command needs a way into the
+  editor's console, such as the Remote Control or Python remote-execution plugins, which
+  projects don't enable by default.
+- **Focus:** the shortcut also reaches Tethys's own window, so the button first moves focus off
+  any terminal, which would otherwise pass F11 to the agent.
+- **Limits:**
+  - A shortcut changed in the editor's Live Coding settings isn't followed.
+  - It only checks that some Unreal Editor is running, not that it's this project's.
+  - It refuses while the debugger has the editor stopped, since the compile would wait for it.
+  - Progress and errors show in the editor's own Live Coding window, not in Tethys.
+
 ## Milestones
 
 Each milestone is the smallest useful step. M0 carries a spike that isn't a feature: it exists to

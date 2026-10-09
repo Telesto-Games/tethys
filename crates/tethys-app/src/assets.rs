@@ -6,7 +6,7 @@ use gpui_kit::{AssetSource, Result, SharedString};
 
 gpui_kit::assets::icon_assets!(
     pub ExtraIcons,
-    [Hammer, Play, Plus, FolderOpen, SquareTerminal, Bug]
+    [Hammer, Play, Plus, FolderOpen, SquareTerminal, Bug, Zap]
 );
 
 pub struct AppAssets;

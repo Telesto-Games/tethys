@@ -64,6 +64,14 @@ pub trait ProcessLauncher {
     fn spawn_detached(&self, command: &CommandSpec, cwd: &Path) -> PortResult<()>;
 }
 
+/// Asks the running Unreal Editor to Live Code: recompile changed C++ and
+/// patch it into the running editor.
+pub trait LiveCoding: Send + Sync {
+    /// Starts a Live Coding compile. Progress shows in the editor's own Live
+    /// Coding window. Fails if no editor is running.
+    fn compile(&self) -> PortResult<()>;
+}
+
 /// Receives debug events; called from the debugger's thread.
 pub type DebugEventSink = Arc<dyn Fn(DebugEvent) + Send + Sync>;
 

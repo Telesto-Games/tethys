@@ -21,6 +21,7 @@ use tethys_adapters::agent_terminal::TerminalHost;
 use tethys_adapters::config_toml::TomlConfigStore;
 use tethys_adapters::debug_dbgeng::DbgEng;
 use tethys_adapters::engine_registry::RegistryEngineLocator;
+use tethys_adapters::live_coding_hotkey::HotkeyLiveCoding;
 use tethys_adapters::process_launcher::DetachedLauncher;
 use tethys_adapters::scm_git::Git;
 use tethys_adapters::scm_svn::Subversion;
@@ -29,8 +30,8 @@ use tethys_adapters::update_github::GitHubReleases;
 use tethys_core::debug::{self as dbg, Breakpoints, DebugEnd, DebugEvent, StackFrame, StopReason};
 use tethys_core::diff::FileDiff;
 use tethys_core::ports::{
-    AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EventSink, SelfInstaller,
-    SessionEvent, SourceControl, UpdateSource,
+    AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EventSink, LiveCoding,
+    SelfInstaller, SessionEvent, SourceControl, UpdateSource,
 };
 use tethys_core::unreal::Configuration;
 use tethys_core::usecases::{DebugStart, RecentProject, ScmSummary};
@@ -65,6 +66,7 @@ gpui_kit::actions!(
         NextSession,
         PrevSession,
         BuildProject,
+        LiveCode,
         LaunchEditor,
         ShowProjects,
         Exit,
@@ -95,6 +97,7 @@ pub fn install_menus(cx: &mut App) {
         Menu::new("Build")
             .items([
                 MenuItem::action("Build", BuildProject),
+                MenuItem::action("Live Coding (Ctrl+Alt+F11)", LiveCode),
                 MenuItem::action("Launch Editor", LaunchEditor),
             ])
             .owned(),
@@ -148,6 +151,7 @@ pub struct Services {
     pub updates: Arc<dyn UpdateSource>,
     pub installer: Arc<dyn SelfInstaller>,
     pub debugger: Arc<dyn Debugger>,
+    pub live_coding: Arc<dyn LiveCoding>,
     next_session: AtomicU64,
 }
 
@@ -161,6 +165,7 @@ impl Services {
             updates: Arc::new(GitHubReleases::new(update_ui::REPO)),
             installer: Arc::new(ExeReplacer::new()),
             debugger: Arc::new(DbgEng),
+            live_coding: Arc::new(HotkeyLiveCoding),
             next_session: AtomicU64::new(1),
         }
     }
@@ -496,6 +501,35 @@ impl Workspace {
                     .map_err(|e| e.to_string())
             },
         );
+    }
+
+    /// Asks the running editor to Live Code the changed C++.
+    fn live_code(&mut self, _: &LiveCode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.is_none() {
+            return;
+        }
+        if let DebugStatus::Stopped(_) = self.debug.status {
+            self.error =
+                Some("The editor is stopped in the debugger. Continue it, then Live Code.".into());
+            cx.notify();
+            return;
+        }
+        // The shortcut Live Coding listens for also reaches this window; keep
+        // it away from terminals, which would pass it to the agent.
+        window.focus(&self.focus, cx);
+        let live_coding = cx.global::<Services>().live_coding.clone();
+        let compile = cx
+            .background_executor()
+            .spawn(async move { live_coding.compile().map_err(|e| e.to_string()) });
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = compile.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(format!("Can't start Live Coding: {e}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn set_configuration(&mut self, configuration: Configuration, cx: &mut Context<Self>) {
@@ -1561,6 +1595,18 @@ impl Workspace {
                     ),
             )
             .child(
+                Button::new("live-coding")
+                    .small()
+                    .h(TOOLBAR_HEIGHT)
+                    .outline()
+                    .icon(Icon::new(IconName::Zap))
+                    .label("Live Coding")
+                    .tooltip("Recompile C++ into the running editor (Ctrl+Alt+F11)")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.live_code(&LiveCode, window, cx)),
+                    ),
+            )
+            .child(
                 Button::new("launch-editor")
                     .small()
                     .h(TOOLBAR_HEIGHT)
@@ -1635,6 +1681,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_session))
             .on_action(cx.listener(Self::prev_session))
             .on_action(cx.listener(Self::build))
+            .on_action(cx.listener(Self::live_code))
             .on_action(cx.listener(Self::launch_editor))
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::about))

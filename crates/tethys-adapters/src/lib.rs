@@ -4,6 +4,7 @@ pub mod agent_terminal;
 pub mod config_toml;
 pub mod debug_dbgeng;
 pub mod engine_registry;
+pub mod live_coding_hotkey;
 pub mod process_launcher;
 pub mod scm_git;
 pub mod scm_svn;
