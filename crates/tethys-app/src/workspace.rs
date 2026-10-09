@@ -62,6 +62,7 @@ gpui_kit::actions!(
     tethys,
     [
         OpenProject,
+        OpenFolder,
         NewSession,
         NewTerminal,
         CloseSession,
@@ -89,6 +90,7 @@ pub fn install_menus(cx: &mut App) {
         Menu::new("File")
             .items([
                 MenuItem::action("Open Project…", OpenProject),
+                MenuItem::action("Open Folder…", OpenFolder),
                 MenuItem::action("Projects…", ShowProjects),
                 MenuItem::separator(),
                 MenuItem::action("New Session", NewSession),
@@ -185,7 +187,7 @@ impl Services {
 
 impl Global for Services {}
 
-/// Opens a Tethys window, optionally loading a `.uproject` into it.
+/// Opens a Tethys window, optionally loading a `.uproject` or folder into it.
 pub fn open_window(path: Option<PathBuf>, cx: &mut App) {
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {
@@ -457,6 +459,25 @@ impl Workspace {
         .detach();
     }
 
+    fn prompt_open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("Open folder")
+            .pick_folder();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(folder) = dialog.await {
+                let path = folder.path().to_path_buf();
+                let _ = this.update_in(cx, |this, window, cx| this.open(path, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// The open project, if it's an Unreal one: builds, the editor and the
+    /// debugger need it.
+    fn unreal_project(&self) -> Option<&Project> {
+        self.project.as_ref().filter(|p| p.is_unreal())
+    }
+
     /// Starts the default (first) agent profile.
     fn new_session(&mut self, _: &NewSession, window: &mut Window, cx: &mut Context<Self>) {
         self.start_agent(0, window, cx);
@@ -499,7 +520,7 @@ impl Workspace {
     }
 
     fn build(&mut self, _: &BuildProject, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project) = self.project.as_ref() else {
+        let Some(project) = self.unreal_project() else {
             return;
         };
         // One build at a time: focus the running one instead.
@@ -530,7 +551,7 @@ impl Workspace {
 
     /// Asks the running editor to Live Code the changed C++.
     fn live_code(&mut self, _: &LiveCode, window: &mut Window, cx: &mut Context<Self>) {
-        if self.project.is_none() {
+        if self.unreal_project().is_none() {
             return;
         }
         if let DebugStatus::Stopped(_) = self.debug.status {
@@ -570,7 +591,7 @@ impl Workspace {
     }
 
     fn launch_editor(&mut self, _: &LaunchEditor, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(project) = self.project.as_ref() else {
+        let Some(project) = self.unreal_project() else {
             return;
         };
         let args = settings_ui::editor_args(cx);
@@ -652,7 +673,7 @@ impl Workspace {
             .panels
             .iter()
             .any(|p| p.read(cx).kind() == SessionKind::Build);
-        if self.project.is_none() || has_build || self.build_placeholder.is_some() {
+        if self.unreal_project().is_none() || has_build || self.build_placeholder.is_some() {
             return;
         }
         let placeholder = cx.new(BuildPlaceholder::new);
@@ -1040,7 +1061,8 @@ impl Workspace {
     /// Attaches to this project's running editor, or launches it under the
     /// debugger in the chosen configuration.
     fn start_debugging(&mut self, how: DebugStart, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(project), Some(tx)) = (self.project.clone(), self.debug.events.clone()) else {
+        let (Some(project), Some(tx)) = (self.unreal_project().cloned(), self.debug.events.clone())
+        else {
             return;
         };
         if self.debug.status != DebugStatus::Detached {
@@ -1383,12 +1405,16 @@ impl Workspace {
         let recent = self.recent.iter().enumerate().map(|(i, entry)| {
             let open_path = entry.path.clone();
             let forget_path = entry.path.clone();
-            let name = entry
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let name = match &entry.project {
+                Ok(project) => project.name().to_string(),
+                Err(_) => entry
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
             let (detail, detail_color) = match &entry.project {
+                Ok(project) if !project.is_unreal() => ("Folder".to_string(), muted),
                 Ok(project) => match &project.engine {
                     Ok(_) => (format!("Engine: {}", association_label(project)), muted),
                     Err(e) => (
@@ -1469,17 +1495,28 @@ impl Workspace {
                     .child(
                         div()
                             .text_color(muted)
-                            .child("Open a .uproject to start a Claude Code session in it. You can also drop one onto this window."),
+                            .child("Open a .uproject, or any folder, to start a Claude Code session in it. You can also drop one onto this window."),
                     )
                     .child(
-                        div().flex().child(
-                            Button::new("open")
-                                .primary()
-                                .label("Open .uproject…  (Ctrl+Shift+O)")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.prompt_open(&OpenProject, window, cx)
-                                })),
-                        ),
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("open")
+                                    .primary()
+                                    .label("Open .uproject…  (Ctrl+Shift+O)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.prompt_open(&OpenProject, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("open-folder")
+                                    .outline()
+                                    .label("Open folder…")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.prompt_open_folder(&OpenFolder, window, cx)
+                                    })),
+                            ),
                     )
                     .child(
                         div()
@@ -1510,12 +1547,27 @@ impl Workspace {
     fn render_project(&self, project: &Project, cx: &mut Context<Self>) -> impl IntoElement {
         let debug_button = self.render_debug_button(cx);
         let theme = cx.theme();
-        let (engine_chip, engine_error) = match &project.engine {
-            Ok(path) => (association_label(project), path.display().to_string()),
-            Err(e) => (association_label(project), e.clone()),
+        let unreal = project.is_unreal();
+        let engine_ok = !unreal || project.engine.is_ok();
+        let (engine_chip, details) = if unreal {
+            let engine = match &project.engine {
+                Ok(path) => path.display().to_string(),
+                Err(e) => e.clone(),
+            };
+            let enabled_plugins = project.plugins.iter().filter(|(_, on)| *on).count();
+            (
+                association_label(project),
+                format!(
+                    "{} · engine {} · {} module(s), {} plugin(s)",
+                    project.root().display(),
+                    engine,
+                    project.modules.len(),
+                    enabled_plugins
+                ),
+            )
+        } else {
+            ("Folder".to_string(), project.root().display().to_string())
         };
-        let engine_ok = project.engine.is_ok();
-        let enabled_plugins = project.plugins.iter().filter(|(_, on)| *on).count();
         let divider = || div().w_px().h(px(20.)).mx_1().bg(theme.border);
 
         let identity = div()
@@ -1562,13 +1614,7 @@ impl Workspace {
                         theme.danger
                     })
                     .truncate()
-                    .child(format!(
-                        "{} · engine {} · {} module(s), {} plugin(s)",
-                        project.root().display(),
-                        engine_error,
-                        project.modules.len(),
-                        enabled_plugins
-                    )),
+                    .child(details),
             );
 
         // Every header control is TOOLBAR_HEIGHT tall with small-size labels.
@@ -1601,6 +1647,33 @@ impl Workspace {
                 }
             }));
 
+        let build = Button::new("build")
+            .small()
+            .h(TOOLBAR_HEIGHT)
+            .outline()
+            .icon(Icon::new(IconName::Hammer))
+            .label("Build")
+            .tooltip("Build (Ctrl+Shift+B)")
+            .on_click(cx.listener(|this, _, window, cx| this.build(&BuildProject, window, cx)));
+        let live_coding = Button::new("live-coding")
+            .small()
+            .h(TOOLBAR_HEIGHT)
+            .outline()
+            .icon(Icon::new(IconName::Zap))
+            .label("Live Coding")
+            .tooltip("Recompile C++ into the running editor (Ctrl+Alt+F11)")
+            .on_click(cx.listener(|this, _, window, cx| this.live_code(&LiveCode, window, cx)));
+        let launch_editor = Button::new("launch-editor")
+            .small()
+            .h(TOOLBAR_HEIGHT)
+            .outline()
+            .icon(Icon::new(IconName::Play))
+            .label("Launch editor")
+            .tooltip("Launch editor (Ctrl+Shift+E)")
+            .on_click(
+                cx.listener(|this, _, window, cx| this.launch_editor(&LaunchEditor, window, cx)),
+            );
+
         let header = div()
             .flex()
             .items_center()
@@ -1611,45 +1684,16 @@ impl Workspace {
             .border_b_1()
             .border_color(theme.title_bar_border)
             .child(identity)
-            .child(configuration)
-            .child(
-                Button::new("build")
-                    .small()
-                    .h(TOOLBAR_HEIGHT)
-                    .outline()
-                    .icon(Icon::new(IconName::Hammer))
-                    .label("Build")
-                    .tooltip("Build (Ctrl+Shift+B)")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.build(&BuildProject, window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("live-coding")
-                    .small()
-                    .h(TOOLBAR_HEIGHT)
-                    .outline()
-                    .icon(Icon::new(IconName::Zap))
-                    .label("Live Coding")
-                    .tooltip("Recompile C++ into the running editor (Ctrl+Alt+F11)")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.live_code(&LiveCode, window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("launch-editor")
-                    .small()
-                    .h(TOOLBAR_HEIGHT)
-                    .outline()
-                    .icon(Icon::new(IconName::Play))
-                    .label("Launch editor")
-                    .tooltip("Launch editor (Ctrl+Shift+E)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.launch_editor(&LaunchEditor, window, cx)
-                    })),
-            )
-            .child(debug_button)
-            .child(divider())
+            // Builds, the editor and the debugger need a .uproject.
+            .when(unreal, |header| {
+                header
+                    .child(configuration)
+                    .child(build)
+                    .child(live_coding)
+                    .child(launch_editor)
+                    .child(debug_button)
+                    .child(divider())
+            })
             .child(
                 Button::new("new-session")
                     .small()
@@ -1688,7 +1732,7 @@ impl Workspace {
                     }),
             );
 
-        // Always shown: the build pane lives in the dock even with no sessions.
+        // For a .uproject the build pane is always in the dock, even with no sessions.
         // Drag a tab to an edge of a pane to split, or onto another tab bar to move it.
         let body = div().flex_1().min_h_0().child(self.dock.clone());
 
@@ -1718,6 +1762,7 @@ impl Render for Workspace {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::prompt_open))
+            .on_action(cx.listener(Self::prompt_open_folder))
             .on_action(cx.listener(Self::new_session))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::close_session))
@@ -1736,7 +1781,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::pause_debugger))
             .on_action(cx.listener(Self::detach_debugger))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                if let Some(path) = paths.paths().iter().find(|p| is_uproject(p)) {
+                if let Some(path) = paths.paths().iter().find(|p| is_uproject(p) || p.is_dir()) {
                     this.open(path.clone(), window, cx);
                 }
             }))

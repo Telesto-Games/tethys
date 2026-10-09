@@ -22,7 +22,7 @@ themselves.
 Needs Rust (stable, MSVC) and the Visual Studio C++ build tools.
 
 ```sh
-cargo run -- path\to\Game.uproject     # or just `cargo run` and pick one
+cargo run -- path\to\Game.uproject     # or a folder, or just `cargo run` and pick one
 cargo build --release                  # target\release\tethys.exe, no console window
 ```
 
@@ -31,8 +31,9 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Do this | How |
 |---|---|
 | Open a project | Start `tethys.exe` with no argument for the project browser (picker + recent projects), or pass a `.uproject`. Also **Ctrl+Shift+O**, or drop a `.uproject` on the window |
+| Open a folder | **File → Open Folder…**, **Open folder…** in the project browser, pass a folder path, or drop a folder on the window. You get agent sessions, terminals and the Files pane; Build, Launch Editor and Debug need a `.uproject` and are hidden |
 | Project browser from a project | **File → Projects…** or **Ctrl+Shift+P** opens it in a new window |
-| Menus | **File** (Open Project, Projects, New/Close Session, Exit), **Build** (Build, Launch Editor), **Help** (About) |
+| Menus | **File** (Open Project, Open Folder, Projects, New/Close Session, Exit), **Build** (Build, Launch Editor), **Help** (About) |
 | New agent session | **New session ▾** → Claude Code or opencode. **Ctrl+Shift+T** starts the first (Claude Code) |
 | Plain terminal | **New session ▾** → Terminal, or **Ctrl+Shift+\`**. Runs PowerShell 7 (`pwsh`) if installed, otherwise Windows PowerShell, in the project folder |
 | Close session | **Ctrl+Shift+W** |

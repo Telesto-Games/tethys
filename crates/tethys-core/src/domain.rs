@@ -26,11 +26,21 @@ pub enum ProjectError {
     },
 }
 
-/// A parsed `.uproject` plus its resolved engine path.
+/// What was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectKind {
+    /// A `.uproject`: builds, the editor and the debugger are available.
+    Unreal,
+    /// A plain folder: sessions, terminals and files only.
+    Folder,
+}
+
+/// A parsed `.uproject` plus its resolved engine path, or a plain folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
-    /// Path to the `.uproject` file.
+    /// Path to the `.uproject` file, or the folder itself.
     pub path: PathBuf,
+    pub kind: ProjectKind,
     /// `EngineAssociation`: a version, a build GUID, or empty for a native project.
     pub engine_association: String,
     pub modules: Vec<String>,
@@ -85,6 +95,7 @@ impl Project {
         };
         Ok(Project {
             path,
+            kind: ProjectKind::Unreal,
             engine_association: file.engine_association,
             modules: file.modules.into_iter().map(|m| m.name).collect(),
             plugins: file
@@ -97,17 +108,42 @@ impl Project {
         })
     }
 
-    /// Project name, taken from the `.uproject` file stem.
+    /// A plain folder, with nothing Unreal about it.
+    pub fn folder(path: impl Into<PathBuf>) -> Project {
+        Project {
+            path: path.into(),
+            kind: ProjectKind::Folder,
+            engine_association: String::new(),
+            modules: Vec::new(),
+            plugins: Vec::new(),
+            targets: Vec::new(),
+            engine: Err("not an Unreal project".into()),
+        }
+    }
+
+    pub fn is_unreal(&self) -> bool {
+        self.kind == ProjectKind::Unreal
+    }
+
+    /// Project name: the `.uproject` file stem, or the folder name.
     pub fn name(&self) -> &str {
-        self.path
-            .file_stem()
+        let name = match self.kind {
+            ProjectKind::Unreal => self.path.file_stem(),
+            ProjectKind::Folder => self.path.file_name(),
+        };
+        // A drive root like `D:\` has no file name.
+        name.or(Some(self.path.as_os_str()))
             .and_then(|s| s.to_str())
             .unwrap_or_default()
     }
 
-    /// Directory containing the `.uproject`; agent sessions run here.
+    /// Directory containing the `.uproject`, or the folder itself; agent
+    /// sessions run here.
     pub fn root(&self) -> &Path {
-        self.path.parent().unwrap_or(Path::new("."))
+        match self.kind {
+            ProjectKind::Unreal => self.path.parent().unwrap_or(Path::new(".")),
+            ProjectKind::Folder => &self.path,
+        }
     }
 
     /// What kind of engine `EngineAssociation` points at.
@@ -287,6 +323,16 @@ mod tests {
             Project::parse("Game.uproject", "not json"),
             Err(ProjectError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn folder_is_its_own_root() {
+        let p = Project::folder(r"D:\dev\tools.v2");
+        assert!(!p.is_unreal());
+        assert_eq!(p.name(), "tools.v2");
+        assert_eq!(p.root(), Path::new(r"D:\dev\tools.v2"));
+        assert_eq!(Project::folder(r"D:\").name(), r"D:\");
+        assert!(Project::parse("G.uproject", "{}").unwrap().is_unreal());
     }
 
     #[test]

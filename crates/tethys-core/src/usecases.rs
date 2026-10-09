@@ -89,11 +89,15 @@ pub fn diff_against_base(
 /// How many recent projects to remember.
 pub const MAX_RECENT_PROJECTS: usize = 10;
 
-/// Reads and parses a `.uproject`, then resolves its engine.
+/// Reads and parses a `.uproject`, then resolves its engine. A folder opens
+/// as a plain folder project.
 ///
 /// An unresolved engine is not an error: the project still opens and
 /// `Project::engine` says what went wrong.
 pub fn open_project(path: &Path, locator: &dyn EngineLocator) -> Result<Project, ProjectError> {
+    if path.is_dir() {
+        return Ok(Project::folder(path));
+    }
     let json = std::fs::read_to_string(path).map_err(|source| ProjectError::Read {
         path: path.to_path_buf(),
         source,
@@ -306,10 +310,10 @@ pub fn recent_projects(
         .unwrap_or_default()
         .into_iter()
         .map(|path| {
-            let project = if path.is_file() {
+            let project = if path.exists() {
                 open_project(&path, locator).map_err(|e| e.to_string())
             } else {
-                Err("file not found".into())
+                Err("not found".into())
             };
             RecentProject { path, project }
         })
@@ -496,6 +500,16 @@ mod tests {
     }
 
     #[test]
+    fn open_project_opens_a_folder_as_is() {
+        let dir = std::env::temp_dir().join(format!("tethys-folder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = open_project(&dir, &FakeLocator).unwrap();
+        assert!(!p.is_unreal());
+        assert_eq!(p.root(), dir);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn forget_and_list_recent_projects() {
         let good = temp_uproject("Good.uproject", r#"{"EngineAssociation":"5.6"}"#);
         let missing = PathBuf::from(r"Z:\gone\Gone.uproject");
@@ -506,7 +520,7 @@ mod tests {
         let recent = recent_projects(&config, &FakeLocator);
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].project.as_ref().unwrap().name(), "Good");
-        assert_eq!(recent[1].project.as_ref().unwrap_err(), "file not found");
+        assert_eq!(recent[1].project.as_ref().unwrap_err(), "not found");
 
         forget_project(&config, Path::new(r"z:\GONE\gone.uproject")).unwrap();
         assert_eq!(*config.recent.borrow(), [good]);
