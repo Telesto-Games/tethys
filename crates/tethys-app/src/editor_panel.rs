@@ -8,10 +8,13 @@ use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{Panel, PanelControl, PanelEvent};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, TabSize};
+use gpui_kit::component::input::{
+    Editor, EditorState, InputEvent, Position, RangeDecoration, RangeDecorationCollection,
+    RangeDecorationStyle, RopeExt, TabSize,
+};
 use gpui_kit::*;
 
-gpui_kit::actions!(editor, [Save]);
+gpui_kit::actions!(editor, [Save, ToggleBreakpoint]);
 
 /// Files larger than this aren't opened in the editor.
 pub const MAX_EDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -23,6 +26,8 @@ pub enum EditorEvent {
     Diff(PathBuf, String),
     /// The unsaved-changes marker changed; the tab title needs redrawing.
     DirtyChanged,
+    /// Toggle a breakpoint on this 1-based line.
+    ToggleBreakpoint(PathBuf, u32),
 }
 
 /// Width of a tab stop when showing tab characters.
@@ -142,6 +147,10 @@ pub struct EditorPanel {
     saved: String,
     dirty: bool,
     error: Option<String>,
+    /// Red fills on breakpoint lines.
+    breakpoint_marks: RangeDecorationCollection,
+    /// An orange fill on the line the debugger stopped at.
+    stop_mark: RangeDecorationCollection,
     _changes: Subscription,
 }
 
@@ -170,6 +179,12 @@ impl EditorPanel {
                 }
             }
         });
+        let (breakpoint_marks, stop_mark) = state.update(cx, |state, cx| {
+            (
+                state.create_range_decorations_collection(Vec::new(), cx),
+                state.create_range_decorations_collection(Vec::new(), cx),
+            )
+        });
         Self {
             path,
             state,
@@ -177,6 +192,8 @@ impl EditorPanel {
             saved: text,
             dirty: false,
             error: None,
+            breakpoint_marks,
+            stop_mark,
             _changes: changes,
         }
     }
@@ -224,6 +241,61 @@ impl EditorPanel {
             Err(e) => self.error = Some(e),
         }
         cx.notify();
+    }
+
+    /// Marks breakpoint lines and the line the debugger stopped at (1-based).
+    pub fn set_debug_marks(
+        &mut self,
+        breakpoints: &[u32],
+        stop: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = cx.theme();
+        let (red, orange) = (theme.danger.opacity(0.28), theme.primary.opacity(0.35));
+        let text = self.state.read(cx).text();
+        let fill = |line: u32, color: Hsla| {
+            let row = line.saturating_sub(1) as usize;
+            if row >= text.lines_len() {
+                return None;
+            }
+            // Through the newline, so empty lines are marked too.
+            let start = text.line_start_offset(row);
+            let end = if row + 1 < text.lines_len() {
+                text.line_start_offset(row + 1)
+            } else {
+                text.len()
+            };
+            Some(
+                RangeDecoration::new(start..end.max(start + 1).min(text.len()))
+                    .with_style(RangeDecorationStyle::Fill)
+                    .with_color(color),
+            )
+        };
+        let marks = breakpoints.iter().filter_map(|&l| fill(l, red)).collect();
+        let stop = stop.and_then(|l| fill(l, orange)).into_iter().collect();
+        self.breakpoint_marks.set(marks, cx);
+        self.stop_mark.set(stop, cx);
+    }
+
+    /// Moves the cursor to a 1-based line and scrolls it into view.
+    pub fn go_to_line(&mut self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let position = Position::new(line.saturating_sub(1), 0);
+        self.state.update(cx, |state, cx| {
+            state.set_cursor_position(position, window, cx)
+        });
+        // A new editor hasn't been laid out yet, so it can't scroll; try again
+        // once it has.
+        let state = self.state.clone();
+        window.on_next_frame(move |window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_cursor_position(position, window, cx)
+            });
+        });
+    }
+
+    fn toggle_breakpoint(&mut self, _: &ToggleBreakpoint, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.state.read(cx).cursor_position().line + 1;
+        cx.emit(EditorEvent::ToggleBreakpoint(self.path.clone(), line));
     }
 
     fn diff(&mut self, cx: &mut Context<Self>) {
@@ -349,6 +421,16 @@ impl Render for EditorPanel {
                     .map(|e| div().text_color(theme.danger).child(e)),
             )
             .child(
+                Button::new("breakpoint")
+                    .xsmall()
+                    .ghost()
+                    .label("Breakpoint")
+                    .tooltip("Toggle a breakpoint on the cursor's line (F9)")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_breakpoint(&ToggleBreakpoint, window, cx)
+                    })),
+            )
+            .child(
                 Button::new("diff")
                     .xsmall()
                     .ghost()
@@ -379,6 +461,7 @@ impl Render for EditorPanel {
             .bg(theme.background)
             .p_1p5()
             .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::toggle_breakpoint))
             .child(
                 div()
                     .size_full()

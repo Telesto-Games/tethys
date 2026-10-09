@@ -42,6 +42,12 @@ gpui-component = { version = "=0.7.1", features = [
 alacritty_terminal = "=0.26.0"
 rfd = "0.17"
 winreg = "0.56"
+# Only for DbgEng's COM interfaces (the debugger); windows-sys has no COM.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug_Extensions",
+    "Win32_System_Threading",
+] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

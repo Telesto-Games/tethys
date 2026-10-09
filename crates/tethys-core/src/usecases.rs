@@ -4,11 +4,12 @@ use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::debug::{self, FindEditorError, ProcessInfo};
 use crate::diff::{self, FileDiff};
 use crate::domain::{AdapterKind, AgentProfile, DomainError, Project, ProjectError, SessionId};
 use crate::ports::{
-    AgentHost, AgentSession, ConfigStore, EngineLocator, EventSink, PortError, ProcessLauncher,
-    SourceControl,
+    AgentHost, AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EngineLocator,
+    EventSink, PortError, ProcessLauncher, SourceControl,
 };
 use crate::scm::{WorkingCopyInfo, WorkingCopyStatus};
 use crate::unreal::{self, Configuration, ToolError};
@@ -158,6 +159,38 @@ pub fn launch_editor(
             program: cmd.program.display().to_string(),
             source,
         })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AttachError {
+    #[error(transparent)]
+    Find(#[from] FindEditorError),
+    #[error("can't list processes: {0}")]
+    List(PortError),
+    #[error("can't attach to {exe} (process {pid}): {source}")]
+    Attach {
+        exe: String,
+        pid: u32,
+        source: PortError,
+    },
+}
+
+/// Attaches the debugger to the Unreal Editor that has `project` open.
+pub fn attach_to_editor(
+    debugger: &dyn Debugger,
+    project: &Project,
+    events: DebugEventSink,
+) -> Result<(ProcessInfo, Box<dyn DebugSession>), AttachError> {
+    let processes = debugger.processes().map_err(AttachError::List)?;
+    let editor = debug::find_editor(&processes, &project.path)?.clone();
+    let session = debugger
+        .attach(editor.pid, events)
+        .map_err(|source| AttachError::Attach {
+            exe: editor.exe.clone(),
+            pid: editor.pid,
+            source,
+        })?;
+    Ok((editor, session))
 }
 
 /// Moves `path` to the front of the recent projects list and saves it.
@@ -519,6 +552,52 @@ mod tool_tests {
         p.modules = vec!["Game".into()];
         p.targets = vec!["Game".into(), "GameEditor".into()];
         p
+    }
+
+    struct FakeDebugger(Vec<ProcessInfo>, Mutex<Vec<u32>>);
+    struct FakeDebugSession;
+    impl DebugSession for FakeDebugSession {
+        fn set_breakpoints(&self, _: Vec<crate::debug::SourceBreakpoint>) {}
+        fn resume(&self) {}
+        fn pause(&self) {}
+        fn detach(&self) {}
+    }
+    impl Debugger for FakeDebugger {
+        fn processes(&self) -> PortResult<Vec<ProcessInfo>> {
+            Ok(self.0.clone())
+        }
+        fn attach(&self, pid: u32, _: DebugEventSink) -> PortResult<Box<dyn DebugSession>> {
+            self.1.lock().unwrap().push(pid);
+            Ok(Box::new(FakeDebugSession))
+        }
+    }
+
+    #[test]
+    fn attaches_to_the_projects_editor() {
+        let editor = |pid, uproject: &str| ProcessInfo {
+            pid,
+            exe: "UnrealEditor.exe".into(),
+            details: format!("UnrealEditor.exe {uproject}"),
+        };
+        let debugger = FakeDebugger(
+            vec![
+                editor(5, r"D:\o\Other.uproject"),
+                editor(9, r"D:\g\Game.uproject"),
+            ],
+            Mutex::default(),
+        );
+        let (found, _) = attach_to_editor(&debugger, &project(), Arc::new(|_| {})).unwrap();
+        assert_eq!(found.pid, 9);
+        assert_eq!(*debugger.1.lock().unwrap(), vec![9]);
+
+        let none = FakeDebugger(vec![], Mutex::default());
+        let err = attach_to_editor(&none, &project(), Arc::new(|_| {}))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            AttachError::Find(FindEditorError::NoneRunning)
+        ));
     }
 
     #[test]

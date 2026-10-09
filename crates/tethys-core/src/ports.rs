@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::debug::{DebugEvent, ProcessInfo, SourceBreakpoint};
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
 use crate::scm::{FileStatus, WorkingCopyInfo};
 use crate::unreal::{CommandSpec, Configuration};
@@ -61,6 +62,29 @@ pub trait SourceControl: Send + Sync {
 /// Starts programs that outlive Tethys, like the Unreal Editor.
 pub trait ProcessLauncher {
     fn spawn_detached(&self, command: &CommandSpec, cwd: &Path) -> PortResult<()>;
+}
+
+/// Receives debug events; called from the debugger's thread.
+pub type DebugEventSink = Arc<dyn Fn(DebugEvent) + Send + Sync>;
+
+/// Attaches a native debugger to a running program (DbgEng now).
+pub trait Debugger: Send + Sync {
+    /// Processes that could be debugged.
+    fn processes(&self) -> PortResult<Vec<ProcessInfo>>;
+    /// Attaches to `pid`. Events, starting with `Attached`, go to `events`.
+    fn attach(&self, pid: u32, events: DebugEventSink) -> PortResult<Box<dyn DebugSession>>;
+}
+
+/// One attached program. Every call returns at once; results arrive as
+/// events. Dropping it detaches: it never kills the program.
+pub trait DebugSession: Send {
+    /// Replaces every breakpoint with `breakpoints`.
+    fn set_breakpoints(&self, breakpoints: Vec<SourceBreakpoint>);
+    /// Continues after a stop.
+    fn resume(&self);
+    fn pause(&self);
+    /// Detaches, leaving the program running. Ends with `Ended(Detached)`.
+    fn detach(&self);
 }
 
 /// Receives session events; called from any thread.

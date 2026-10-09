@@ -3,6 +3,7 @@
 //! This crate must not depend on UI, OS or agent details. Adapters live in
 //! `tethys-adapters`; the composition root is `tethys-app`.
 
+pub mod debug;
 pub mod diff;
 pub mod domain;
 pub mod ports;

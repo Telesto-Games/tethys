@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::GlobalState;
+use gpui_kit::base::{Disableable, GlobalState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
     DockArea, DockEvent, DockPlacement, DockSkin, Panel, PanelHandle, PanelId, PanelStyle,
@@ -19,21 +19,27 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use tethys_adapters::agent_terminal::TerminalHost;
 use tethys_adapters::config_toml::TomlConfigStore;
+use tethys_adapters::debug_dbgeng::DbgEng;
 use tethys_adapters::engine_registry::RegistryEngineLocator;
 use tethys_adapters::process_launcher::DetachedLauncher;
 use tethys_adapters::scm_git::Git;
 use tethys_adapters::scm_svn::Subversion;
 use tethys_adapters::self_install::ExeReplacer;
 use tethys_adapters::update_github::GitHubReleases;
+use tethys_core::debug::{self as dbg, Breakpoints, DebugEnd, DebugEvent, StackFrame, StopReason};
 use tethys_core::diff::FileDiff;
 use tethys_core::ports::{
-    AgentSession, ConfigStore, EventSink, SelfInstaller, SessionEvent, SourceControl, UpdateSource,
+    AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EventSink, SelfInstaller,
+    SessionEvent, SourceControl, UpdateSource,
 };
 use tethys_core::unreal::Configuration;
 use tethys_core::usecases::{RecentProject, ScmSummary};
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
 use crate::build_placeholder::BuildPlaceholder;
+use crate::debug_panel::{
+    BreakpointRow, DebugPanel, DebugPanelEvent, DebugStatus, DebugView, FrameRow,
+};
 use crate::diff_panel::DiffPanel;
 use crate::editor_panel::{self, EditorEvent, EditorPanel};
 use crate::file_tree::{FileTreeEvent, FileTreePanel};
@@ -45,6 +51,8 @@ use crate::update_ui;
 const BUILD_PANE_WIDTH: Pixels = px(560.);
 /// Initial width of the Files pane on the left.
 const FILES_PANE_WIDTH: Pixels = px(280.);
+/// Initial height of the debug pane at the bottom.
+const DEBUG_PANE_HEIGHT: Pixels = px(240.);
 /// Height of every control in the project header, so they line up.
 const TOOLBAR_HEIGHT: Pixels = px(28.);
 
@@ -61,7 +69,10 @@ gpui_kit::actions!(
         ShowProjects,
         Exit,
         About,
-        CheckForUpdates
+        CheckForUpdates,
+        AttachOrContinue,
+        PauseDebugger,
+        DetachDebugger
     ]
 );
 
@@ -85,6 +96,15 @@ pub fn install_menus(cx: &mut App) {
                 MenuItem::action("Launch Editor", LaunchEditor),
             ])
             .owned(),
+        Menu::new("Debug")
+            .items([
+                MenuItem::action("Attach to Editor / Continue", AttachOrContinue),
+                MenuItem::action("Pause", PauseDebugger),
+                MenuItem::action("Detach", DetachDebugger),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Breakpoint", editor_panel::ToggleBreakpoint),
+            ])
+            .owned(),
         Menu::new("Help")
             .items([
                 MenuItem::action("Check for Updates…", CheckForUpdates),
@@ -100,6 +120,9 @@ pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-shift-p", ShowProjects, None),
         KeyBinding::new("ctrl-s", crate::editor_panel::Save, None),
+        KeyBinding::new("f9", crate::editor_panel::ToggleBreakpoint, None),
+        KeyBinding::new("f5", AttachOrContinue, None),
+        KeyBinding::new("shift-f5", DetachDebugger, None),
         KeyBinding::new("ctrl-shift-b", BuildProject, None),
         KeyBinding::new("ctrl-shift-e", LaunchEditor, None),
         KeyBinding::new("ctrl-shift-o", OpenProject, None),
@@ -119,6 +142,7 @@ pub struct Services {
     pub scms: Vec<Arc<dyn SourceControl>>,
     pub updates: Arc<dyn UpdateSource>,
     pub installer: Arc<dyn SelfInstaller>,
+    pub debugger: Arc<dyn Debugger>,
     next_session: AtomicU64,
 }
 
@@ -131,6 +155,7 @@ impl Services {
             scms: vec![Arc::new(Git::new()), Arc::new(Subversion::new())],
             updates: Arc::new(GitHubReleases::new(update_ui::REPO)),
             installer: Arc::new(ExeReplacer::new()),
+            debugger: Arc::new(DbgEng),
             next_session: AtomicU64::new(1),
         }
     }
@@ -185,6 +210,25 @@ pub struct Workspace {
     /// The source control managing the project folder, if any.
     scm: Option<Arc<dyn SourceControl>>,
     subscriptions: Vec<Subscription>,
+    debug: Debug,
+}
+
+/// The debugger side of a window.
+#[derive(Default)]
+struct Debug {
+    session: Option<Box<dyn DebugSession>>,
+    status: DebugStatus,
+    /// What is attached, or a note about the last session.
+    process: Option<String>,
+    /// The stack of the last stop, with sources found on this machine.
+    frames: Vec<FrameRow>,
+    /// The frame shown in the editor.
+    frame: Option<usize>,
+    breakpoints: Breakpoints,
+    panel: Option<Entity<DebugPanel>>,
+    /// Tags events, so a late event from an earlier session is ignored.
+    generation: u64,
+    events: Option<futures::channel::mpsc::UnboundedSender<(u64, DebugEvent)>>,
 }
 
 impl Workspace {
@@ -200,6 +244,21 @@ impl Workspace {
                 }
             }
         });
+
+        let (debug_tx, mut debug_rx) = futures::channel::mpsc::unbounded();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some((generation, event)) = debug_rx.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.on_debug_event(generation, event, window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
 
         let (dock, skin) = DockSkin::dock_area("sessions", None, window, cx);
         skin.set_panel_style(PanelStyle::TabBar, cx);
@@ -224,6 +283,9 @@ impl Workspace {
                 for panel in this.panels.drain(..) {
                     panel.update(cx, |panel, _| panel.stop());
                 }
+                // Dropping the session detaches (and waits for it), so the
+                // editor is never left with breakpoints in it.
+                this.debug.session = None;
             });
             true
         });
@@ -250,6 +312,10 @@ impl Workspace {
             diffs: Vec::new(),
             scm: None,
             subscriptions: Vec::new(),
+            debug: Debug {
+                events: Some(debug_tx),
+                ..Debug::default()
+            },
         };
         if let Some(path) = path {
             this.open(path, window, cx);
@@ -660,12 +726,16 @@ impl Workspace {
                     this.show_diff(path.clone(), Some(text.clone()), window, cx)
                 }
                 EditorEvent::DirtyChanged => {}
+                EditorEvent::ToggleBreakpoint(path, line) => {
+                    this.toggle_breakpoint(path.clone(), *line, window, cx)
+                }
             }
             // Tab titles (the unsaved marker) are drawn by the dock.
             this.dock.update(cx, |_, cx| cx.notify());
         });
         self.subscriptions.push(events);
         self.add_center_panel(&editor, window, cx);
+        self.mark_editor(&editor, cx);
         self.editors.push(editor);
     }
 
@@ -773,6 +843,14 @@ impl Workspace {
         self.panels.retain(|p| held(p.entity_id()));
         self.editors.retain(|p| held(p.entity_id()));
         self.diffs.retain(|p| held(p.entity_id()));
+        if self
+            .debug
+            .panel
+            .as_ref()
+            .is_some_and(|p| !held(p.entity_id()))
+        {
+            self.debug.panel = None;
+        }
         if (self.panels.len(), self.editors.len(), self.diffs.len()) != before {
             cx.notify();
         }
@@ -842,6 +920,322 @@ impl Workspace {
         }
         // Tab titles are drawn by the dock.
         self.dock.update(cx, |_, cx| cx.notify());
+    }
+
+    /// F5: attach to the editor, or continue after a stop.
+    fn attach_or_continue(
+        &mut self,
+        _: &AttachOrContinue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.debug.status {
+            DebugStatus::Detached => self.attach_debugger(window, cx),
+            DebugStatus::Stopped(_) => {
+                if let Some(session) = &self.debug.session {
+                    session.resume();
+                }
+            }
+            DebugStatus::Attaching | DebugStatus::Running => {}
+        }
+    }
+
+    fn pause_debugger(&mut self, _: &PauseDebugger, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(session) = &self.debug.session {
+            session.pause();
+        }
+    }
+
+    fn detach_debugger(&mut self, _: &DetachDebugger, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(session) = &self.debug.session {
+            session.detach();
+        }
+    }
+
+    /// Attaches to the running editor that has this project open.
+    fn attach_debugger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(project), Some(tx)) = (self.project.clone(), self.debug.events.clone()) else {
+            return;
+        };
+        if self.debug.status != DebugStatus::Detached {
+            return;
+        }
+        self.debug.generation += 1;
+        let generation = self.debug.generation;
+        let sink: DebugEventSink = Arc::new(move |event| {
+            let _ = tx.unbounded_send((generation, event));
+        });
+        self.debug.status = DebugStatus::Attaching;
+        self.debug.process = None;
+        self.show_debug_panel(window, cx);
+        self.refresh_debug(cx);
+
+        let debugger = cx.global::<Services>().debugger.clone();
+        // Listing processes and attaching take a few seconds on a big editor.
+        let attach = cx.background_executor().spawn(async move {
+            usecases::attach_to_editor(debugger.as_ref(), &project, sink).map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let attached = attach.await;
+            let _ = this.update(cx, |this, cx| {
+                match attached {
+                    Ok((process, session)) => {
+                        session.set_breakpoints(this.breakpoint_requests());
+                        this.debug.process = Some(format!("{} (pid {})", process.exe, process.pid));
+                        this.debug.session = Some(session);
+                    }
+                    Err(e) => {
+                        this.debug.status = DebugStatus::Detached;
+                        this.error = Some(format!("Can't debug: {e}"));
+                    }
+                }
+                this.refresh_debug(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn on_debug_event(
+        &mut self,
+        generation: u64,
+        event: DebugEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.debug.generation {
+            return;
+        }
+        match event {
+            DebugEvent::Attached => {}
+            DebugEvent::Running => {
+                self.debug.status = DebugStatus::Running;
+                self.debug.frames.clear();
+                self.debug.frame = None;
+            }
+            DebugEvent::Stopped { reason, frames, .. } => {
+                self.debug.status = DebugStatus::Stopped(self.describe_stop(&reason));
+                self.debug.frames = self.frame_rows(frames);
+                // Show the innermost frame we have the source for.
+                let shown = self.debug.frames.iter().position(|f| f.source.is_some());
+                window.activate_window();
+                match shown {
+                    Some(i) => self.open_frame(i, window, cx),
+                    None => self.show_debug_panel(window, cx),
+                }
+            }
+            DebugEvent::Breakpoints(states) => self.debug.breakpoints.set_states(&states),
+            DebugEvent::Ended(end) => {
+                self.debug.session = None;
+                self.debug.status = DebugStatus::Detached;
+                self.debug.frames.clear();
+                self.debug.frame = None;
+                self.debug.breakpoints.reset_states();
+                self.debug.process = match end {
+                    DebugEnd::Detached => None,
+                    DebugEnd::Exited => Some("The editor exited.".into()),
+                    DebugEnd::Failed(e) => {
+                        self.error = Some(format!("The debugger stopped: {e}"));
+                        None
+                    }
+                };
+            }
+        }
+        self.refresh_debug(cx);
+        cx.notify();
+    }
+
+    fn describe_stop(&self, reason: &StopReason) -> String {
+        let StopReason::Breakpoint(id) = reason else {
+            return reason.describe();
+        };
+        match self.debug.breakpoints.all().iter().find(|b| b.id == *id) {
+            Some(b) => {
+                let name = b.file.file_name().unwrap_or_default().to_string_lossy();
+                format!("Breakpoint at {name}:{}", b.line)
+            }
+            None => reason.describe(),
+        }
+    }
+
+    /// Stack frames for display, with sources mapped to this machine.
+    fn frame_rows(&self, frames: Vec<StackFrame>) -> Vec<FrameRow> {
+        let engine = self.project.as_ref().and_then(|p| p.engine.clone().ok());
+        frames
+            .into_iter()
+            .map(|frame| {
+                let located = frame.file.zip(frame.line);
+                let location = located.as_ref().map(|(file, line)| {
+                    let name = file.file_name().unwrap_or_default().to_string_lossy();
+                    format!("{name}:{line}")
+                });
+                let source = located.and_then(|(file, line)| {
+                    let file = match &engine {
+                        Some(root) => dbg::local_source(&file, root, |p| p.is_file()),
+                        None => file,
+                    };
+                    file.is_file().then_some((file, line))
+                });
+                FrameRow {
+                    function: frame.function,
+                    location,
+                    source,
+                    current: false,
+                }
+            })
+            .collect()
+    }
+
+    /// Shows frame `index` of the last stop in the editor.
+    fn open_frame(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(frame) = self.debug.frames.get(index) else {
+            return;
+        };
+        self.debug.frame = Some(index);
+        if let Some((file, line)) = frame.source.clone() {
+            self.open_source(file, line, window, cx);
+        }
+        self.refresh_debug(cx);
+    }
+
+    /// Opens `file` in an editor at a 1-based line.
+    fn open_source(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file(file.clone(), window, cx);
+        if let Some(editor) = self.editors.iter().find(|e| e.read(cx).path() == file) {
+            editor.update(cx, |editor, cx| editor.go_to_line(line, window, cx));
+        }
+    }
+
+    fn toggle_breakpoint(
+        &mut self,
+        file: PathBuf,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.debug.breakpoints.toggle(&file, line);
+        if let Some(session) = &self.debug.session {
+            session.set_breakpoints(self.breakpoint_requests());
+        }
+        self.show_debug_panel(window, cx);
+        self.refresh_debug(cx);
+    }
+
+    fn breakpoint_requests(&self) -> Vec<dbg::SourceBreakpoint> {
+        self.debug.breakpoints.requests(|p| p.is_file())
+    }
+
+    /// Adds the debug pane at the bottom, unless it's already there.
+    fn show_debug_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.debug.panel.is_some() || self.project.is_none() {
+            return;
+        }
+        let panel = cx.new(DebugPanel::new);
+        let events = cx.subscribe_in(&panel, window, |this, _, event, window, cx| match event {
+            DebugPanelEvent::Attach => this.attach_debugger(window, cx),
+            DebugPanelEvent::Detach => this.detach_debugger(&DetachDebugger, window, cx),
+            DebugPanelEvent::Continue => this.attach_or_continue(&AttachOrContinue, window, cx),
+            DebugPanelEvent::Pause => this.pause_debugger(&PauseDebugger, window, cx),
+            DebugPanelEvent::OpenFrame(i) => this.open_frame(*i, window, cx),
+            DebugPanelEvent::OpenBreakpoint(file, line) => {
+                this.open_source(file.clone(), *line, window, cx)
+            }
+            DebugPanelEvent::RemoveBreakpoint(id) => {
+                this.debug.breakpoints.remove(*id);
+                if let Some(session) = &this.debug.session {
+                    session.set_breakpoints(this.breakpoint_requests());
+                }
+                this.refresh_debug(cx);
+            }
+        });
+        self.subscriptions.push(events);
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                Arc::new(PanelHandle::new(panel.clone())),
+                DockPlacement::Bottom,
+                Some(DEBUG_PANE_HEIGHT),
+                window,
+                cx,
+            )
+        });
+        self.debug.panel = Some(panel);
+    }
+
+    /// Redraws the debug pane and every editor's breakpoint and stop marks.
+    fn refresh_debug(&mut self, cx: &mut Context<Self>) {
+        let frames = self
+            .debug
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| FrameRow {
+                current: self.debug.frame == Some(i),
+                ..f.clone()
+            })
+            .collect();
+        let view = DebugView {
+            status: self.debug.status.clone(),
+            process: self.debug.process.clone(),
+            frames,
+            breakpoints: self
+                .debug
+                .breakpoints
+                .all()
+                .iter()
+                .map(|b| BreakpointRow {
+                    id: b.id,
+                    file: b.file.clone(),
+                    line: b.line,
+                    state: b.state.clone(),
+                })
+                .collect(),
+        };
+        if let Some(panel) = &self.debug.panel {
+            panel.update(cx, |panel, cx| panel.set_view(view, cx));
+        }
+        for editor in self.editors.clone() {
+            self.mark_editor(&editor, cx);
+        }
+    }
+
+    fn mark_editor(&self, editor: &Entity<EditorPanel>, cx: &mut Context<Self>) {
+        let path = editor.read(cx).path().to_path_buf();
+        let lines = self.debug.breakpoints.lines_in(&path);
+        let stop = self
+            .debug
+            .frame
+            .and_then(|i| self.debug.frames.get(i)?.source.clone())
+            .filter(|(file, _)| file.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+            .map(|(_, line)| line);
+        editor.update(cx, |editor, cx| editor.set_debug_marks(&lines, stop, cx));
+    }
+
+    /// Debug when detached, Detach when attached.
+    fn render_debug_button(&self, cx: &mut Context<Self>) -> Button {
+        let button = Button::new("debug")
+            .small()
+            .h(TOOLBAR_HEIGHT)
+            .outline()
+            .icon(Icon::new(IconName::Bug));
+        match self.debug.status {
+            DebugStatus::Detached => button
+                .label("Debug")
+                .tooltip("Attach to this project's running editor (F5)")
+                .on_click(cx.listener(|this, _, window, cx| this.attach_debugger(window, cx))),
+            DebugStatus::Attaching => button.label("Attaching…").disabled(true),
+            DebugStatus::Running | DebugStatus::Stopped(_) => button
+                .label("Detach")
+                .tooltip("Detach, leaving the editor running (Shift+F5)")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.detach_debugger(&DetachDebugger, window, cx)
+                })),
+        }
     }
 
     fn render_error(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1006,6 +1400,7 @@ impl Workspace {
     }
 
     fn render_project(&self, project: &Project, cx: &mut Context<Self>) -> impl IntoElement {
+        let debug_button = self.render_debug_button(cx);
         let theme = cx.theme();
         let (engine_chip, engine_error) = match &project.engine {
             Ok(path) => (association_label(project), path.display().to_string()),
@@ -1133,6 +1528,7 @@ impl Workspace {
                         this.launch_editor(&LaunchEditor, window, cx)
                     })),
             )
+            .child(debug_button)
             .child(divider())
             .child(
                 Button::new("new-session")
@@ -1199,6 +1595,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::check_for_updates))
+            .on_action(cx.listener(Self::attach_or_continue))
+            .on_action(cx.listener(Self::pause_debugger))
+            .on_action(cx.listener(Self::detach_debugger))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if let Some(path) = paths.paths().iter().find(|p| is_uproject(p)) {
                     this.open(path.clone(), window, cx);

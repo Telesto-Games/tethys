@@ -3,6 +3,7 @@
 
 mod assets;
 mod build_placeholder;
+mod debug_panel;
 mod diff_panel;
 mod editor_panel;
 mod file_tree;
