@@ -5,7 +5,7 @@
 //! send input.
 
 mod command;
-mod job;
+pub(crate) mod job;
 pub mod palette;
 
 use std::borrow::Cow;

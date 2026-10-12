@@ -12,6 +12,7 @@ mod session_panel;
 mod settings_ui;
 mod tab_skin;
 mod terminal_view;
+mod tests_panel;
 mod theme;
 mod update_ui;
 mod workspace;

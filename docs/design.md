@@ -157,6 +157,7 @@ doesn't need a port.
 | `ConfigStore` | Agent profiles, recent projects | `config_toml` | In-memory fake |
 | `AgentHost` | Start, stop and watch an agent session in a project | `agent_terminal` (PTY + alacritty_terminal) | `agent_acp` (opencode). Fake for tests. |
 | `Debugger` | Attach to the running editor, set breakpoints, report stops (see [Debugging the editor](#debugging-the-editor)) | `debug_dbgeng` (DbgEng) | Fake for tests. |
+| `TestRunner` | Find editors, list and run their automation tests (see [Automation tests](#automation-tests)) | `udp_messagebus` (UE's UDP message bus) | Fake for tests. |
 
 The core's `AgentProfile.adapter` field chooses which `AgentHost` adapter runs a session. The
 composition root in `tethys-app` registers the available hosts. The core rejects Claude + ACP,
@@ -484,6 +485,101 @@ refuses to build while a Live Coding session is active.
   - It refuses while the debugger has the editor stopped, since the compile would wait for it.
   - Progress and errors show in the editor's own Live Coding window, not in Tethys.
 
+## Automation tests
+
+> Status: **implemented 2026-10-12.** Checked against UE 5.8 (AeonixDemo): a headless test
+> editor starts, lists its 6,382 tests and runs the project's 29 in about 10 s from the click;
+> against an editor that's already open, the 29 run in under 2 s. Not yet seen through Tethys: a
+> failing test's error entries (their file and line arrive as fields, so they should link), and
+> stopping mid-run.
+
+The **Tests** pane lists an editor's automation tests and runs them, the way the editor's own
+Session Frontend does, and over the same channel: Unreal's **UDP message bus**.
+
+### Why the message bus, not the command line
+
+The obvious route is `UnrealEditor-Cmd <uproject> -ExecCmds="Automation RunTests …; Quit"`
+and parsing its log (`Test Completed. Result={Success} …`). It works, but every run starts an
+editor (8–10 s for a small project), can't use the editor the user has open (so Live Coding
+patches aren't tested), can't stop cleanly, and progress is log scraping.
+
+Session Frontend instead talks to the editor's **automation worker** through messages. Tethys
+does the same, so it can use the open editor or keep a headless one running between runs, and it
+gets structured results: each test's source file and line, state, duration and log entries.
+
+### The protocol (`tethys-adapters::udp_messagebus`)
+
+None of it is documented by Epic; it's read from the UE 5.8 sources (`UdpMessaging`,
+`SessionServices`, `AutomationWorker`, `AutomationController`) and checked against a live editor.
+
+- **Transport** (`wire.rs`, `node.rs`). Protocol version 18 (UE 5.8 accepts 10–18; the layouts
+  Tethys uses are the same from 16). Every datagram starts with `u8 version, GUID recipient (zero
+  = everyone), GUID sender, u8 segment type`. Nodes announce themselves with **Hello** to the
+  multicast group `230.0.0.1:6666` every second or so, and are dropped after a while without
+  traffic. An editor started with `-UDPMESSAGING_TRANSPORT_STATIC=<endpoint>` also sends **Ping**
+  there, with a version 11 header so any node can read it and its real version in the body.
+  Messages travel as **Data** segments; the receiver acknowledges **every segment**
+  (`AcknowledgeSegments`) even for unreliable messages, and the sender resends what isn't
+  acknowledged, so a node that doesn't acknowledge stalls the sender. The multicast port is
+  shared with editors on the same machine (`SO_REUSEADDR`, hence the `socket2` dependency).
+- **Messages** (`message.rs`). A reassembled message is: type path (`/Script/Package.Struct`, as
+  two `FString`s), sender address, recipient addresses (empty = published), scope, flags, sent
+  and expiry times, annotations, a format byte, and the body. `FString`s and GUIDs use `FArchive`
+  encoding.
+- **Bodies** (`cbor.rs`). The editor writes **CBOR in platform byte order**: standard CBOR
+  except that multi-byte lengths and numbers are little-endian. Structs are maps from property
+  name to value, enums are their names, a `FGuid` is `{A, B, C, D}`. Tethys reads that and writes
+  standard big-endian CBOR, which the format byte lets the editor accept.
+- **Finding the editor.** A worker only answers `AutomationWorkerFindWorkers` that carries its
+  own session id (and `Changelist = 10000`). `SessionServicePing` gets a `SessionServicePong` from
+  every editor with its session id, instance id and instance name (`<Computer>-<pid>`); the pid is
+  how `automation::pick_instance` tells this project's editor from others, through the same
+  process list the debugger uses. A test editor Tethys starts gets `-SessionId` from Tethys.
+- **The conversation** (`automation.rs`, `runner.rs`): `FindWorkers` (repeated: the worker
+  answers once the asset registry has loaded), `RequestTests` → `RequestTestsReplyComplete` (every
+  test, megabytes for an engine's 6,000), then `StartTestSession`, one `RunTests` per test →
+  `RunTestsReply`, and `StopTestSession`. `StopTests` abandons a run; the worker finishes the test
+  it's on.
+
+### Port
+
+```rust
+pub trait TestRunner: Send + Sync {
+    fn instances(&self) -> PortResult<Vec<TestInstance>>;      // editors on the bus
+    fn connect(&self, instance: &TestInstance, events: TestEventSink) -> PortResult<Box<dyn TestSession>>;
+    fn launch(&self, command: &CommandSpec, cwd: &Path, events: TestEventSink) -> PortResult<Box<dyn TestSession>>;
+}
+pub trait TestSession: Send {                                   // dropping it disconnects
+    fn refresh(&self);
+    fn run(&self, tests: Vec<AutomationTest>);
+    fn stop(&self);
+}
+pub enum TestEvent { Status(String), Connected { name }, Tests(Vec<AutomationTest>),
+                     Started(path), Finished(path, TestResult), RunEnded { stopped }, Ended(TestEnd) }
+```
+
+As with the debugger, one thread per session owns the node and polls it; the session handle
+sends it commands through a channel. Dropping a launched session stops its editor, which also
+runs in a kill-on-close Job Object so it can't outlive Tethys. The core's `automation` module
+holds the plain logic: `TestCatalog` (results, a run's progress, the tree rows and group
+summaries) and `pick_instance`, all unit-tested. `usecases::connect_tests` picks or launches.
+
+### UI
+
+- **Tests** button in the project header and a **Test** menu; the pane sits in the bottom dock.
+  Closing it disconnects.
+- **Connect ▾**: *This project's editor* or *Start a test editor (headless)*:
+  `UnrealEditor-Cmd.exe <uproject> -unattended -nosplash -nopause` (or the DebugGame build) plus
+  the **Test editor arguments** setting, `-nullrhi` by default.
+- The tree shows the project's own tests by default (*Project only*: defined under the project
+  folder), with a filter. **Run** runs the selection or everything shown; **Run failed**;
+  **Refresh** lists again; **Stop**. The details side shows the selected test's state, duration,
+  source link and log, problems first.
+
+**Known limits:** a test editor runs the DLLs on disk, so after Live Coding the open editor is the
+one to test. Tests needing several participants (network tests) aren't supported. Results aren't
+kept between sessions. Screenshot comparison requests from tests aren't answered.
+
 ## Milestones
 
 Each milestone is the smallest useful step. M0 carries a spike that isn't a feature: it exists to
@@ -560,7 +656,7 @@ Things learned while building M0–M3 that aren't obvious from the code.
   `Build.bat … DebugGame` and launches `Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe`.
   Installed engines ship that executable; it loads the project's `-Win64-DebugGame` modules.
 - **Settings.** File → Settings… (Ctrl+,) opens an app-wide dialog (`settings_ui.rs`). It
-  has two settings. The first is **extra command-line arguments for the editor**. They're added
+  has three settings. The first is **extra command-line arguments for the editor**. They're added
   after the `.uproject` whenever Tethys starts the editor, whether through Launch editor or
   through Debug when Debug launches it.
   - They're stored as typed in `state.toml` (`ConfigStore::editor_args`) and split at launch by
@@ -570,7 +666,10 @@ Things learned while building M0–M3 that aren't obvious from the code.
     (the experimental `ModelContextProtocol` plugin) with the editor, and the editor ignores it
     when the plugin isn't enabled.
   - Saving an empty value means no extra arguments, not the default.
-  - The second, **Vertical tabs** (`ConfigStore::vertical_tabs`, off by default), lists the main
+  - **Test editor arguments** (`ConfigStore::test_editor_args`) work the same way for the
+    headless editor the Tests pane starts; the default, `unreal::DEFAULT_TEST_EDITOR_ARGS`, is
+    `-nullrhi`. See [Automation tests](#automation-tests).
+  - The last, **Vertical tabs** (`ConfigStore::vertical_tabs`, off by default), lists the main
     area's tabs down its left side. The dock always lays a tab group out as a column, so
     `tab_skin.rs` wraps gpui-component's `DockSkin`, draws the tab list over the group's left
     edge and moves the content over by its width. Docks keep their tabs along the top.

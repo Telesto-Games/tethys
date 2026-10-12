@@ -26,15 +26,18 @@ use tethys_adapters::process_launcher::DetachedLauncher;
 use tethys_adapters::scm_git::Git;
 use tethys_adapters::scm_svn::Subversion;
 use tethys_adapters::self_install::ExeReplacer;
+use tethys_adapters::udp_messagebus::runner::BusTestRunner;
 use tethys_adapters::update_github::GitHubReleases;
+use tethys_core::automation::{TestEnd, TestEvent};
 use tethys_core::debug::{self as dbg, Breakpoints, DebugEnd, DebugEvent, StackFrame, StopReason};
 use tethys_core::diff::FileDiff;
 use tethys_core::ports::{
     AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EventSink, LiveCoding,
-    SelfInstaller, SessionEvent, SourceControl, UpdateSource,
+    SelfInstaller, SessionEvent, SourceControl, TestEventSink, TestRunner, TestSession,
+    UpdateSource,
 };
 use tethys_core::unreal::Configuration;
-use tethys_core::usecases::{DebugStart, RecentProject, ScmSummary};
+use tethys_core::usecases::{DebugStart, RecentProject, ScmSummary, TestTarget};
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
 use crate::build_placeholder::BuildPlaceholder;
@@ -47,6 +50,7 @@ use crate::file_tree::{FileTreeEvent, FileTreePanel};
 use crate::session_panel::{SessionKind, SessionPanel};
 use crate::settings_ui;
 use crate::tab_skin;
+use crate::tests_panel::{TestsPanel, TestsPanelEvent};
 use crate::theme;
 use crate::update_ui;
 
@@ -81,7 +85,10 @@ gpui_kit::actions!(
         AttachToEditor,
         LaunchWithDebugger,
         PauseDebugger,
-        DetachDebugger
+        DetachDebugger,
+        ShowTests,
+        ConnectTestsToEditor,
+        StartTestEditor
     ]
 );
 
@@ -120,6 +127,14 @@ pub fn install_menus(cx: &mut App) {
                 MenuItem::action("Detach", DetachDebugger),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Breakpoint", editor_panel::ToggleBreakpoint),
+            ])
+            .owned(),
+        Menu::new("Test")
+            .items([
+                MenuItem::action("Show Tests", ShowTests),
+                MenuItem::separator(),
+                MenuItem::action("Connect to This Project's Editor", ConnectTestsToEditor),
+                MenuItem::action("Start a Test Editor (Headless)", StartTestEditor),
             ])
             .owned(),
         Menu::new("Help")
@@ -163,6 +178,7 @@ pub struct Services {
     pub installer: Arc<dyn SelfInstaller>,
     pub debugger: Arc<dyn Debugger>,
     pub live_coding: Arc<dyn LiveCoding>,
+    pub tests: Arc<dyn TestRunner>,
     next_session: AtomicU64,
 }
 
@@ -177,6 +193,7 @@ impl Services {
             installer: Arc::new(ExeReplacer::new()),
             debugger: Arc::new(DbgEng),
             live_coding: Arc::new(HotkeyLiveCoding),
+            tests: Arc::new(BusTestRunner),
             next_session: AtomicU64::new(1),
         }
     }
@@ -232,6 +249,17 @@ pub struct Workspace {
     scm: Option<Arc<dyn SourceControl>>,
     subscriptions: Vec<Subscription>,
     debug: Debug,
+    tests: Tests,
+}
+
+/// The automation-test side of a window.
+#[derive(Default)]
+struct Tests {
+    session: Option<Box<dyn TestSession>>,
+    panel: Option<Entity<TestsPanel>>,
+    /// Tags events, so a late event from an earlier session is ignored.
+    generation: u64,
+    events: Option<UnboundedSender<(u64, TestEvent)>>,
 }
 
 /// The debugger side of a window.
@@ -281,6 +309,19 @@ impl Workspace {
         })
         .detach();
 
+        let (tests_tx, mut tests_rx) = futures::channel::mpsc::unbounded();
+        cx.spawn(async move |this, cx| {
+            while let Some((generation, event)) = tests_rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.on_test_event(generation, event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         let (dock, skin) = tab_skin::dock_area("sessions", window, cx);
         skin.set_panel_style(PanelStyle::TabBar, cx);
         skin.set_close_button_visible(true, cx);
@@ -307,6 +348,8 @@ impl Workspace {
                 // Dropping the session detaches (and waits for it), so the
                 // editor is never left with breakpoints in it.
                 this.debug.session = None;
+                // Disconnecting stops a test editor Tethys started.
+                this.tests.session = None;
             });
             true
         });
@@ -336,6 +379,10 @@ impl Workspace {
             debug: Debug {
                 events: Some(debug_tx),
                 ..Debug::default()
+            },
+            tests: Tests {
+                events: Some(tests_tx),
+                ..Tests::default()
             },
         };
         if let Some(path) = path {
@@ -939,6 +986,17 @@ impl Workspace {
         {
             self.debug.panel = None;
         }
+        // The panel holds the results, so closing it ends the session too.
+        if self
+            .tests
+            .panel
+            .as_ref()
+            .is_some_and(|p| !held(p.entity_id()))
+        {
+            self.tests.panel = None;
+            self.tests.session = None;
+            self.tests.generation += 1;
+        }
         if (self.panels.len(), self.editors.len(), self.diffs.len()) != before {
             cx.notify();
         }
@@ -1344,6 +1402,161 @@ impl Workspace {
         editor.update(cx, |editor, cx| editor.set_debug_marks(&lines, stop, cx));
     }
 
+    fn show_tests(&mut self, _: &ShowTests, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = self.show_tests_panel(window, cx) {
+            self.focus_panel(&panel, window, cx);
+        }
+    }
+
+    fn connect_tests_to_editor(
+        &mut self,
+        _: &ConnectTestsToEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connect_tests(TestTarget::OpenEditor, window, cx);
+    }
+
+    fn start_test_editor(
+        &mut self,
+        _: &StartTestEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connect_tests(TestTarget::TestEditor, window, cx);
+    }
+
+    /// Adds the Tests pane at the bottom, unless it's already there.
+    fn show_tests_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TestsPanel>> {
+        if let Some(panel) = &self.tests.panel {
+            return Some(panel.clone());
+        }
+        let root = self.unreal_project()?.root().to_path_buf();
+        let panel = cx.new(|cx| TestsPanel::new(root, window, cx));
+        let events = cx.subscribe_in(&panel, window, |this, _, event, window, cx| match event {
+            TestsPanelEvent::Connect(target) => this.connect_tests(*target, window, cx),
+            TestsPanelEvent::Disconnect => this.disconnect_tests(cx),
+            TestsPanelEvent::Run(tests) => {
+                if let Some(session) = &this.tests.session {
+                    session.run(tests.clone());
+                }
+            }
+            TestsPanelEvent::Stop => {
+                if let Some(session) = &this.tests.session {
+                    session.stop();
+                }
+            }
+            TestsPanelEvent::Refresh => {
+                if let Some(session) = &this.tests.session {
+                    session.refresh();
+                }
+            }
+            TestsPanelEvent::OpenSource(file, line) => {
+                this.open_source(file.clone(), *line, window, cx)
+            }
+        });
+        self.subscriptions.push(events);
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                Arc::new(PanelHandle::new(panel.clone())),
+                DockPlacement::Bottom,
+                Some(DEBUG_PANE_HEIGHT),
+                window,
+                cx,
+            )
+        });
+        self.tests.panel = Some(panel.clone());
+        Some(panel)
+    }
+
+    /// Connects the Tests pane to this project's editor, or to a headless
+    /// test editor it starts.
+    fn connect_tests(&mut self, target: TestTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(project), Some(tx)) = (self.unreal_project().cloned(), self.tests.events.clone())
+        else {
+            return;
+        };
+        let Some(panel) = self.show_tests_panel(window, cx) else {
+            return;
+        };
+        if self.tests.session.is_some() || !panel.read(cx).is_disconnected() {
+            return;
+        }
+        self.tests.generation += 1;
+        let generation = self.tests.generation;
+        let sink: TestEventSink = Arc::new(move |event| {
+            let _ = tx.unbounded_send((generation, event));
+        });
+        let status = match target {
+            TestTarget::OpenEditor => "Looking for this project's editor…",
+            TestTarget::TestEditor => "Starting the test editor…",
+        };
+        panel.update(cx, |panel, cx| panel.set_connecting(status.into(), cx));
+
+        let services = cx.global::<Services>();
+        let runner = services.tests.clone();
+        let debugger = services.debugger.clone();
+        let configuration = self.configuration;
+        let args = settings_ui::test_editor_args(cx);
+        // Finding editors listens on the bus for a few seconds.
+        let start = cx.background_executor().spawn(async move {
+            usecases::connect_tests(
+                runner.as_ref(),
+                || debugger.processes(),
+                &project,
+                configuration,
+                &args,
+                target,
+                sink,
+            )
+            .map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let started = start.await;
+            let _ = this.update(cx, |this, cx| {
+                // Cancelled while connecting: dropping the session disconnects it.
+                if this.tests.generation != generation {
+                    return;
+                }
+                match started {
+                    Ok((_, session)) => this.tests.session = Some(session),
+                    Err(e) => {
+                        if let Some(panel) = &this.tests.panel {
+                            panel.update(cx, |panel, cx| panel.set_failed(e, cx));
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn disconnect_tests(&mut self, cx: &mut Context<Self>) {
+        self.tests.generation += 1;
+        self.tests.session = None;
+        if let Some(panel) = &self.tests.panel {
+            panel.update(cx, |panel, cx| {
+                panel.apply(TestEvent::Ended(TestEnd::Disconnected), cx)
+            });
+        }
+    }
+
+    fn on_test_event(&mut self, generation: u64, event: TestEvent, cx: &mut Context<Self>) {
+        if generation != self.tests.generation {
+            return;
+        }
+        if let TestEvent::Ended(_) = event {
+            self.tests.session = None;
+        }
+        if let Some(panel) = &self.tests.panel {
+            panel.update(cx, |panel, cx| panel.apply(event, cx));
+        }
+    }
+
     /// Debug when detached, Detach when attached.
     fn render_debug_button(&self, cx: &mut Context<Self>) -> Button {
         let button = Button::new("debug")
@@ -1674,6 +1887,15 @@ impl Workspace {
                 cx.listener(|this, _, window, cx| this.launch_editor(&LaunchEditor, window, cx)),
             );
 
+        let tests = Button::new("tests")
+            .small()
+            .h(TOOLBAR_HEIGHT)
+            .outline()
+            .icon(Icon::new(IconName::FlaskConical))
+            .label("Tests")
+            .tooltip("List and run this project's automation tests")
+            .on_click(cx.listener(|this, _, window, cx| this.show_tests(&ShowTests, window, cx)));
+
         let header = div()
             .flex()
             .items_center()
@@ -1692,6 +1914,7 @@ impl Workspace {
                     .child(live_coding)
                     .child(launch_editor)
                     .child(debug_button)
+                    .child(tests)
                     .child(divider())
             })
             .child(
@@ -1780,6 +2003,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::launch_with_debugger))
             .on_action(cx.listener(Self::pause_debugger))
             .on_action(cx.listener(Self::detach_debugger))
+            .on_action(cx.listener(Self::show_tests))
+            .on_action(cx.listener(Self::connect_tests_to_editor))
+            .on_action(cx.listener(Self::start_test_editor))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if let Some(path) = paths.paths().iter().find(|p| is_uproject(p) || p.is_dir()) {
                     this.open(path.clone(), window, cx);

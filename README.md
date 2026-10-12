@@ -31,15 +31,16 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Do this | How |
 |---|---|
 | Open a project | Start `tethys.exe` with no argument for the project browser (picker + recent projects), or pass a `.uproject`. Also **Ctrl+Shift+O**, or drop a `.uproject` on the window |
-| Open a folder | **File → Open Folder…**, **Open folder…** in the project browser, pass a folder path, or drop a folder on the window. You get agent sessions, terminals and the Files pane; Build, Launch Editor and Debug need a `.uproject` and are hidden |
+| Open a folder | **File → Open Folder…**, **Open folder…** in the project browser, pass a folder path, or drop a folder on the window. You get agent sessions, terminals and the Files pane; Build, Launch Editor, Debug and Tests need a `.uproject` and are hidden |
 | Project browser from a project | **File → Projects…** or **Ctrl+Shift+P** opens it in a new window |
-| Menus | **File** (Open Project, Open Folder, Projects, New/Close Session, Exit), **Build** (Build, Launch Editor), **Help** (About) |
+| Menus | **File** (Open Project, Open Folder, Projects, New/Close Session, Exit), **Build** (Build, Launch Editor), **Debug**, **Test** (Show Tests, Connect, Start a Test Editor), **Help** (About) |
 | New agent session | **New session ▾** → Claude Code or opencode. **Ctrl+Shift+T** starts the first (Claude Code) |
 | Plain terminal | **New session ▾** → Terminal, or **Ctrl+Shift+\`**. Runs PowerShell 7 (`pwsh`) if installed, otherwise Windows PowerShell, in the project folder |
 | Close session | **Ctrl+Shift+W** |
 | Pick the build configuration | **Development** / **DebugGame** toggle in the project header (remembered between runs) |
 | Build the editor target | **Ctrl+Shift+B**: runs `Build.bat <Project>Editor Win64 <Configuration>` in the **Build pane** on the right (✓ or ✗ when done). Each new build replaces the previous finished log |
 | Launch the Unreal Editor | **Ctrl+Shift+E**: starts `UnrealEditor.exe` (or `UnrealEditor-Win64-DebugGame.exe`) on the project, independent of Tethys |
+| Run automation tests | **Tests** in the project header opens the **Tests** pane. **Connect ▾** → **This project's editor** uses the editor you have open, or **Start a test editor (headless)** starts `UnrealEditor-Cmd` just for tests (stopped when you disconnect). Tests show as a tree, the project's own by default (**Project only**). **Run** runs the selected test or group, or every test shown; **Run failed** reruns failures. Select a test for its result and log; click a file name to open the source at that line. Extra test editor arguments are in **File → Settings…** |
 | Switch session | **Ctrl+Tab** / **Ctrl+Shift+Tab**, or click the tab |
 | Browse files | The **Files** pane on the left lists the project folder; its footer shows the source control in use, Git or Subversion (branch, revision, remote URL, last change). **All / Changes** at its top switches to a flat list of only added and modified files. Changed files are coloured (yellow modified, green added, red deleted/conflicted, grey unversioned) with their SVN-style letter; folders containing changes are yellow |
 | Edit a file | Click it in Files. Ctrl+S saves, **Revert** discards unsaved edits. Line endings, BOM and tab indentation are preserved exactly. Tabs with unsaved edits can't be closed until saved or reverted |

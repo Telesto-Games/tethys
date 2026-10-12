@@ -4,12 +4,13 @@ use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::automation;
 use crate::debug::{self, FindEditorError, ProcessInfo, SourceBreakpoint};
 use crate::diff::{self, FileDiff};
 use crate::domain::{AdapterKind, AgentProfile, DomainError, Project, ProjectError, SessionId};
 use crate::ports::{
     AgentHost, AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EngineLocator,
-    EventSink, PortError, ProcessLauncher, SourceControl,
+    EventSink, PortError, ProcessLauncher, SourceControl, TestEventSink, TestRunner, TestSession,
 };
 use crate::scm::{WorkingCopyInfo, WorkingCopyStatus};
 use crate::unreal::{self, Configuration, ToolError};
@@ -279,6 +280,77 @@ pub fn debug_editor(
     Ok((debuggee, session))
 }
 
+/// Which editor runs the tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestTarget {
+    /// The editor the user has open on this project.
+    OpenEditor,
+    /// A headless editor Tethys starts for tests, and stops with the session.
+    TestEditor,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TestStartError {
+    #[error(transparent)]
+    Find(#[from] FindEditorError),
+    #[error(transparent)]
+    Tool(#[from] ToolError),
+    #[error("can't look for editors: {0}")]
+    Discover(PortError),
+    #[error("can't connect to {name}: {source}")]
+    Connect { name: String, source: PortError },
+    #[error("can't start {program}: {source}")]
+    Launch { program: String, source: PortError },
+}
+
+/// Connects to an editor that can run `project`'s tests: this project's open
+/// editor, or a headless test editor started in `configuration` with the
+/// user's `test_editor_args`. Returns what it connected to, for display.
+///
+/// `processes` tells this project's editor apart from others; it may fail
+/// (the debugger refuses while it debugs), and then only a lone editor is taken.
+pub fn connect_tests(
+    runner: &dyn TestRunner,
+    processes: impl FnOnce() -> Result<Vec<ProcessInfo>, PortError>,
+    project: &Project,
+    configuration: Configuration,
+    test_editor_args: &[String],
+    target: TestTarget,
+    events: TestEventSink,
+) -> Result<(String, Box<dyn TestSession>), TestStartError> {
+    match target {
+        TestTarget::OpenEditor => {
+            let instances = runner.instances().map_err(TestStartError::Discover)?;
+            let processes = processes().ok();
+            let instance =
+                automation::pick_instance(&instances, processes.as_deref(), &project.path)?;
+            let session =
+                runner
+                    .connect(instance, events)
+                    .map_err(|source| TestStartError::Connect {
+                        name: instance.name.clone(),
+                        source,
+                    })?;
+            Ok((instance.name.clone(), session))
+        }
+        TestTarget::TestEditor => {
+            let cmd = unreal::test_editor_command(project, configuration, test_editor_args)?;
+            let session = runner
+                .launch(&cmd, project.root(), events)
+                .map_err(|source| TestStartError::Launch {
+                    program: cmd.program.display().to_string(),
+                    source,
+                })?;
+            let exe = cmd
+                .program
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok((format!("{exe} (test editor)"), session))
+        }
+    }
+}
+
 /// Moves `path` to the front of the recent projects list and saves it.
 pub fn remember_project(config: &dyn ConfigStore, path: &Path) -> Result<(), PortError> {
     let recent = config.recent_projects().unwrap_or_default();
@@ -431,6 +503,12 @@ mod tests {
             Ok(String::new())
         }
         fn set_editor_args(&self, _: &str) -> PortResult<()> {
+            Ok(())
+        }
+        fn test_editor_args(&self) -> PortResult<String> {
+            Ok(String::new())
+        }
+        fn set_test_editor_args(&self, _: &str) -> PortResult<()> {
             Ok(())
         }
         fn vertical_tabs(&self) -> PortResult<bool> {

@@ -6901,6 +6901,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "socket2",
  "tethys-core",
  "toml 1.1.7+spec-1.1.0",
  "ureq",
