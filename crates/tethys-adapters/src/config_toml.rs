@@ -33,6 +33,9 @@ struct StateFile {
     /// default applies), so an empty string means "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     editor_args: Option<String>,
+    /// Extra arguments for the headless test editor; `None` until set, as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_editor_args: Option<String>,
     /// Tabs down the side of the main area rather than along the top.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     vertical_tabs: bool,
@@ -112,6 +115,17 @@ impl ConfigStore for TomlConfigStore {
 
     fn set_editor_args(&self, args: &str) -> PortResult<()> {
         self.update_state(|s| s.editor_args = Some(args.trim().to_string()))
+    }
+
+    fn test_editor_args(&self) -> PortResult<String> {
+        let state = self.read::<StateFile>("state.toml")?;
+        Ok(state
+            .test_editor_args
+            .unwrap_or_else(|| unreal::DEFAULT_TEST_EDITOR_ARGS.to_string()))
+    }
+
+    fn set_test_editor_args(&self, args: &str) -> PortResult<()> {
+        self.update_state(|s| s.test_editor_args = Some(args.trim().to_string()))
     }
 
     fn vertical_tabs(&self) -> PortResult<bool> {
@@ -241,6 +255,26 @@ mod state_tests {
         // Cleared on purpose: no arguments, not the default.
         store.set_editor_args("").unwrap();
         assert_eq!(store.editor_args().unwrap(), "");
+    }
+
+    #[test]
+    fn test_editor_args_default_until_set_and_apart_from_editor_args() {
+        let dir =
+            std::env::temp_dir().join(format!("tethys-config-test-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        assert_eq!(
+            store.test_editor_args().unwrap(),
+            unreal::DEFAULT_TEST_EDITOR_ARGS
+        );
+        store
+            .set_test_editor_args(" -nullrhi -DisablePlugins=FSR ")
+            .unwrap();
+        assert_eq!(
+            store.test_editor_args().unwrap(),
+            "-nullrhi -DisablePlugins=FSR"
+        );
+        assert_eq!(store.editor_args().unwrap(), unreal::DEFAULT_EDITOR_ARGS);
     }
 
     #[test]

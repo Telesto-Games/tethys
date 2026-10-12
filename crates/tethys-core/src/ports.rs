@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::automation::{AutomationTest, TestEvent, TestInstance};
 use crate::debug::{DebugEvent, ProcessInfo, SourceBreakpoint};
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
 use crate::scm::{FileStatus, WorkingCopyInfo};
@@ -32,6 +33,10 @@ pub trait ConfigStore {
     /// [`crate::unreal::DEFAULT_EDITOR_ARGS`] until the user sets them.
     fn editor_args(&self) -> PortResult<String>;
     fn set_editor_args(&self, args: &str) -> PortResult<()>;
+    /// Extra arguments for the headless editor that runs tests, as typed.
+    /// [`crate::unreal::DEFAULT_TEST_EDITOR_ARGS`] until the user sets them.
+    fn test_editor_args(&self) -> PortResult<String>;
+    fn set_test_editor_args(&self, args: &str) -> PortResult<()>;
     /// Whether the main area lists its tabs down the side instead of along the top.
     fn vertical_tabs(&self) -> PortResult<bool>;
     fn set_vertical_tabs(&self, vertical: bool) -> PortResult<()>;
@@ -117,6 +122,42 @@ pub trait DebugSession: Send {
     fn pause(&self);
     /// Detaches, leaving the program running. Ends with `Ended(Detached)`.
     fn detach(&self);
+}
+
+/// Receives test events; called from the test session's thread.
+pub type TestEventSink = Arc<dyn Fn(TestEvent) + Send + Sync>;
+
+/// Reaches Unreal Editors' automation workers, to list and run their tests
+/// (the UDP message bus now, as Session Frontend does).
+pub trait TestRunner: Send + Sync {
+    /// Editors on this machine that can run tests. Takes a few seconds.
+    fn instances(&self) -> PortResult<Vec<TestInstance>>;
+    /// Connects to a running editor's automation worker. Events, ending with
+    /// `Connected` and `Tests` once it answers, go to `events`.
+    fn connect(
+        &self,
+        instance: &TestInstance,
+        events: TestEventSink,
+    ) -> PortResult<Box<dyn TestSession>>;
+    /// Starts `command` (a headless editor) in `cwd` and connects to it once
+    /// it's up. The editor stops when the session ends.
+    fn launch(
+        &self,
+        command: &CommandSpec,
+        cwd: &Path,
+        events: TestEventSink,
+    ) -> PortResult<Box<dyn TestSession>>;
+}
+
+/// A connection to one editor's automation worker. Every call returns at
+/// once; results arrive as events. Dropping it disconnects.
+pub trait TestSession: Send {
+    /// Lists the tests again, e.g. after a build.
+    fn refresh(&self);
+    /// Runs `tests` one after another. Ignored while a run is going.
+    fn run(&self, tests: Vec<AutomationTest>);
+    /// Stops the run after the current test.
+    fn stop(&self);
 }
 
 /// Receives session events; called from any thread.

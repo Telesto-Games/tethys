@@ -24,17 +24,33 @@ pub fn editor_args(cx: &App) -> Vec<String> {
     unreal::split_args(&line)
 }
 
+/// The extra arguments for the headless test editor, as saved.
+pub fn test_editor_args(cx: &App) -> Vec<String> {
+    let config = &cx.global::<Services>().config;
+    let line = config
+        .test_editor_args()
+        .unwrap_or_else(|_| unreal::DEFAULT_TEST_EDITOR_ARGS.to_string());
+    unreal::split_args(&line)
+}
+
 /// Opens the Settings dialog in `window`.
 pub fn open(window: &mut Window, cx: &mut App) {
-    let saved = cx
-        .global::<Services>()
-        .config
+    let config = &cx.global::<Services>().config;
+    let saved = config
         .editor_args()
         .unwrap_or_else(|_| unreal::DEFAULT_EDITOR_ARGS.to_string());
+    let saved_test = config
+        .test_editor_args()
+        .unwrap_or_else(|_| unreal::DEFAULT_TEST_EDITOR_ARGS.to_string());
     let args = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder("No extra arguments")
             .default_value(saved)
+    });
+    let test_args = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("No extra arguments")
+            .default_value(saved_test)
     });
     let vertical = Rc::new(Cell::new(cx.global::<TabLayout>().vertical));
 
@@ -47,7 +63,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
                 .child(title)
         };
         let reset = args.clone();
+        let reset_test = test_args.clone();
         let save = args.clone();
+        let save_test = test_args.clone();
         let toggle = vertical.clone();
         let save_vertical = vertical.clone();
         dialog.title("Settings").w(px(560.)).child(
@@ -75,6 +93,15 @@ pub fn open(window: &mut Window, cx: &mut App) {
                             unreal::DEFAULT_EDITOR_ARGS
                         )),
                 )
+                .child(div().pt_2().child(section("RUNNING TESTS")))
+                .child(div().text_sm().child("Test editor arguments"))
+                .child(Input::new(&test_args))
+                .child(div().text_xs().text_color(muted).whitespace_normal().child(format!(
+                    "Added when Tests starts a headless test editor (UnrealEditor-Cmd). The \
+                     default, {}, skips rendering; remove it for tests that render. Add \
+                     anything your project needs to start headless, e.g. -DisablePlugins=….",
+                    unreal::DEFAULT_TEST_EDITOR_ARGS
+                )))
                 .child(div().pt_2().child(section("TABS")))
                 .child(
                     Checkbox::new("vertical-tabs")
@@ -98,10 +125,17 @@ pub fn open(window: &mut Window, cx: &mut App) {
                             Button::new("reset-editor-args")
                                 .ghost()
                                 .small()
-                                .label("Reset to default")
+                                .label("Reset to defaults")
                                 .on_click(move |_, window, cx| {
                                     reset.update(cx, |input, cx| {
                                         input.set_value(unreal::DEFAULT_EDITOR_ARGS, window, cx)
+                                    });
+                                    reset_test.update(cx, |input, cx| {
+                                        input.set_value(
+                                            unreal::DEFAULT_TEST_EDITOR_ARGS,
+                                            window,
+                                            cx,
+                                        )
                                     });
                                 }),
                         )
@@ -118,10 +152,12 @@ pub fn open(window: &mut Window, cx: &mut App) {
                                 .label("Save")
                                 .on_click(move |_, window, cx| {
                                     let line = save.read(cx).value().to_string();
+                                    let test_line = save_test.read(cx).value().to_string();
                                     let vertical = save_vertical.get();
                                     let config = &cx.global::<Services>().config;
                                     match config
                                         .set_editor_args(&line)
+                                        .and_then(|()| config.set_test_editor_args(&test_line))
                                         .and_then(|()| config.set_vertical_tabs(vertical))
                                     {
                                         Ok(()) => {

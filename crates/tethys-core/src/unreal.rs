@@ -54,6 +54,16 @@ impl Configuration {
             Configuration::DebugGame => r"Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe",
         }
     }
+
+    /// The console build of the editor, for running headless.
+    fn editor_cmd_exe(self) -> &'static str {
+        match self {
+            Configuration::Development => r"Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
+            Configuration::DebugGame => {
+                r"Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame-Cmd.exe"
+            }
+        }
+    }
 }
 
 /// The editor target to build: `<Name>Editor` if the project has that target,
@@ -116,6 +126,31 @@ pub fn editor_command(
     args.extend(extra_args.iter().cloned());
     Ok(CommandSpec {
         program: engine.join(configuration.editor_exe()),
+        args,
+    })
+}
+
+/// Extra test editor arguments when the user hasn't set any: no rendering, so
+/// it starts quickly and opens no window. Tests that render need it removed.
+pub const DEFAULT_TEST_EDITOR_ARGS: &str = "-nullrhi";
+
+/// A headless editor for running tests: `UnrealEditor-Cmd.exe <uproject>
+/// -unattended -nosplash -nopause <extra_args…>`, which stays up until stopped.
+pub fn test_editor_command(
+    project: &Project,
+    configuration: Configuration,
+    extra_args: &[String],
+) -> Result<CommandSpec, ToolError> {
+    let engine = engine_root(project)?;
+    let mut args = vec![
+        project.path.display().to_string(),
+        "-unattended".into(),
+        "-nosplash".into(),
+        "-nopause".into(),
+    ];
+    args.extend(extra_args.iter().cloned());
+    Ok(CommandSpec {
+        program: engine.join(configuration.editor_cmd_exe()),
         args,
     })
 }
@@ -232,6 +267,27 @@ mod tests {
             [
                 r"D:\dev\Arcade\Arcade.uproject",
                 "-ModelContextProtocolStartServer"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_editor_command_runs_the_console_editor_unattended() {
+        let p = project(Ok(r"D:\UE_5.8"), &[], &[]);
+        let extra = vec!["-nullrhi".to_string()];
+        let cmd = test_editor_command(&p, Configuration::DebugGame, &extra).unwrap();
+        assert_eq!(
+            cmd.program,
+            Path::new(r"D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame-Cmd.exe")
+        );
+        assert_eq!(
+            cmd.args,
+            [
+                r"D:\dev\Arcade\Arcade.uproject",
+                "-unattended",
+                "-nosplash",
+                "-nopause",
+                "-nullrhi"
             ]
         );
     }
