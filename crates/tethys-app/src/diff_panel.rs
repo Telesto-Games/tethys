@@ -7,11 +7,13 @@ use gpui_kit::component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_kit::*;
 use tethys_core::diff::{FileDiff, LineKind};
 
+use crate::editor_panel::expand_tabs;
 use crate::file_tree::file_name;
 
 const ROW_HEIGHT: f32 = 20.;
 const GUTTER: f32 = 48.;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Row {
     Hunk {
         old_start: usize,
@@ -62,24 +64,7 @@ impl DiffPanel {
     }
 
     pub fn set_diff(&mut self, diff: FileDiff, cx: &mut Context<Self>) {
-        self.added = diff.added;
-        self.removed = diff.removed;
-        self.rows = diff
-            .hunks
-            .into_iter()
-            .flat_map(|h| {
-                std::iter::once(Row::Hunk {
-                    old_start: h.old_start,
-                    new_start: h.new_start,
-                })
-                .chain(h.lines.into_iter().map(|l| Row::Line {
-                    kind: l.kind,
-                    old_line: l.old_line,
-                    new_line: l.new_line,
-                    text: l.text.replace('\t', "    ").into(),
-                }))
-            })
-            .collect();
+        (self.rows, self.added, self.removed) = diff_rows(diff);
         cx.notify();
     }
 
@@ -123,7 +108,7 @@ impl DiffPanel {
                     .px_3()
                     .bg(theme.primary.opacity(0.08))
                     .text_color(theme.primary.opacity(0.85))
-                    .child(format!("@@ -{old_start} +{new_start} @@"))
+                    .child(hunk_header(*old_start, *new_start))
                     .into_any_element(),
                 Row::Line {
                     kind,
@@ -160,6 +145,33 @@ impl DiffPanel {
             })
             .collect()
     }
+}
+
+/// A hunk as a header row followed by its lines, with the counts of lines
+/// added and removed. Tabs expand to tab stops, as the editor shows them.
+fn diff_rows(diff: FileDiff) -> (Vec<Row>, usize, usize) {
+    let rows = diff
+        .hunks
+        .into_iter()
+        .flat_map(|h| {
+            std::iter::once(Row::Hunk {
+                old_start: h.old_start,
+                new_start: h.new_start,
+            })
+            .chain(h.lines.into_iter().map(|l| Row::Line {
+                kind: l.kind,
+                old_line: l.old_line,
+                new_line: l.new_line,
+                text: expand_tabs(&l.text).into(),
+            }))
+        })
+        .collect();
+    (rows, diff.added, diff.removed)
+}
+
+/// The unified-diff style hunk line.
+fn hunk_header(old_start: usize, new_start: usize) -> String {
+    format!("@@ -{old_start} +{new_start} @@")
 }
 
 impl EventEmitter<PanelEvent> for DiffPanel {}
@@ -265,5 +277,101 @@ impl Render for DiffPanel {
                     .child(header)
                     .child(body),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tethys_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
+
+    use super::{Row, diff_rows, hunk_header};
+
+    fn line(kind: LineKind, old: Option<usize>, new: Option<usize>, text: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            old_line: old,
+            new_line: new,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn rows_are_a_header_per_hunk_then_its_lines() {
+        let diff = FileDiff {
+            hunks: vec![
+                Hunk {
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        line(LineKind::Context, Some(1), Some(1), "a"),
+                        line(LineKind::Removed, Some(2), None, "b"),
+                        line(LineKind::Added, None, Some(2), "c"),
+                    ],
+                },
+                Hunk {
+                    old_start: 10,
+                    new_start: 11,
+                    lines: vec![line(LineKind::Added, None, Some(11), "d")],
+                },
+            ],
+            added: 2,
+            removed: 1,
+        };
+        let (rows, added, removed) = diff_rows(diff);
+        assert_eq!((added, removed), (2, 1));
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            rows[0],
+            Row::Hunk {
+                old_start: 1,
+                new_start: 1
+            }
+        );
+        assert_eq!(
+            rows[2],
+            Row::Line {
+                kind: LineKind::Removed,
+                old_line: Some(2),
+                new_line: None,
+                text: "b".into(),
+            }
+        );
+        assert_eq!(
+            rows[4],
+            Row::Hunk {
+                old_start: 10,
+                new_start: 11
+            }
+        );
+    }
+
+    #[test]
+    fn tabs_expand_to_tab_stops_like_the_editor() {
+        let diff = FileDiff {
+            hunks: vec![Hunk {
+                old_start: 1,
+                new_start: 1,
+                lines: vec![line(LineKind::Context, Some(1), Some(1), "\tx\ty")],
+            }],
+            added: 0,
+            removed: 0,
+        };
+        let (rows, _, _) = diff_rows(diff);
+        let Row::Line { text, .. } = &rows[1] else {
+            panic!("a line row");
+        };
+        assert_eq!(text.as_ref(), "    x   y");
+    }
+
+    #[test]
+    fn an_empty_diff_has_no_rows() {
+        let (rows, added, removed) = diff_rows(FileDiff::default());
+        assert!(rows.is_empty());
+        assert_eq!((added, removed), (0, 0));
+    }
+
+    #[test]
+    fn hunk_header_is_unified_diff_style() {
+        assert_eq!(hunk_header(3, 7), "@@ -3 +7 @@");
     }
 }

@@ -96,12 +96,7 @@ impl HistoryPanel {
         let selection = self.selection;
         cx.notify();
         let (scm, path) = (self.scm.clone(), self.path.clone());
-        let against = format!(
-            "{} · {} · {}",
-            short_revision(&commit.revision),
-            commit.author,
-            day(&commit.date)
-        );
+        let against = commit_meta(&commit);
         let diff = cx
             .background_executor()
             .spawn(async move { usecases::commit_diff(scm.as_ref(), &path, &commit) });
@@ -154,12 +149,6 @@ impl HistoryPanel {
         range
             .filter_map(|ix| commits.get(ix).map(|c| (ix, c)))
             .map(|(ix, commit)| {
-                let message = commit
-                    .message
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
                 div()
                     .id(ix)
                     .h(px(ROW_HEIGHT))
@@ -172,17 +161,19 @@ impl HistoryPanel {
                     .cursor_pointer()
                     .when(self.selected == Some(ix), |d| d.bg(selected_bg))
                     .hover(|s| s.bg(hover))
-                    .child(div().text_sm().truncate().child(if message.is_empty() {
-                        "(no message)".to_string()
-                    } else {
-                        message
-                    }))
-                    .child(div().text_xs().truncate().text_color(muted).child(format!(
-                        "{} · {} · {}",
-                        short_revision(&commit.revision),
-                        commit.author,
-                        day(&commit.date)
-                    )))
+                    .child(
+                        div()
+                            .text_sm()
+                            .truncate()
+                            .child(summary_line(&commit.message)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .truncate()
+                            .text_color(muted)
+                            .child(commit_meta(commit)),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx)))
                     .into_any_element()
             })
@@ -190,15 +181,40 @@ impl HistoryPanel {
     }
 }
 
-/// `r712` for Subversion; a git hash cut to its first eight characters.
+/// `r712` for Subversion, whole; a git hash cut to its first eight characters.
 fn short_revision(revision: &str) -> String {
     let label = revision_label(revision);
-    label.chars().take(8).collect()
+    if label == revision {
+        // A git hash: `revision_label` left it alone.
+        label.chars().take(8).collect()
+    } else {
+        label
+    }
 }
 
 /// An ISO date's day: "2026-10-06".
 fn day(date: &str) -> &str {
     date.get(..10).unwrap_or(date)
+}
+
+/// A commit's first line, or "(no message)".
+fn summary_line(message: &str) -> String {
+    let first = message.lines().next().unwrap_or_default();
+    if first.is_empty() {
+        "(no message)".to_string()
+    } else {
+        first.to_string()
+    }
+}
+
+/// "r712 · alice · 2026-10-06": the line under a commit, and the diff's label.
+fn commit_meta(commit: &Commit) -> String {
+    format!(
+        "{} · {} · {}",
+        short_revision(&commit.revision),
+        commit.author,
+        day(&commit.date)
+    )
 }
 
 impl EventEmitter<PanelEvent> for HistoryPanel {}
@@ -305,5 +321,58 @@ impl Render for HistoryPanel {
                     .child(list),
             )
             .child(div().flex_1().min_w_0().flex().flex_col().child(diff))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tethys_core::scm::Commit;
+
+    use super::{commit_meta, day, short_revision, summary_line};
+
+    #[test]
+    fn svn_revisions_stay_whole_and_git_hashes_are_cut() {
+        assert_eq!(short_revision("712"), "r712");
+        assert_eq!(short_revision("12345678"), "r12345678");
+        assert_eq!(
+            short_revision("0123456789abcdef0123456789abcdef01234567"),
+            "01234567"
+        );
+        assert_eq!(short_revision("abc"), "abc");
+        assert_eq!(short_revision(""), "");
+    }
+
+    #[test]
+    fn day_is_the_date_part() {
+        assert_eq!(day("2026-10-06T12:34:56Z"), "2026-10-06");
+        assert_eq!(day("2026-10-06"), "2026-10-06");
+        assert_eq!(day("yesterday"), "yesterday");
+        // Cutting inside a character falls back to the whole string.
+        assert_eq!(day("ééééé"), "ééééé");
+    }
+
+    #[test]
+    fn summary_is_the_first_line_or_a_placeholder() {
+        assert_eq!(summary_line("Fix it\n\nDetails"), "Fix it");
+        assert_eq!(summary_line("One line"), "One line");
+        assert_eq!(summary_line(""), "(no message)");
+        assert_eq!(summary_line("\nSecond"), "(no message)");
+    }
+
+    #[test]
+    fn meta_joins_revision_author_and_day() {
+        let commit = Commit {
+            revision: "89abcdef01234567".into(),
+            author: "alice".into(),
+            date: "2026-10-06T09:00:00Z".into(),
+            message: "m".into(),
+            locator: "x".into(),
+        };
+        assert_eq!(commit_meta(&commit), "89abcdef · alice · 2026-10-06");
+        let svn = Commit {
+            revision: "12345678".into(),
+            ..commit
+        };
+        assert_eq!(commit_meta(&svn), "r12345678 · alice · 2026-10-06");
     }
 }

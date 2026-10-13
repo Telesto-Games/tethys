@@ -224,6 +224,14 @@ Three crates is the minimum that lets Cargo enforce "core depends on nothing".
   want opencode over ACP. The port is designed so that adding it later is cheap, but we don't
   build it ahead of time.
 - Test the core with fake adapters, without any UI or processes.
+- Test the app too. Views keep their decisions in plain functions or plain state structs
+  (`TestsState`, `Debug::apply`, `row_status`, `cell_style`, …) that unit tests call with data;
+  the GPUI entity is a thin shell that renders them and forwards events. Where the behaviour
+  is the interaction itself, `#[gpui_kit::test]` renders the real view in a headless window
+  (`test_support.rs` sets the app up as `main` does, with the config in a temp dir) and clicks
+  elements by id (`themes_ui::view_tests`). A plain element that a test must find gets
+  `.test_support()`, a no-op outside tests. Test modules import names explicitly: a glob of
+  `gpui_kit` brings in its `test` attribute macro and the `#[test]` expansion recurses.
 
 ### Terminal adapter notes
 
@@ -673,6 +681,22 @@ Things learned while building M0–M3 that aren't obvious from the code.
     area's tabs down its left side. The dock always lays a tab group out as a column, so
     `tab_skin.rs` wraps gpui-component's `DockSkin`, draws the tab list over the group's left
     edge and moves the content over by its width. Docks keep their tabs along the top.
+- **Themes.** Edit → Themes… opens a dialog (`themes_ui.rs`) listing the built-in theme and the
+  user's own. A theme is a `ThemeSpec` (`tethys-core::theme`): a name, four `#rrggbb` colours
+  (background, text, quiet text, accent), a font family and a base font size. Everything else
+  in the UI (headers, raised surfaces, hovers, hairlines, the active tab) is derived from those
+  in `theme::apply`, so a user theme gets the same structure as the built-in one, and a light
+  background switches gpui-component to its light mode and syntax theme. User themes and the
+  active theme's name are saved in `state.toml` (`ConfigStore::themes` / `active_theme`);
+  the built-in theme isn't stored and can't be edited, only copied. **Save and use** writes the
+  themes, makes the selected one active and applies it to every window through
+  `Theme::update`. A theme's **Terminals follow this theme** (`ThemeSpec::terminal`, off by
+  default) sets a `TerminalSkin` global: the terminal's default foreground, background and
+  cursor (`palette::Defaults`, taken from the theme's text, pane and accent colours) and its
+  font, two pixels smaller than the UI's. Off, terminals keep the brand palette. The ANSI
+  colours and a program's own OSC colour overrides are untouched either way, but a program
+  asking for its colours (OSC 10/11/12) is answered from the same defaults
+  (`palette::set_defaults`), so one that picks a scheme by background colour picks right.
 - **Docking.** Sessions (Claude and builds) are panels in a gpui-component `DockArea`
   (`SessionPanel`), so tabs can be dragged into splits and resized. The panel owns its
   `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. The layout
@@ -748,7 +772,8 @@ Things learned while building M0–M3 that aren't obvious from the code.
     one, and a bordered pill for the configuration toggle.
   - **Labels:** GPUI has no letter-spacing, so `theme::tracked` imitates the brand's wide
     tracking for a few welcome-screen labels only. Panel tabs use plain title case.
-  - Everything lives in `crates/tethys-app/src/theme.rs` and `agent_terminal::palette`.
+  - Everything lives in `crates/tethys-app/src/theme.rs` and `agent_terminal::palette`. The
+    brand values are the built-in `ThemeSpec`; see **Themes** above for user themes.
 - **App icon.** Tethys the moon (Telesto shares its orbit) in brand colours: an orange moon with
   a plum `>_` agent prompt above the Telesto horizon line, on a plum tile. The sources are
   `assets/icon/tethys.svg`, plus `tethys-small.svg` for 16–32 px, which drops the prompt so the

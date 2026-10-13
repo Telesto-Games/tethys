@@ -33,7 +33,8 @@ cargo build --release                  # target\release\tethys.exe, no console w
 | Open a project | Start `tethys.exe` with no argument for the project browser (picker + recent projects), or pass a `.uproject`. Also **Ctrl+Shift+O**, or drop a `.uproject` on the window |
 | Open a folder | **File → Open Folder…**, **Open folder…** in the project browser, pass a folder path, or drop a folder on the window. You get agent sessions, terminals and the Files pane; Build, Launch Editor, Debug and Tests need a `.uproject` and are hidden |
 | Project browser from a project | **File → Projects…** or **Ctrl+Shift+P** opens it in a new window |
-| Menus | **File** (Open Project, Open Folder, Projects, New/Close Session, Exit), **Build** (Build, Launch Editor), **Debug**, **Test** (Show Tests, Connect, Start a Test Editor), **Help** (About) |
+| Menus | **File** (Open Project, Open Folder, Projects, New/Close Session, Settings, Exit), **Edit** (Themes), **Build** (Build, Launch Editor), **Debug**, **Test** (Show Tests, Connect, Start a Test Editor), **Help** (About) |
+| Change the look | **Edit → Themes…** picks the theme in use and makes your own: **New theme** copies the selected one, then set its background, text, quiet text and accent colours, font family and size. **Save and use** applies it everywhere at once. Tick **Terminals follow this theme** for sessions and terminals to take its colours and font too. The built-in Telesto theme can't be edited |
 | New agent session | **New session ▾** → Claude Code or opencode. **Ctrl+Shift+T** starts the first (Claude Code) |
 | Plain terminal | **New session ▾** → Terminal, or **Ctrl+Shift+\`**. Runs PowerShell 7 (`pwsh`) if installed, otherwise Windows PowerShell, in the project folder |
 | Close session | **Ctrl+Shift+W** |

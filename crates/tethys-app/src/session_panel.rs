@@ -82,22 +82,29 @@ impl SessionPanel {
     }
 
     pub fn label(&self) -> String {
-        if self.kind == SessionKind::Build {
-            return match self.exit_code {
-                None => format!("{} …", self.label),
-                Some(0) => format!("{} ✓", self.label),
-                Some(code) => format!("{} ✗ ({code})", self.label),
-            };
-        }
-        let name = if self.kind == SessionKind::Terminal || self.title.trim().is_empty() {
-            &self.label
-        } else {
-            &self.title
+        session_label(self.kind, &self.label, &self.title, self.exit_code)
+    }
+}
+
+/// A session's tab label. Builds show progress and their result; agents use
+/// the title they set unless it's blank; terminals keep their label. A
+/// finished session says so.
+fn session_label(kind: SessionKind, label: &str, title: &str, exit_code: Option<i32>) -> String {
+    if kind == SessionKind::Build {
+        return match exit_code {
+            None => format!("{label} …"),
+            Some(0) => format!("{label} ✓"),
+            Some(code) => format!("{label} ✗ ({code})"),
         };
-        match self.exit_code {
-            Some(code) => format!("{name} (exited {code})"),
-            None => name.clone(),
-        }
+    }
+    let name = if kind == SessionKind::Terminal || title.trim().is_empty() {
+        label
+    } else {
+        title
+    };
+    match exit_code {
+        Some(code) => format!("{name} (exited {code})"),
+        None => name.to_string(),
     }
 }
 
@@ -169,5 +176,43 @@ impl Render for SessionPanel {
                 .overflow_hidden()
                 .child(self.terminal.clone()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionKind, session_label};
+
+    #[test]
+    fn build_labels_show_progress_and_result() {
+        let build = |code| session_label(SessionKind::Build, "Build GameEditor", "ignored", code);
+        assert_eq!(build(None), "Build GameEditor …");
+        assert_eq!(build(Some(0)), "Build GameEditor ✓");
+        assert_eq!(build(Some(6)), "Build GameEditor ✗ (6)");
+    }
+
+    #[test]
+    fn agents_use_their_title_unless_blank() {
+        let agent = |title, code| session_label(SessionKind::Agent, "Claude Code 2", title, code);
+        assert_eq!(agent("", None), "Claude Code 2");
+        assert_eq!(agent("  \t", None), "Claude Code 2");
+        assert_eq!(agent("✳ fixing tests", None), "✳ fixing tests");
+        assert_eq!(
+            agent("✳ fixing tests", Some(0)),
+            "✳ fixing tests (exited 0)"
+        );
+        assert_eq!(agent("", Some(1)), "Claude Code 2 (exited 1)");
+    }
+
+    #[test]
+    fn terminals_ignore_the_shell_title() {
+        assert_eq!(
+            session_label(SessionKind::Terminal, "Terminal", "D:\\dev\\repos", None),
+            "Terminal"
+        );
+        assert_eq!(
+            session_label(SessionKind::Terminal, "Terminal", "D:\\dev", Some(-1)),
+            "Terminal (exited -1)"
+        );
     }
 }

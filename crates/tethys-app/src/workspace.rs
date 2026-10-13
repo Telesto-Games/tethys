@@ -57,6 +57,7 @@ use crate::settings_ui;
 use crate::tab_skin;
 use crate::tests_panel::{TestsPanel, TestsPanelEvent};
 use crate::theme;
+use crate::themes_ui;
 use crate::update_ui;
 
 /// Initial width of the build pane on the right.
@@ -83,6 +84,7 @@ gpui_kit::actions!(
         LaunchEditor,
         ShowProjects,
         OpenSettings,
+        OpenThemes,
         Exit,
         About,
         CheckForUpdates,
@@ -97,7 +99,8 @@ gpui_kit::actions!(
     ]
 );
 
-/// The menu bar: File, Build and Help. Rendered in-window by `AppMenuBar`.
+/// The menu bar: File, Edit, Build, Debug, Test and Help. Rendered in-window
+/// by `AppMenuBar`.
 pub fn install_menus(cx: &mut App) {
     let menus = vec![
         Menu::new("File")
@@ -114,6 +117,9 @@ pub fn install_menus(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Exit", Exit),
             ])
+            .owned(),
+        Menu::new("Edit")
+            .items([MenuItem::action("Themes…", OpenThemes)])
             .owned(),
         Menu::new("Build")
             .items([
@@ -286,6 +292,135 @@ struct Debug {
     /// Tags events, so a late event from an earlier session is ignored.
     generation: u64,
     events: Option<futures::channel::mpsc::UnboundedSender<(u64, DebugEvent)>>,
+}
+
+/// What the window must do after [`Debug::apply`] took an event.
+#[derive(Debug, PartialEq)]
+enum DebugEffect {
+    /// The event was from an earlier session; nothing changed.
+    Ignored,
+    None,
+    /// Show this frame of the stop in the editor.
+    OpenFrame(usize),
+    /// Stopped with no source to show: bring up the Debug pane.
+    ShowPanel,
+    /// Tell the user the debugger failed.
+    Error(String),
+}
+
+impl Debug {
+    /// Takes an event from the session tagged `generation`, updating the
+    /// debug state. `engine` and `exists` map frame sources to this machine.
+    fn apply(
+        &mut self,
+        generation: u64,
+        event: DebugEvent,
+        engine: Option<&Path>,
+        exists: impl Fn(&Path) -> bool,
+    ) -> DebugEffect {
+        if generation != self.generation {
+            return DebugEffect::Ignored;
+        }
+        match event {
+            DebugEvent::Attached => DebugEffect::None,
+            DebugEvent::Running => {
+                self.status = DebugStatus::Running;
+                self.frames.clear();
+                self.frame = None;
+                DebugEffect::None
+            }
+            DebugEvent::Stopped { reason, frames, .. } => {
+                self.status = DebugStatus::Stopped(describe_stop(&reason, &self.breakpoints));
+                self.frames = frame_rows(frames, engine, exists);
+                // Show the innermost frame we have the source for.
+                match innermost_with_source(&self.frames) {
+                    Some(i) => DebugEffect::OpenFrame(i),
+                    None => DebugEffect::ShowPanel,
+                }
+            }
+            DebugEvent::Breakpoints(states) => {
+                self.breakpoints.set_states(&states);
+                DebugEffect::None
+            }
+            DebugEvent::Ended(end) => {
+                self.session = None;
+                self.status = DebugStatus::Detached;
+                self.frames.clear();
+                self.frame = None;
+                self.breakpoints.reset_states();
+                self.process = None;
+                match end {
+                    DebugEnd::Detached => DebugEffect::None,
+                    DebugEnd::Exited => {
+                        self.process = Some("The editor exited.".into());
+                        DebugEffect::None
+                    }
+                    DebugEnd::Failed(e) => DebugEffect::Error(format!("The debugger stopped: {e}")),
+                }
+            }
+        }
+    }
+}
+
+/// Why the program stopped, naming the breakpoint when it was one of ours.
+fn describe_stop(reason: &StopReason, breakpoints: &Breakpoints) -> String {
+    let StopReason::Breakpoint(id) = reason else {
+        return reason.describe();
+    };
+    match breakpoints.all().iter().find(|b| b.id == *id) {
+        Some(b) => {
+            let name = b.file.file_name().unwrap_or_default().to_string_lossy();
+            format!("Breakpoint at {name}:{}", b.line)
+        }
+        None => reason.describe(),
+    }
+}
+
+/// Stack frames for display, with sources mapped to this machine: a frame
+/// gets a source only if its file (or its engine-relative twin under
+/// `engine`) exists.
+fn frame_rows(
+    frames: Vec<StackFrame>,
+    engine: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<FrameRow> {
+    frames
+        .into_iter()
+        .map(|frame| {
+            let located = frame.file.zip(frame.line);
+            let location = located.as_ref().map(|(file, line)| {
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                format!("{name}:{line}")
+            });
+            let source = located.and_then(|(file, line)| {
+                let file = match engine {
+                    Some(root) => dbg::local_source(&file, root, &exists),
+                    None => file,
+                };
+                exists(&file).then_some((file, line))
+            });
+            FrameRow {
+                function: frame.function,
+                location,
+                source,
+                current: false,
+            }
+        })
+        .collect()
+}
+
+/// The innermost frame with source on this machine: the one to show first.
+fn innermost_with_source(frames: &[FrameRow]) -> Option<usize> {
+    frames.iter().position(|f| f.source.is_some())
+}
+
+/// The line to mark as the stop in the editor of `path`: the shown frame's,
+/// if that frame's source is this file (paths compared without case).
+fn stop_line(frames: &[FrameRow], frame: Option<usize>, path: &Path) -> Option<u32> {
+    frame
+        .and_then(|i| frames.get(i)?.source.as_ref())
+        .filter(|(file, _)| file.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+        .map(|(_, line)| *line)
 }
 
 impl Workspace {
@@ -988,12 +1123,7 @@ impl Workspace {
     fn moved(&mut self, from: &Path, to: &Path, window: &mut Window, cx: &mut Context<Self>) {
         for editor in &self.editors {
             let old = editor.read(cx).path().to_path_buf();
-            if let Ok(rest) = old.strip_prefix(from) {
-                let new = if rest.as_os_str().is_empty() {
-                    to.to_path_buf()
-                } else {
-                    to.join(rest)
-                };
+            if let Some(new) = remap_path(&old, from, to) {
                 editor.update(cx, |editor, cx| editor.set_path(new, cx));
             }
         }
@@ -1052,29 +1182,17 @@ impl Workspace {
 
     /// Asks before deleting `path` for good.
     fn confirm_delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let name = file_name(&path);
-        let what = if path.is_dir() {
-            "This folder and everything in it"
-        } else {
-            "This file"
-        };
-        let tracked = match &self.scm {
-            Some(scm) => format!(
-                " If it's under {}, the deletion is marked there, ready to commit.",
-                scm.name()
-            ),
-            None => String::new(),
-        };
-        let description = format!(
-            "{what} will be deleted permanently, including changes not yet saved or \
-             committed.{tracked}"
+        let (title, description) = delete_prompt(
+            &file_name(&path),
+            path.is_dir(),
+            self.scm.as_ref().map(|scm| scm.name()),
         );
         let this = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (this, path) = (this.clone(), path.clone());
             alert
                 .confirm()
-                .title(format!("Delete {name}?"))
+                .title(title.clone())
                 .description(description.clone())
                 .button_props(
                     DialogButtonProps::default()
@@ -1384,35 +1502,31 @@ impl Workspace {
     }
 
     fn close_session(&mut self, _: &CloseSession, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self
-            .focused_panel(window, cx)
-            .or(self.panels.len().checked_sub(1))
-        else {
+        let focused = self.focused_panel(window, cx);
+        let Some(index) = close_target(focused, self.panels.len()) else {
             return;
         };
         let panel = self.panels.remove(index);
         self.dock
             .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
-        if self.panels.is_empty() {
-            window.focus(&self.focus, cx);
-        } else {
-            self.activate(index.min(self.panels.len() - 1), window, cx);
+        match after_close(index, self.panels.len()) {
+            Some(next) => self.activate(next, window, cx),
+            None => window.focus(&self.focus, cx),
         }
         cx.notify();
     }
 
     fn next_session(&mut self, _: &NextSession, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.panels.is_empty() {
-            let next = self.focused_panel(window, cx).map_or(0, |i| i + 1);
-            self.activate(next % self.panels.len(), window, cx);
+        let focused = self.focused_panel(window, cx);
+        if let Some(next) = next_index(focused, self.panels.len()) {
+            self.activate(next, window, cx);
         }
     }
 
     fn prev_session(&mut self, _: &PrevSession, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.panels.is_empty() {
-            let n = self.panels.len();
-            let prev = self.focused_panel(window, cx).map_or(n - 1, |i| i + n - 1);
-            self.activate(prev % n, window, cx);
+        let focused = self.focused_panel(window, cx);
+        if let Some(prev) = prev_index(focused, self.panels.len()) {
+            self.activate(prev, window, cx);
         }
     }
 
@@ -1563,87 +1677,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if generation != self.debug.generation {
-            return;
-        }
-        match event {
-            DebugEvent::Attached => {}
-            DebugEvent::Running => {
-                self.debug.status = DebugStatus::Running;
-                self.debug.frames.clear();
-                self.debug.frame = None;
-            }
-            DebugEvent::Stopped { reason, frames, .. } => {
-                self.debug.status = DebugStatus::Stopped(self.describe_stop(&reason));
-                self.debug.frames = self.frame_rows(frames);
-                // Show the innermost frame we have the source for.
-                let shown = self.debug.frames.iter().position(|f| f.source.is_some());
+        let engine = self.project.as_ref().and_then(|p| p.engine.clone().ok());
+        let effect = self
+            .debug
+            .apply(generation, event, engine.as_deref(), |p| p.is_file());
+        match effect {
+            DebugEffect::Ignored => return,
+            DebugEffect::None => {}
+            DebugEffect::OpenFrame(i) => {
                 window.activate_window();
-                match shown {
-                    Some(i) => self.open_frame(i, window, cx),
-                    None => self.show_debug_panel(window, cx),
-                }
+                self.open_frame(i, window, cx);
             }
-            DebugEvent::Breakpoints(states) => self.debug.breakpoints.set_states(&states),
-            DebugEvent::Ended(end) => {
-                self.debug.session = None;
-                self.debug.status = DebugStatus::Detached;
-                self.debug.frames.clear();
-                self.debug.frame = None;
-                self.debug.breakpoints.reset_states();
-                self.debug.process = match end {
-                    DebugEnd::Detached => None,
-                    DebugEnd::Exited => Some("The editor exited.".into()),
-                    DebugEnd::Failed(e) => {
-                        self.error = Some(format!("The debugger stopped: {e}"));
-                        None
-                    }
-                };
+            DebugEffect::ShowPanel => {
+                window.activate_window();
+                self.show_debug_panel(window, cx);
             }
+            DebugEffect::Error(e) => self.error = Some(e),
         }
         self.refresh_debug(cx);
         cx.notify();
-    }
-
-    fn describe_stop(&self, reason: &StopReason) -> String {
-        let StopReason::Breakpoint(id) = reason else {
-            return reason.describe();
-        };
-        match self.debug.breakpoints.all().iter().find(|b| b.id == *id) {
-            Some(b) => {
-                let name = b.file.file_name().unwrap_or_default().to_string_lossy();
-                format!("Breakpoint at {name}:{}", b.line)
-            }
-            None => reason.describe(),
-        }
-    }
-
-    /// Stack frames for display, with sources mapped to this machine.
-    fn frame_rows(&self, frames: Vec<StackFrame>) -> Vec<FrameRow> {
-        let engine = self.project.as_ref().and_then(|p| p.engine.clone().ok());
-        frames
-            .into_iter()
-            .map(|frame| {
-                let located = frame.file.zip(frame.line);
-                let location = located.as_ref().map(|(file, line)| {
-                    let name = file.file_name().unwrap_or_default().to_string_lossy();
-                    format!("{name}:{line}")
-                });
-                let source = located.and_then(|(file, line)| {
-                    let file = match &engine {
-                        Some(root) => dbg::local_source(&file, root, |p| p.is_file()),
-                        None => file,
-                    };
-                    file.is_file().then_some((file, line))
-                });
-                FrameRow {
-                    function: frame.function,
-                    location,
-                    source,
-                    current: false,
-                }
-            })
-            .collect()
     }
 
     /// Shows frame `index` of the last stop in the editor.
@@ -1765,12 +1817,7 @@ impl Workspace {
     fn mark_editor(&self, editor: &Entity<EditorPanel>, cx: &mut Context<Self>) {
         let path = editor.read(cx).path().to_path_buf();
         let lines = self.debug.breakpoints.lines_in(&path);
-        let stop = self
-            .debug
-            .frame
-            .and_then(|i| self.debug.frames.get(i)?.source.clone())
-            .filter(|(file, _)| file.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
-            .map(|(_, line)| line);
+        let stop = stop_line(&self.debug.frames, self.debug.frame, &path);
         editor.update(cx, |editor, cx| editor.set_debug_marks(&lines, stop, cx));
     }
 
@@ -1988,25 +2035,8 @@ impl Workspace {
         let recent = self.recent.iter().enumerate().map(|(i, entry)| {
             let open_path = entry.path.clone();
             let forget_path = entry.path.clone();
-            let name = match &entry.project {
-                Ok(project) => project.name().to_string(),
-                Err(_) => entry
-                    .path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            };
-            let (detail, detail_color) = match &entry.project {
-                Ok(project) if !project.is_unreal() => ("Folder".to_string(), muted),
-                Ok(project) => match &project.engine {
-                    Ok(_) => (format!("Engine: {}", association_label(project)), muted),
-                    Err(e) => (
-                        format!("Engine: {} — {e}", association_label(project)),
-                        danger,
-                    ),
-                },
-                Err(e) => (e.clone(), danger),
-            };
+            let (name, detail, is_error) = recent_entry_text(entry);
+            let detail_color = if is_error { danger } else { muted };
             let available = entry.project.is_ok();
 
             div()
@@ -2367,6 +2397,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(|_, _: &OpenSettings, window, cx| settings_ui::open(window, cx)))
+            .on_action(cx.listener(|_, _: &OpenThemes, window, cx| themes_ui::open(window, cx)))
             .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::attach_or_continue))
             .on_action(cx.listener(Self::attach_to_editor))
@@ -2377,7 +2408,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::connect_tests_to_editor))
             .on_action(cx.listener(Self::start_test_editor))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                if let Some(path) = paths.paths().iter().find(|p| is_uproject(p) || p.is_dir()) {
+                if let Some(path) = droppable(paths.paths(), |p| p.is_dir()) {
                     this.open(path.clone(), window, cx);
                 }
             }))
@@ -2410,10 +2441,472 @@ fn is_uproject(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("uproject"))
 }
 
+/// The first dropped path Tethys can open: a `.uproject` or a folder.
+fn droppable(paths: &[PathBuf], is_dir: impl Fn(&Path) -> bool) -> Option<&PathBuf> {
+    paths.iter().find(|p| is_uproject(p) || is_dir(p))
+}
+
+/// Where `old` is after `from` was renamed to `to`, if it was under it.
+fn remap_path(old: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = old.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
+}
+
+/// Which session Ctrl+Shift+W closes: the focused one, else the last.
+fn close_target(focused: Option<usize>, count: usize) -> Option<usize> {
+    focused.or(count.checked_sub(1))
+}
+
+/// Which session to show after closing the one at `closed`, or `None` when
+/// none are left.
+fn after_close(closed: usize, remaining: usize) -> Option<usize> {
+    remaining.checked_sub(1).map(|last| closed.min(last))
+}
+
+/// The session after the focused one, wrapping; the first when none is focused.
+fn next_index(focused: Option<usize>, count: usize) -> Option<usize> {
+    (count > 0).then(|| focused.map_or(0, |i| i + 1) % count)
+}
+
+/// The session before the focused one, wrapping; the last when none is focused.
+fn prev_index(focused: Option<usize>, count: usize) -> Option<usize> {
+    (count > 0).then(|| focused.map_or(count - 1, |i| i + count - 1) % count)
+}
+
+/// The title and body of the "delete for good" prompt.
+fn delete_prompt(name: &str, is_dir: bool, scm: Option<&str>) -> (String, String) {
+    let what = if is_dir {
+        "This folder and everything in it"
+    } else {
+        "This file"
+    };
+    let tracked = match scm {
+        Some(scm) => {
+            format!(" If it's under {scm}, the deletion is marked there, ready to commit.")
+        }
+        None => String::new(),
+    };
+    (
+        format!("Delete {name}?"),
+        format!(
+            "{what} will be deleted permanently, including changes not yet saved or \
+             committed.{tracked}"
+        ),
+    )
+}
+
+/// A recent project's name and detail line, and whether the detail is an
+/// error (an engine that can't be found, or a project that won't open).
+fn recent_entry_text(entry: &RecentProject) -> (String, String, bool) {
+    let name = match &entry.project {
+        Ok(project) => project.name().to_string(),
+        Err(_) => entry
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    let (detail, is_error) = match &entry.project {
+        Ok(project) if !project.is_unreal() => ("Folder".to_string(), false),
+        Ok(project) => match &project.engine {
+            Ok(_) => (format!("Engine: {}", association_label(project)), false),
+            Err(e) => (
+                format!("Engine: {} — {e}", association_label(project)),
+                true,
+            ),
+        },
+        Err(e) => (e.clone(), true),
+    };
+    (name, detail, is_error)
+}
+
 fn association_label(project: &Project) -> String {
     match project.association_kind() {
         AssociationKind::Native => "native (in-tree)".to_string(),
         AssociationKind::Launcher => format!("Launcher {}", project.engine_association),
         AssociationKind::SourceBuild => format!("source build {}", project.engine_association),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use tethys_core::Project;
+    use tethys_core::debug::{
+        BreakpointId, BreakpointState, Breakpoints, DebugEnd, DebugEvent, StackFrame, StopReason,
+    };
+    use tethys_core::usecases::RecentProject;
+
+    use super::{
+        Debug, DebugEffect, DebugStatus, FrameRow, after_close, association_label, close_target,
+        delete_prompt, describe_stop, droppable, frame_rows, innermost_with_source, is_uproject,
+        key_bindings, next_index, prev_index, recent_entry_text, remap_path, stop_line,
+    };
+
+    fn unreal(association: &str) -> Project {
+        let json = format!(r#"{{"EngineAssociation": "{association}", "Modules": []}}"#);
+        Project::parse(r"D:\p\Game.uproject", &json).unwrap()
+    }
+
+    #[test]
+    fn uproject_is_matched_by_extension_in_any_case() {
+        assert!(is_uproject(Path::new(r"D:\p\Game.uproject")));
+        assert!(is_uproject(Path::new(r"D:\p\Game.UPROJECT")));
+        assert!(!is_uproject(Path::new(r"D:\p\Game.uplugin")));
+        assert!(!is_uproject(Path::new(r"D:\p\uproject")));
+    }
+
+    #[test]
+    fn association_labels_name_the_engine_kind() {
+        assert_eq!(association_label(&unreal("5.6")), "Launcher 5.6");
+        assert_eq!(
+            association_label(&unreal("{1234-ABCD}")),
+            "source build {1234-ABCD}"
+        );
+        assert_eq!(association_label(&unreal("")), "native (in-tree)");
+    }
+
+    #[test]
+    fn every_key_binding_parses_and_no_keystroke_is_bound_twice() {
+        // `KeyBinding::new` panics on a keystroke it can't parse, so building
+        // the list is the parse check; then no two actions share a key.
+        let bindings = key_bindings();
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        for binding in &bindings {
+            let keystrokes: Vec<String> = binding
+                .keystrokes()
+                .iter()
+                .map(|k| k.inner().unparse())
+                .collect();
+            assert!(!seen.contains(&keystrokes), "{keystrokes:?} is bound twice");
+            seen.push(keystrokes);
+        }
+        assert!(bindings.len() >= 10);
+    }
+
+    #[test]
+    fn dropping_takes_the_first_uproject_or_folder() {
+        let paths = vec![
+            PathBuf::from(r"D:\a\notes.txt"),
+            PathBuf::from(r"D:\a\Game.uproject"),
+            PathBuf::from(r"D:\b"),
+        ];
+        let is_dir = |p: &Path| p == Path::new(r"D:\b");
+        assert_eq!(droppable(&paths, is_dir), Some(&paths[1]));
+        assert_eq!(droppable(&paths[2..], is_dir), Some(&paths[2]));
+        assert_eq!(droppable(&paths[..1], is_dir), None);
+    }
+
+    #[test]
+    fn renames_remap_the_file_itself_and_anything_under_a_folder() {
+        let from = Path::new(r"D:\p\Source\Old");
+        let to = Path::new(r"D:\p\Source\New");
+        assert_eq!(
+            remap_path(Path::new(r"D:\p\Source\Old\A.cpp"), from, to),
+            Some(PathBuf::from(r"D:\p\Source\New\A.cpp"))
+        );
+        assert_eq!(remap_path(from, from, to), Some(to.to_path_buf()));
+        assert_eq!(
+            remap_path(Path::new(r"D:\p\Source\Other.cpp"), from, to),
+            None
+        );
+        // A sibling whose name merely starts with the old name is not under it.
+        assert_eq!(
+            remap_path(Path::new(r"D:\p\Source\Older\A.cpp"), from, to),
+            None
+        );
+    }
+
+    #[test]
+    fn closing_takes_the_focused_session_or_the_last_one() {
+        assert_eq!(close_target(Some(1), 3), Some(1));
+        assert_eq!(close_target(None, 3), Some(2));
+        assert_eq!(close_target(None, 0), None);
+    }
+
+    #[test]
+    fn after_closing_the_same_slot_shows_unless_it_was_the_last() {
+        assert_eq!(after_close(1, 2), Some(1));
+        assert_eq!(after_close(2, 2), Some(1));
+        assert_eq!(after_close(0, 0), None);
+    }
+
+    #[test]
+    fn session_cycling_wraps_both_ways() {
+        assert_eq!(next_index(Some(0), 3), Some(1));
+        assert_eq!(next_index(Some(2), 3), Some(0));
+        assert_eq!(next_index(None, 3), Some(0));
+        assert_eq!(prev_index(Some(0), 3), Some(2));
+        assert_eq!(prev_index(Some(2), 3), Some(1));
+        assert_eq!(prev_index(None, 3), Some(2));
+        assert_eq!(next_index(None, 0), None);
+        assert_eq!(prev_index(Some(0), 0), None);
+    }
+
+    #[test]
+    fn delete_prompt_says_what_goes_and_mentions_source_control() {
+        let (title, body) = delete_prompt("A.cpp", false, Some("Subversion"));
+        assert_eq!(title, "Delete A.cpp?");
+        assert!(body.starts_with("This file will be deleted permanently"));
+        assert!(body.contains("If it's under Subversion"));
+        let (_, body) = delete_prompt("Source", true, None);
+        assert!(body.starts_with("This folder and everything in it"));
+        assert!(!body.contains("If it's under"));
+    }
+
+    #[test]
+    fn recent_entries_describe_folders_engines_and_errors() {
+        let folder = RecentProject {
+            path: PathBuf::from(r"D:\tools\tethys"),
+            project: Ok(Project::folder(r"D:\tools\tethys")),
+        };
+        assert_eq!(
+            recent_entry_text(&folder),
+            ("tethys".to_string(), "Folder".to_string(), false)
+        );
+
+        let mut found = unreal("5.6");
+        found.engine = Ok(PathBuf::from(r"C:\UE_5.6"));
+        let entry = RecentProject {
+            path: found.path.clone(),
+            project: Ok(found),
+        };
+        assert_eq!(
+            recent_entry_text(&entry),
+            (
+                "Game".to_string(),
+                "Engine: Launcher 5.6".to_string(),
+                false
+            )
+        );
+
+        let mut missing = unreal("5.9");
+        missing.engine = Err("no such engine".into());
+        let entry = RecentProject {
+            path: missing.path.clone(),
+            project: Ok(missing),
+        };
+        let (_, detail, is_error) = recent_entry_text(&entry);
+        assert_eq!(detail, "Engine: Launcher 5.9 — no such engine");
+        assert!(is_error);
+
+        let broken = RecentProject {
+            path: PathBuf::from(r"D:\gone\Old.uproject"),
+            project: Err("not found".into()),
+        };
+        assert_eq!(
+            recent_entry_text(&broken),
+            ("Old".to_string(), "not found".to_string(), true)
+        );
+    }
+
+    fn breakpoints_at(file: &str, lines: &[u32]) -> Breakpoints {
+        let mut bps = Breakpoints::default();
+        for line in lines {
+            bps.toggle(Path::new(file), *line);
+        }
+        bps
+    }
+
+    #[test]
+    fn stops_name_our_breakpoint_by_file_and_line() {
+        let bps = breakpoints_at(r"D:\p\Source\A.cpp", &[10, 20]);
+        let second = bps.all()[1].id;
+        assert_eq!(
+            describe_stop(&StopReason::Breakpoint(second), &bps),
+            "Breakpoint at A.cpp:20"
+        );
+        // One we don't know (e.g. removed since) falls back to the plain word.
+        assert_eq!(
+            describe_stop(&StopReason::Breakpoint(BreakpointId(99)), &bps),
+            "Breakpoint"
+        );
+        assert_eq!(describe_stop(&StopReason::Pause, &bps), "Paused");
+    }
+
+    fn frame(function: &str, file: Option<&str>, line: Option<u32>) -> StackFrame {
+        StackFrame {
+            function: function.into(),
+            file: file.map(PathBuf::from),
+            line,
+        }
+    }
+
+    #[test]
+    fn frame_rows_locate_sources_here_or_under_the_local_engine() {
+        let local = Path::new(r"D:\p\Source\A.cpp");
+        let engine_twin = Path::new(r"C:\UE\Engine\Source\B.cpp");
+        let exists = |p: &Path| p == local || p == engine_twin;
+        let frames = vec![
+            frame("Game!Foo", Some(r"D:\p\Source\A.cpp"), Some(12)),
+            frame("Core!Bar", Some(r"E:\build\Engine\Source\B.cpp"), Some(7)),
+            frame("Core!Baz", Some(r"E:\build\Engine\Source\C.cpp"), Some(9)),
+            frame("0x7ff0", None, None),
+        ];
+        let rows = frame_rows(frames, Some(Path::new(r"C:\UE")), exists);
+
+        assert_eq!(rows[0].location.as_deref(), Some("A.cpp:12"));
+        assert_eq!(rows[0].source, Some((local.to_path_buf(), 12)));
+        // Built elsewhere, but the engine file exists under the local install.
+        assert_eq!(rows[1].source, Some((engine_twin.to_path_buf(), 7)));
+        // Known location, but nowhere on this machine.
+        assert_eq!(rows[2].location.as_deref(), Some("C.cpp:9"));
+        assert_eq!(rows[2].source, None);
+        assert_eq!(rows[3].location, None);
+        assert_eq!(rows[3].source, None);
+        assert!(rows.iter().all(|r| !r.current));
+    }
+
+    #[test]
+    fn without_an_engine_only_files_that_exist_as_named_get_sources() {
+        let frames = vec![frame(
+            "Core!Bar",
+            Some(r"E:\build\Engine\Source\B.cpp"),
+            Some(7),
+        )];
+        let rows = frame_rows(frames, None, |_| false);
+        assert_eq!(rows[0].source, None);
+    }
+
+    fn row(source: Option<(&str, u32)>) -> FrameRow {
+        FrameRow {
+            function: String::new(),
+            location: None,
+            source: source.map(|(f, l)| (PathBuf::from(f), l)),
+            current: false,
+        }
+    }
+
+    #[test]
+    fn the_first_frame_with_source_is_shown() {
+        let rows = vec![
+            row(None),
+            row(Some((r"D:\p\A.cpp", 3))),
+            row(Some((r"D:\p\B.cpp", 4))),
+        ];
+        assert_eq!(innermost_with_source(&rows), Some(1));
+        assert_eq!(innermost_with_source(&[row(None)]), None);
+    }
+
+    #[test]
+    fn the_stop_line_marks_only_the_shown_frames_file_ignoring_case() {
+        let rows = vec![row(Some((r"D:\p\A.cpp", 3))), row(Some((r"D:\p\B.cpp", 4)))];
+        assert_eq!(stop_line(&rows, Some(0), Path::new(r"d:\P\a.CPP")), Some(3));
+        assert_eq!(stop_line(&rows, Some(0), Path::new(r"D:\p\B.cpp")), None);
+        assert_eq!(stop_line(&rows, Some(1), Path::new(r"D:\p\B.cpp")), Some(4));
+        assert_eq!(stop_line(&rows, None, Path::new(r"D:\p\A.cpp")), None);
+        assert_eq!(stop_line(&rows, Some(5), Path::new(r"D:\p\A.cpp")), None);
+    }
+
+    fn stopped(reason: StopReason, frames: Vec<StackFrame>) -> DebugEvent {
+        DebugEvent::Stopped {
+            reason,
+            thread: 1,
+            frames,
+        }
+    }
+
+    #[test]
+    fn debug_events_from_an_earlier_session_are_ignored() {
+        let mut debug = Debug {
+            generation: 2,
+            ..Debug::default()
+        };
+        let effect = debug.apply(1, DebugEvent::Running, None, |_| false);
+        assert_eq!(effect, DebugEffect::Ignored);
+        assert_eq!(debug.status, DebugStatus::Detached);
+    }
+
+    #[test]
+    fn a_stop_with_source_opens_that_frame_and_without_shows_the_panel() {
+        let mut debug = Debug::default();
+        assert_eq!(
+            debug.apply(0, DebugEvent::Running, None, |_| false),
+            DebugEffect::None
+        );
+        assert_eq!(debug.status, DebugStatus::Running);
+
+        let a = r"D:\p\A.cpp";
+        let frames = vec![
+            frame("0x1", None, None),
+            frame("Game!Foo", Some(a), Some(5)),
+        ];
+        let effect = debug.apply(0, stopped(StopReason::Pause, frames), None, |p| {
+            p == Path::new(a)
+        });
+        assert_eq!(effect, DebugEffect::OpenFrame(1));
+        assert_eq!(debug.status, DebugStatus::Stopped("Paused".into()));
+        assert_eq!(debug.frames.len(), 2);
+
+        let frames = vec![frame("0x1", None, None)];
+        let effect = debug.apply(0, stopped(StopReason::DebugBreak, frames), None, |_| false);
+        assert_eq!(effect, DebugEffect::ShowPanel);
+
+        // Running again clears the stack from the last stop.
+        debug.frame = Some(0);
+        debug.apply(0, DebugEvent::Running, None, |_| false);
+        assert!(debug.frames.is_empty());
+        assert_eq!(debug.frame, None);
+    }
+
+    #[test]
+    fn a_stop_at_our_breakpoint_is_named_from_the_breakpoint_list() {
+        let mut debug = Debug::default();
+        debug.breakpoints.toggle(Path::new(r"D:\p\A.cpp"), 42);
+        let id = debug.breakpoints.all()[0].id;
+        debug.apply(0, stopped(StopReason::Breakpoint(id), vec![]), None, |_| {
+            false
+        });
+        assert_eq!(
+            debug.status,
+            DebugStatus::Stopped("Breakpoint at A.cpp:42".into())
+        );
+    }
+
+    #[test]
+    fn breakpoint_states_are_recorded_and_forgotten_when_the_session_ends() {
+        let mut debug = Debug::default();
+        debug.breakpoints.toggle(Path::new(r"D:\p\A.cpp"), 1);
+        let id = debug.breakpoints.all()[0].id;
+        let effect = debug.apply(
+            0,
+            DebugEvent::Breakpoints(vec![(id, BreakpointState::Bound)]),
+            None,
+            |_| false,
+        );
+        assert_eq!(effect, DebugEffect::None);
+        assert_eq!(debug.breakpoints.all()[0].state, BreakpointState::Bound);
+
+        debug.status = DebugStatus::Running;
+        debug.process = Some("UnrealEditor.exe (pid 1)".into());
+        let effect = debug.apply(0, DebugEvent::Ended(DebugEnd::Detached), None, |_| false);
+        assert_eq!(effect, DebugEffect::None);
+        assert_eq!(debug.status, DebugStatus::Detached);
+        assert_eq!(debug.breakpoints.all()[0].state, BreakpointState::Unset);
+        assert_eq!(debug.process, None);
+    }
+
+    #[test]
+    fn an_exit_leaves_a_note_and_a_failure_reports_an_error() {
+        let mut debug = Debug::default();
+        debug.apply(0, DebugEvent::Ended(DebugEnd::Exited), None, |_| false);
+        assert_eq!(debug.process.as_deref(), Some("The editor exited."));
+
+        let effect = debug.apply(
+            0,
+            DebugEvent::Ended(DebugEnd::Failed("lost the pipe".into())),
+            None,
+            |_| false,
+        );
+        assert_eq!(
+            effect,
+            DebugEffect::Error("The debugger stopped: lost the pipe".into())
+        );
+        assert_eq!(debug.process, None);
     }
 }

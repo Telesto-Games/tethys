@@ -18,5 +18,9 @@ rfd.workspace = true
 futures.workspace = true
 gpui-component.workspace = true
 
+[dev-dependencies]
+# Headless windows, clicks and keys for view tests (`#[gpui_kit::test]`).
+gpui-kit = { workspace = true, features = ["test-support"] }
+
 [build-dependencies]
 winresource = "0.1"

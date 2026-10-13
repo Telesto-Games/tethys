@@ -1,9 +1,12 @@
 //! Default terminal colours, used when the program hasn't overridden them.
 
+use std::sync::Mutex;
+
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
-const fn rgb(hex: u32) -> Rgb {
+/// `0xrrggbb` as a terminal colour.
+pub const fn rgb(hex: u32) -> Rgb {
     Rgb {
         r: (hex >> 16) as u8,
         g: (hex >> 8) as u8,
@@ -35,8 +38,53 @@ pub const FOREGROUND: Rgb = rgb(0xe6dcf0);
 pub const BACKGROUND: Rgb = rgb(0x120628);
 pub const CURSOR: Rgb = rgb(0xf24b38);
 
-/// The default colour for a palette index (0..269, see `NamedColor`).
+/// The special colours a terminal starts with. The brand ones unless a
+/// theme asks terminals to follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Defaults {
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Rgb,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self {
+            foreground: FOREGROUND,
+            background: BACKGROUND,
+            cursor: CURSOR,
+        }
+    }
+}
+
+/// The defaults in force, for every terminal. Programs that ask for their
+/// colours (OSC 10/11/12) are answered from here, so it must match what
+/// the view draws with.
+static DEFAULTS: Mutex<Defaults> = Mutex::new(Defaults {
+    foreground: FOREGROUND,
+    background: BACKGROUND,
+    cursor: CURSOR,
+});
+
+/// Sets the defaults every terminal starts from (see [`defaults`]).
+pub fn set_defaults(defaults: Defaults) {
+    *DEFAULTS.lock().unwrap_or_else(|e| e.into_inner()) = defaults;
+}
+
+/// The defaults in force: the brand ones until [`set_defaults`] is called.
+pub fn defaults() -> Defaults {
+    *DEFAULTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The default colour for a palette index (0..269, see `NamedColor`), with
+/// the defaults in force.
 pub fn default_color(index: usize) -> Rgb {
+    default_color_with(index, &defaults())
+}
+
+/// The default colour for a palette index, with `defaults` for the special
+/// foreground, background and cursor entries.
+pub fn default_color_with(index: usize, defaults: &Defaults) -> Rgb {
     match index {
         0..16 => BASE[index],
         16..232 => {
@@ -52,16 +100,16 @@ pub fn default_color(index: usize) -> Rgb {
             let v = (8 + (index - 232) * 10) as u8;
             Rgb { r: v, g: v, b: v }
         }
-        i if i == NamedColor::Foreground as usize => FOREGROUND,
-        i if i == NamedColor::Background as usize => BACKGROUND,
-        i if i == NamedColor::Cursor as usize => CURSOR,
+        i if i == NamedColor::Foreground as usize => defaults.foreground,
+        i if i == NamedColor::Background as usize => defaults.background,
+        i if i == NamedColor::Cursor as usize => defaults.cursor,
         i if i == NamedColor::BrightForeground as usize => BASE[15],
-        i if i == NamedColor::DimForeground as usize => dim(FOREGROUND),
+        i if i == NamedColor::DimForeground as usize => dim(defaults.foreground),
         // DimBlack..=DimWhite
         i if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&i) => {
             dim(BASE[i - NamedColor::DimBlack as usize])
         }
-        _ => FOREGROUND,
+        _ => defaults.foreground,
     }
 }
 
@@ -74,12 +122,16 @@ fn dim(c: Rgb) -> Rgb {
     }
 }
 
-/// Resolves a cell colour against the terminal's overrides, then the defaults.
-pub fn resolve(color: Color, overrides: &Colors) -> Rgb {
+/// Resolves a cell colour against the terminal's overrides, then `defaults`.
+pub fn resolve(color: Color, overrides: &Colors, defaults: &Defaults) -> Rgb {
     match color {
         Color::Spec(rgb) => rgb,
-        Color::Named(named) => overrides[named].unwrap_or_else(|| default_color(named as usize)),
-        Color::Indexed(i) => overrides[i as usize].unwrap_or_else(|| default_color(i as usize)),
+        Color::Named(named) => {
+            overrides[named].unwrap_or_else(|| default_color_with(named as usize, defaults))
+        }
+        Color::Indexed(i) => {
+            overrides[i as usize].unwrap_or_else(|| default_color_with(i as usize, defaults))
+        }
     }
 }
 
@@ -113,5 +165,24 @@ mod tests {
     fn named_specials() {
         assert_eq!(default_color(NamedColor::Background as usize), BACKGROUND);
         assert_eq!(default_color(NamedColor::DimRed as usize), dim(BASE[1]));
+    }
+
+    #[test]
+    fn themed_defaults_replace_the_specials_only() {
+        let themed = Defaults {
+            foreground: rgb(0x111111),
+            background: rgb(0xffffff),
+            cursor: rgb(0x00ff00),
+        };
+        let overrides = Colors::default();
+        assert_eq!(
+            resolve(Color::Named(NamedColor::Background), &overrides, &themed),
+            rgb(0xffffff)
+        );
+        assert_eq!(
+            resolve(Color::Named(NamedColor::DimForeground), &overrides, &themed),
+            dim(rgb(0x111111))
+        );
+        assert_eq!(resolve(Color::Indexed(1), &overrides, &themed), BASE[1]);
     }
 }

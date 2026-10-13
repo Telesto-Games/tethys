@@ -7,6 +7,7 @@ use crate::automation::{AutomationTest, TestEvent, TestInstance};
 use crate::debug::{DebugEvent, ProcessInfo, SourceBreakpoint};
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
 use crate::scm::{Commit, FileStatus, WorkingCopyInfo};
+use crate::theme::ThemeSpec;
 use crate::unreal::{CommandSpec, Configuration};
 use crate::update::{Release, Version};
 
@@ -43,6 +44,13 @@ pub trait ConfigStore {
     /// The release the user chose not to be offered again, if any.
     fn skipped_version(&self) -> PortResult<Option<Version>>;
     fn set_skipped_version(&self, version: Option<Version>) -> PortResult<()>;
+    /// The themes the user made, in order. The built-in one isn't stored.
+    fn themes(&self) -> PortResult<Vec<ThemeSpec>>;
+    /// The name of the theme in use; `None` means the built-in one.
+    fn active_theme(&self) -> PortResult<Option<String>>;
+    /// Saves the user's themes and which one is in use (`None`: the
+    /// built-in), together, so one can't be written without the other.
+    fn set_themes(&self, themes: &[ThemeSpec], active: Option<&str>) -> PortResult<()>;
 }
 
 /// A source control system (Subversion and git now; Perforce later).

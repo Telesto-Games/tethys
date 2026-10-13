@@ -18,18 +18,19 @@ use crate::workspace::Services;
 /// The extra editor arguments to launch with, as saved.
 pub fn editor_args(cx: &App) -> Vec<String> {
     let config = &cx.global::<Services>().config;
-    let line = config
-        .editor_args()
-        .unwrap_or_else(|_| unreal::DEFAULT_EDITOR_ARGS.to_string());
-    unreal::split_args(&line)
+    args_or_default(config.editor_args(), unreal::DEFAULT_EDITOR_ARGS)
 }
 
 /// The extra arguments for the headless test editor, as saved.
 pub fn test_editor_args(cx: &App) -> Vec<String> {
     let config = &cx.global::<Services>().config;
-    let line = config
-        .test_editor_args()
-        .unwrap_or_else(|_| unreal::DEFAULT_TEST_EDITOR_ARGS.to_string());
+    args_or_default(config.test_editor_args(), unreal::DEFAULT_TEST_EDITOR_ARGS)
+}
+
+/// The saved argument line split into arguments, or `default`'s if the
+/// config couldn't be read. A saved empty line means no arguments.
+fn args_or_default<E>(saved: Result<String, E>, default: &str) -> Vec<String> {
+    let line = saved.unwrap_or_else(|_| default.to_string());
     unreal::split_args(&line)
 }
 
@@ -173,4 +174,22 @@ pub fn open(window: &mut Window, cx: &mut App) {
                 ),
         )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::args_or_default;
+
+    #[test]
+    fn saved_args_are_split_and_errors_fall_back() {
+        let ok: Result<String, ()> = Ok("-log \"-ini:Engine:[Core]:x=1\"".into());
+        assert_eq!(
+            args_or_default(ok, "-default"),
+            ["-log", "-ini:Engine:[Core]:x=1"]
+        );
+        let empty: Result<String, ()> = Ok(String::new());
+        assert!(args_or_default(empty, "-default").is_empty());
+        let failed: Result<String, ()> = Err(());
+        assert_eq!(args_or_default(failed, "-a -b"), ["-a", "-b"]);
+    }
 }
