@@ -1,15 +1,17 @@
 //! `SourceControl` for git, through the `git` command-line client.
 //!
-//! Read-only and local: `status --porcelain=v2`, `rev-parse`, `symbolic-ref`,
-//! `log`, `ls-remote --get-url` (which only reads config) and `cat-file`.
-//! Every command runs with `--no-optional-locks`, so refreshing status never
-//! writes the index or contends with an agent running git in the same repo.
+//! Local only: `status --porcelain=v2`, `rev-parse`, `symbolic-ref`, `log`,
+//! `ls-files`, `ls-remote --get-url` (which only reads config) and
+//! `cat-file`. The only changes made are `git mv` and `git rm`, when the user
+//! renames or deletes. Every command runs with `--no-optional-locks`, so
+//! refreshing status never writes the index or contends with an agent
+//! running git in the same repo.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tethys_core::ports::{PortResult, SourceControl};
-use tethys_core::scm::{ChangeKind, FileStatus, LastChange, WorkingCopyInfo};
+use tethys_core::scm::{ChangeKind, Commit, FileStatus, LastChange, WorkingCopyInfo};
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -142,6 +144,8 @@ impl SourceControl for Git {
                 "--porcelain=v2",
                 "-z",
                 "--untracked-files=normal",
+                // Ignored folders are named once, not file by file.
+                "--ignored=traditional",
                 "--",
                 ".",
             ],
@@ -169,6 +173,120 @@ impl SourceControl for Git {
         // doesn't show every line changed under `core.autocrlf`.
         Ok(Some(self.output(dir, &["cat-file", "--filters", &spec])?))
     }
+
+    fn is_versioned(&self, path: &Path) -> PortResult<bool> {
+        let (dir, name) = split(path)?;
+        // Lists the tracked file, or the tracked files in a folder.
+        Ok(!self
+            .output(dir, &["ls-files", "-z", "--", name])?
+            .is_empty())
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> PortResult<()> {
+        let (dir, old) = split(from)?;
+        let (_, new) = split(to)?;
+        self.output(dir, &["mv", "--", old, new])?;
+        Ok(())
+    }
+
+    fn delete(&self, path: &Path) -> PortResult<()> {
+        let (dir, name) = split(path)?;
+        self.output(dir, &["rm", "-r", "-f", "-q", "--", name])?;
+        Ok(())
+    }
+
+    fn history(&self, file: &Path, limit: usize) -> PortResult<Vec<Commit>> {
+        let (dir, name) = split(file)?;
+        let limit = format!("-n{limit}");
+        let out = self.output(
+            dir,
+            &[
+                "log",
+                "--follow",
+                &limit,
+                "--format=%x1e%H%x00%an%x00%cI%x00%s",
+                "--name-status",
+                "-z",
+                "--",
+                name,
+            ],
+        )?;
+        Ok(parse_history(&out))
+    }
+
+    fn change(&self, file: &Path, commit: &Commit) -> PortResult<(Option<String>, Option<String>)> {
+        let (dir, _) = split(file)?;
+        let (before, after) = commit.locator.split_once('\0').unwrap_or_default();
+        let text = |spec: String| -> PortResult<Option<String>> {
+            // A path the commit has no version of, or a root commit's parent.
+            if self
+                .query(dir, &["rev-parse", "-q", "--verify", &spec])?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            Ok(Some(self.output(dir, &["cat-file", "--filters", &spec])?))
+        };
+        // Locator paths are from the top of the repository, as `rev:path` reads them.
+        let before = match before {
+            "" => None,
+            path => text(format!("{}^:{path}", commit.revision))?,
+        };
+        let after = match after {
+            "" => None,
+            path => text(format!("{}:{path}", commit.revision))?,
+        };
+        Ok((before, after))
+    }
+}
+
+/// `path`'s folder, and its name as UTF-8.
+fn split(path: &Path) -> PortResult<(&Path, &str)> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("{} has no parent folder", path.display()).into());
+    };
+    let name = name
+        .to_str()
+        .ok_or_else(|| format!("{} isn't a UTF-8 path", path.display()))?;
+    Ok((dir, name))
+}
+
+/// Parses `git log --format=%x1e%H%x00%an%x00%cI%x00%s --name-status -z`.
+///
+/// Each record is the header fields, then the file's status: `M`/`A`/`D`
+/// and a path, or `R…`/`C…` and the old and new paths. The locator is the
+/// path before and after the commit, from the top of the repository,
+/// separated by a NUL; empty where the file didn't exist.
+pub fn parse_history(out: &str) -> Vec<Commit> {
+    out.split('\x1e')
+        .filter_map(|record| {
+            let mut fields = record.split('\0').map(|f| f.trim_matches('\n'));
+            let revision = fields.next().filter(|r| !r.is_empty())?.to_string();
+            let author = fields.next().unwrap_or_default().to_string();
+            let date = fields.next().unwrap_or_default().to_string();
+            let message = fields.next().unwrap_or_default().to_string();
+            let locator = match fields.next().unwrap_or_default() {
+                s if s.starts_with('A') => format!("\0{}", fields.next().unwrap_or_default()),
+                s if s.starts_with('D') => format!("{}\0", fields.next().unwrap_or_default()),
+                s if s.starts_with('R') || s.starts_with('C') => {
+                    let old = fields.next().unwrap_or_default();
+                    format!("{old}\0{}", fields.next().unwrap_or_default())
+                }
+                // M, T, or no status (a merge): the same path both sides.
+                _ => {
+                    let path = fields.next().unwrap_or_default();
+                    format!("{path}\0{path}")
+                }
+            };
+            Some(Commit {
+                revision,
+                author,
+                date,
+                message,
+                locator,
+            })
+        })
+        .collect()
 }
 
 /// Parses `git log --format=%h%x00%an%x00%cI`; `None` when there's no commit.
@@ -218,7 +336,8 @@ pub fn parse_status(out: &str, prefix: &str, root: &Path) -> PortResult<Vec<File
                 push(path, ChangeKind::Conflicted);
             }
             b'?' => push(&record[2..], ChangeKind::Unversioned),
-            // `#` headers and `!` ignored files.
+            b'!' => push(&record[2..], ChangeKind::Ignored),
+            // `#` headers.
             _ => {}
         }
     }
@@ -281,6 +400,7 @@ mod tests {
             "u UU N... 100644 100644 100644 100644 aaaa bbbb cccc Proj/both.txt",
             "? Proj/Src/new.txt",
             "? Proj/U/",
+            "! Proj/Intermediate/",
             "1 .M N... 100644 100644 100644 422c 422c Other/outside.txt",
             "",
         ]
@@ -300,6 +420,7 @@ mod tests {
             (r"D:\r\Proj\both.txt", ChangeKind::Conflicted),
             (r"D:\r\Proj\Src\new.txt", ChangeKind::Unversioned),
             (r"D:\r\Proj\U", ChangeKind::Unversioned),
+            (r"D:\r\Proj\Intermediate", ChangeKind::Ignored),
         ];
         let want: Vec<_> = want.iter().map(|(p, k)| (p.to_string(), *k)).collect();
         assert_eq!(got, want);
@@ -390,6 +511,98 @@ mod tests {
         assert_eq!(git.base_text(&proj.join("new.txt")).unwrap(), None);
         run(&["add", "Proj/new.txt"]);
         assert_eq!(git.base_text(&proj.join("new.txt")).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parses_history_records() {
+        let out = "\x1eaaa\0Chris\x002026-10-13T09:00:00+01:00\0Rename\0\nR095\0Proj/a.txt\0Proj/b.txt\0\
+                   \x1ebbb\0Sam\x002026-10-12T09:00:00+01:00\0Edit\0\nM\0Proj/a.txt\0\
+                   \x1eccc\0Sam\x002026-10-11T09:00:00+01:00\0Add\0\nA\0Proj/a.txt\0";
+        let log = parse_history(out);
+        let got: Vec<_> = log
+            .iter()
+            .map(|c| (c.revision.as_str(), c.message.as_str(), c.locator.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("aaa", "Rename", "Proj/a.txt\0Proj/b.txt"),
+                ("bbb", "Edit", "Proj/a.txt\0Proj/a.txt"),
+                ("ccc", "Add", "\0Proj/a.txt"),
+            ]
+        );
+        assert_eq!(log[0].author, "Chris");
+    }
+
+    /// Rename, history, a commit's change and delete, against a scratch
+    /// repository when git exists.
+    #[test]
+    fn edits_and_history_against_a_real_repository() {
+        let git = Git::new();
+        if !git.is_available() {
+            eprintln!("git not found; skipping");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("tethys-git-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let proj = repo.join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=Tester", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(proj.join("a.txt"), "one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "add a"]);
+        std::fs::write(proj.join("a.txt"), "one\ntwo\n").unwrap();
+        run(&["commit", "-q", "-am", "grow a"]);
+
+        std::fs::write(proj.join("loose.txt"), "x\n").unwrap();
+        assert!(git.is_versioned(&proj.join("a.txt")).unwrap());
+        assert!(
+            git.is_versioned(&proj).unwrap(),
+            "a folder with tracked files"
+        );
+        assert!(!git.is_versioned(&proj.join("loose.txt")).unwrap());
+
+        git.rename(&proj.join("a.txt"), &proj.join("b.txt"))
+            .unwrap();
+        run(&["commit", "-q", "-m", "rename"]);
+        let b = proj.join("b.txt");
+        let log = git.history(&b, 10).unwrap();
+        let messages: Vec<_> = log.iter().map(|c| c.message.as_str()).collect();
+        assert_eq!(messages, ["rename", "grow a", "add a"]);
+
+        // The rename changed nothing; before it, the file had another name.
+        assert_eq!(
+            git.change(&b, &log[0]).unwrap(),
+            (Some("one\ntwo\n".into()), Some("one\ntwo\n".into()))
+        );
+        assert_eq!(
+            git.change(&b, &log[1]).unwrap(),
+            (Some("one\n".into()), Some("one\ntwo\n".into()))
+        );
+        // The root commit added it.
+        assert_eq!(
+            git.change(&b, &log[2]).unwrap(),
+            (None, Some("one\n".into()))
+        );
+
+        std::fs::write(&b, "edited\n").unwrap();
+        git.delete(&b).unwrap();
+        assert!(!b.exists(), "deleted from disk, local edit and all");
+        assert!(!git.is_versioned(&b).unwrap());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

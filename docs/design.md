@@ -676,7 +676,13 @@ Things learned while building M0–M3 that aren't obvious from the code.
 - **Docking.** Sessions (Claude and builds) are panels in a gpui-component `DockArea`
   (`SessionPanel`), so tabs can be dragged into splits and resized. The panel owns its
   `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. The layout
-  isn't saved yet.
+  isn't saved yet. Every panel moves the same way, including the last tab in an area, which
+  gpui-component holds in place: `tab_skin` lays a drag layer over a lone tab bar (gpui-base's
+  `Tab` swallows the left mouse press), and the workspace collapses a dock emptied by a drag
+  instead of removing it, so tabs can be dropped back. Collapsing is per dock, as in the toolkit,
+  but each dock's button ends its own tab bar (the toolkit puts the side docks' on the main
+  area), and a collapsed side dock leaves a strip that reopens it and takes drops, as the bottom
+  dock's tab strip does.
 - **Agent choice.** Without an `agents.toml`, the built-in profiles are Claude Code and opencode,
   both on the terminal adapter. "New session ▾" lists every profile and Ctrl+Shift+T starts the
   first. For full-screen TUIs like opencode, the terminal sends mouse-wheel reports (SGR or
@@ -692,8 +698,8 @@ Things learned while building M0–M3 that aren't obvious from the code.
   and agents open in the center. Before the first build, and after the last build tab closes, it
   holds a `BuildPlaceholder` that can't be closed. Starting a build closes finished build tabs, so
   the pane shows the latest log.
-- **Files, editor and diff.** A `SourceControl` port (`working_copy_root`, `info`, `status`, `base_text`)
-  with a Subversion adapter (`scm_svn`) that runs the `svn` CLI read-only: `status --xml` and
+- **Files, editor and diff.** A `SourceControl` port (`working_copy_root`, `info`, `status`, `base_text`, and the file operations and history below)
+  with a Subversion adapter (`scm_svn`) that runs the `svn` CLI: `status --xml` and
   `cat -r BASE`, which reads the pristine copy with no network access, and no console windows.
   A git adapter (`scm_git`) does the same with the `git` CLI: `status --porcelain=v2 -z`
   limited to the project folder (which may be below the repository root), and
@@ -710,6 +716,21 @@ Things learned while building M0–M3 that aren't obvious from the code.
     byte (`TETHYS_ROUNDTRIP_DIR=… cargo test -- --ignored`).
   - **Diff:** a unified diff against BASE (SVN) or HEAD (git) in the main area. Git renames show
     as the new path added and the old one deleted; the diff of a renamed file is against nothing.
+  - **Tracking:** status also asks for ignored items (`svn status --no-ignore`,
+    `git status --ignored=traditional`). Both name an untracked or ignored folder once, so
+    `WorkingCopyStatus::tracking` looks for the path or any folder above it; the tree shows
+    those items italic, with `?` or `I`.
+  - **File operations:** the Files context menu creates files and folders (`create_file`,
+    `create_folder`; new items aren't added to source control), renames and deletes. A tracked
+    path is renamed or deleted through the port (`SourceControl::rename` / `delete`: `svn move`
+    / `git mv`, `svn delete --force` / `git rm -r -f`), so history follows and the deletion is
+    a change to commit; anything else, and whatever source control leaves, goes through the
+    filesystem. These, and nothing else, change the working copy.
+  - **History:** `SourceControl::history` lists a file's commits through renames (`svn log`
+    pegged at the working copy; `git log --follow --name-status`, keeping each commit's paths
+    in `Commit::locator`), and `change` reads the file before and after one (`svn cat -r N-1`
+    / `-r N` at `@BASE`; `git cat-file` at `rev^:old` and `rev:new`). Subversion asks the
+    repository for these. `HistoryPanel` lists them beside a `DiffPanel` of the selected one.
   - **Not done yet:** nothing is ever committed, reverted or updated through source control; syntax
     highlighting is the editor library's default and fairly sparse; there's no prompt for unsaved
     edits when closing the window.

@@ -202,6 +202,12 @@ impl EditorPanel {
         &self.path
     }
 
+    /// Follows the file to its new path after a rename.
+    pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.path = path;
+        cx.notify();
+    }
+
     fn file_name(&self) -> String {
         self.path
             .file_name()

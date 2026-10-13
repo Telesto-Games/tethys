@@ -53,6 +53,12 @@ impl DiffPanel {
         &self.path
     }
 
+    /// Shows a diff of something else, e.g. another commit.
+    pub fn show(&mut self, against: String, diff: FileDiff, cx: &mut Context<Self>) {
+        self.against = against;
+        self.set_diff(diff, cx);
+    }
+
     pub fn set_diff(&mut self, diff: FileDiff, cx: &mut Context<Self>) {
         self.added = diff.added;
         self.removed = diff.removed;

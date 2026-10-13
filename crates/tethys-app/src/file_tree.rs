@@ -2,14 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{Panel, PanelControl, PanelEvent};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use tethys_core::scm::{ChangeKind, WorkingCopyStatus};
+use tethys_core::scm::{ChangeKind, Tracking, WorkingCopyStatus};
 use tethys_core::usecases::ScmSummary;
 
 /// Folders that are tool metadata, not project content.
@@ -17,11 +19,22 @@ const HIDDEN: &[&str] = &[".svn", ".git", ".vs", ".idea"];
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 14.;
 
+#[derive(Clone)]
 pub enum FileTreeEvent {
     /// Open a file in the editor.
     Open(PathBuf),
     /// Show a file's changes against source control.
     Diff(PathBuf),
+    /// Ask for a name and create a file in this folder.
+    NewFile(PathBuf),
+    /// Ask for a name and create a folder in this folder.
+    NewFolder(PathBuf),
+    /// Ask for a new name for this file or folder.
+    Rename(PathBuf),
+    /// Confirm, then delete this file or folder.
+    Delete(PathBuf),
+    /// Show this file's commits.
+    History(PathBuf),
 }
 
 #[derive(Clone)]
@@ -54,6 +67,9 @@ pub struct FileTreePanel {
     /// Source control details for the footer; `None` until loaded.
     scm: Option<ScmSummary>,
     scroll: UniformListScrollHandle,
+    /// The row last right-clicked, which the context menu acts on; `None`
+    /// for the space below the rows, which means the project folder.
+    menu_target: Option<Entry>,
 }
 
 impl FileTreePanel {
@@ -69,9 +85,79 @@ impl FileTreePanel {
             changes_only: false,
             scm: None,
             scroll: UniformListScrollHandle::new(),
+            menu_target: None,
         };
         this.rebuild();
         this
+    }
+
+    /// Re-reads the tree from disk and shows `path`: its folders expanded,
+    /// it selected and scrolled to.
+    pub fn reveal(&mut self, path: &Path, cx: &mut Context<Self>) {
+        for dir in path.ancestors().skip(1) {
+            if !dir.starts_with(&self.root) || dir == self.root {
+                break;
+            }
+            self.expanded.insert(dir.to_path_buf());
+        }
+        self.selected = Some(path.to_path_buf());
+        self.refresh(cx);
+        if let Some(ix) = self.rows.iter().position(|r| r.entry.path == path) {
+            self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
+    }
+
+    /// Whether View History can work: the project is under source control.
+    fn has_history(&self) -> bool {
+        matches!(self.scm, Some(ScmSummary::Ready { .. }))
+    }
+
+    /// The right-click menu for [`Self::menu_target`].
+    fn context_menu(
+        this: &WeakEntity<Self>,
+        menu: PopupMenu,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let Some(tree) = this.upgrade() else {
+            return menu;
+        };
+        let (target, root, has_history) = {
+            let tree = tree.read(cx);
+            (
+                tree.menu_target.clone(),
+                tree.root.clone(),
+                tree.has_history(),
+            )
+        };
+        // New items go in the folder clicked, or beside the file clicked.
+        let folder = match &target {
+            Some(entry) if entry.is_dir => entry.path.clone(),
+            Some(entry) => entry.path.parent().unwrap_or(&root).to_path_buf(),
+            None => root,
+        };
+        let item = |label: &'static str, event: FileTreeEvent| {
+            let tree = tree.downgrade();
+            let event = Rc::new(event);
+            PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                let event = event.clone();
+                let _ = tree.update(cx, |_, cx| cx.emit(event.as_ref().clone()));
+            })
+        };
+        let menu = menu
+            .item(item("New File…", FileTreeEvent::NewFile(folder.clone())))
+            .item(item("New Folder…", FileTreeEvent::NewFolder(folder)));
+        let Some(entry) = target else {
+            return menu;
+        };
+        let menu = menu
+            .separator()
+            .item(item("Rename…", FileTreeEvent::Rename(entry.path.clone())))
+            .item(item("Delete…", FileTreeEvent::Delete(entry.path.clone())));
+        if entry.is_dir {
+            return menu;
+        }
+        menu.separator()
+            .item(item("View History", FileTreeEvent::History(entry.path)).disabled(!has_history))
     }
 
     pub fn set_scm(&mut self, scm: ScmSummary, cx: &mut Context<Self>) {
@@ -112,6 +198,7 @@ impl FileTreePanel {
                 if let Some(rev) = &info.revision {
                     title.push_str(&format!("  {}", revision_label(rev)));
                 }
+                lines.push("Not tracked: ? untracked, I ignored (italic)".into());
                 (title, true, lines)
             }
         };
@@ -254,12 +341,20 @@ impl FileTreePanel {
             .filter_map(|ix| self.rows.get(ix).cloned().map(|row| (ix, row)))
             .map(|(ix, row)| {
                 let path = &row.entry.path;
+                // Not tracked: itself, or inside a folder that isn't.
+                let untracked = match self.status.tracking(path) {
+                    Tracking::Tracked => None,
+                    Tracking::Untracked => Some(ChangeKind::Unversioned),
+                    Tracking::Ignored => Some(ChangeKind::Ignored),
+                };
                 let change = if row.entry.is_dir {
-                    self.status
-                        .contains_changes_under(path)
-                        .then_some(ChangeKind::Modified)
+                    untracked.or_else(|| {
+                        self.status
+                            .contains_changes_under(path)
+                            .then_some(ChangeKind::Modified)
+                    })
                 } else {
-                    self.status.of(path)
+                    self.status.of(path).or(untracked)
                 };
                 let color = change.map(change_color).unwrap_or(if row.entry.is_dir {
                     fg
@@ -305,6 +400,7 @@ impl FileTreePanel {
                                 div()
                                     .flex_none()
                                     .text_color(color)
+                                    .when(untracked.is_some(), |d| d.italic())
                                     .child(row.entry.name.clone()),
                             )
                             .children(row.detail.clone().map(|folder| {
@@ -333,17 +429,29 @@ impl FileTreePanel {
                                 })),
                         )
                     })
-                    .when_some(change.filter(|_| !row.entry.is_dir), |d, kind| {
-                        d.child(
-                            div()
-                                .w(px(12.))
-                                .flex_none()
-                                .text_xs()
-                                .text_color(change_color(kind))
-                                .child(kind.letter().to_string()),
-                        )
-                    })
+                    // Folders get a letter only for not being tracked.
+                    .when_some(
+                        change.filter(|_| !row.entry.is_dir).or(untracked),
+                        |d, kind| {
+                            d.child(
+                                div()
+                                    .w(px(12.))
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(change_color(kind))
+                                    .child(kind.letter().to_string()),
+                            )
+                        },
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.click(ix, cx)))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.selected = Some(row.entry.path.clone());
+                            this.menu_target = Some(row.entry.clone());
+                            cx.notify();
+                        }),
+                    )
                     .into_any_element()
             })
             .collect()
@@ -356,11 +464,12 @@ pub fn change_color(kind: ChangeKind) -> Hsla {
         ChangeKind::Added => rgb(0x98c379).into(),
         ChangeKind::Deleted | ChangeKind::Missing | ChangeKind::Conflicted => rgb(0xe06c75).into(),
         ChangeKind::Unversioned => rgb(0x6b7280).into(),
+        ChangeKind::Ignored => Hsla::from(rgb(0x6b7280)).opacity(0.6),
     }
 }
 
 /// SVN revision numbers read as `r712`; git hashes as they are.
-fn revision_label(rev: &str) -> String {
+pub fn revision_label(rev: &str) -> String {
     if rev.bytes().all(|b| b.is_ascii_digit()) {
         format!("r{rev}")
     } else {
@@ -498,6 +607,18 @@ impl Render for FileTreePanel {
             .flex_1()
             .into_any_element()
         };
+        // One menu for the whole list: a right-click on a row names its
+        // target on the way up, after this clears it on the way down.
+        let this = cx.weak_entity();
+        let body = div()
+            .id("file-tree-body")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.menu_target = None))
+            .child(body)
+            .context_menu(move |menu, _, cx| Self::context_menu(&this, menu, cx));
 
         div()
             .track_focus(&self.focus)

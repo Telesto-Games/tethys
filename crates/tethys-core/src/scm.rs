@@ -14,6 +14,8 @@ pub enum ChangeKind {
     Conflicted,
     /// Not under source control.
     Unversioned,
+    /// Not under source control, and matching its ignore rules.
+    Ignored,
 }
 
 impl ChangeKind {
@@ -27,6 +29,7 @@ impl ChangeKind {
             ChangeKind::Replaced => 'R',
             ChangeKind::Conflicted => 'C',
             ChangeKind::Unversioned => '?',
+            ChangeKind::Ignored => 'I',
         }
     }
 
@@ -40,6 +43,11 @@ impl ChangeKind {
                 | ChangeKind::Replaced
                 | ChangeKind::Conflicted
         )
+    }
+
+    /// Whether source control tracks the file: not unversioned or ignored.
+    pub fn is_versioned(self) -> bool {
+        !matches!(self, ChangeKind::Unversioned | ChangeKind::Ignored)
     }
 
     /// Whether a diff against the repository makes sense.
@@ -69,6 +77,20 @@ pub struct LastChange {
     pub revision: String,
     pub author: String,
     pub date: String,
+}
+
+/// One commit in a file's history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    /// `712` for Subversion, the full hash for git.
+    pub revision: String,
+    pub author: String,
+    /// ISO 8601.
+    pub date: String,
+    pub message: String,
+    /// Where the file was in this commit, in the source control's own terms,
+    /// for [`crate::ports::SourceControl::change`]. Empty when it doesn't need one.
+    pub locator: String,
 }
 
 /// One changed file. `path` is absolute.
@@ -107,12 +129,37 @@ impl WorkingCopyStatus {
             .map(|f| f.kind)
     }
 
+    /// Whether source control tracks `path`. Status names an untracked or
+    /// ignored folder once rather than everything in it, so this looks for
+    /// `path` or any folder above it. Tracked unless status says otherwise.
+    pub fn tracking(&self, path: &Path) -> Tracking {
+        let found = self
+            .files
+            .iter()
+            .find(|f| !f.kind.is_versioned() && starts_with_ci(path, &f.path));
+        match found.map(|f| f.kind) {
+            Some(ChangeKind::Ignored) => Tracking::Ignored,
+            Some(_) => Tracking::Untracked,
+            None => Tracking::Tracked,
+        }
+    }
+
     /// Whether anything under directory `dir` changed (for marking folders).
     pub fn contains_changes_under(&self, dir: &Path) -> bool {
         self.files
             .iter()
-            .any(|f| f.kind != ChangeKind::Unversioned && starts_with_ci(&f.path, dir))
+            .any(|f| f.kind.is_versioned() && starts_with_ci(&f.path, dir))
     }
+}
+
+/// Whether source control tracks a file or folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tracking {
+    Tracked,
+    /// Not under source control.
+    Untracked,
+    /// Not under source control, and matching its ignore rules.
+    Ignored,
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -177,5 +224,35 @@ mod tests {
         assert!(s.contains_changes_under(Path::new(r"D:\p\Source")));
         assert!(!s.contains_changes_under(Path::new(r"D:\p\Saved")));
         assert!(!s.contains_changes_under(Path::new(r"D:\p\Sour")));
+    }
+
+    #[test]
+    fn tracking_comes_from_the_nearest_untracked_or_ignored_folder() {
+        let s = WorkingCopyStatus::new(vec![
+            FileStatus {
+                path: PathBuf::from(r"D:\p\Source\Game\A.cpp"),
+                kind: ChangeKind::Modified,
+            },
+            FileStatus {
+                path: PathBuf::from(r"D:\p\Scratch"),
+                kind: ChangeKind::Unversioned,
+            },
+            FileStatus {
+                path: PathBuf::from(r"D:\p\Intermediate"),
+                kind: ChangeKind::Ignored,
+            },
+        ]);
+        let tracking = |p: &str| s.tracking(Path::new(p));
+        assert_eq!(tracking(r"D:\p\Source\Game\A.cpp"), Tracking::Tracked);
+        assert_eq!(tracking(r"D:\p\Source\Game\B.cpp"), Tracking::Tracked);
+        assert_eq!(tracking(r"D:\p\Scratch"), Tracking::Untracked);
+        assert_eq!(tracking(r"d:\P\scratch\deep\x.txt"), Tracking::Untracked);
+        assert_eq!(
+            tracking(r"D:\p\Intermediate\Build\x.obj"),
+            Tracking::Ignored
+        );
+        assert_eq!(tracking(r"D:\p\IntermediateNot"), Tracking::Tracked);
+        // Nothing tracked changed under an ignored folder.
+        assert!(!s.contains_changes_under(Path::new(r"D:\p\Intermediate")));
     }
 }
