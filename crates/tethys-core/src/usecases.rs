@@ -128,7 +128,28 @@ pub fn check_name(name: &str) -> Result<(), String> {
     if name.ends_with(['.', ' ']) || name.starts_with(' ') {
         return Err("A name can't start with a space or end with a space or dot.".into());
     }
+    if is_reserved_device_name(name) {
+        return Err(format!(
+            "\"{name}\" is a device name on Windows, not a file name."
+        ));
+    }
     Ok(())
+}
+
+/// `CON`, `nul.txt`, `COM1`…: names Windows gives to devices, in any case
+/// and with any extension. Creating one opens the device instead.
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let stem = stem.to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        s => {
+            s.len() == 4
+                && (s.starts_with("COM") || s.starts_with("LPT"))
+                && s.as_bytes()[3].is_ascii_digit()
+                && s.as_bytes()[3] != b'0'
+        }
+    }
 }
 
 /// The path `name` would have in `dir`, if it's a valid name not taken there.
@@ -1212,9 +1233,35 @@ mod scm_tests {
         assert!(check_name("Thing.cpp").is_ok());
         assert!(check_name(".gitignore").is_ok());
         for bad in [
-            "", "  ", ".", "..", "a/b", r"a\b", "a:b", "a?", "end.", "end ", " start",
+            "",
+            "  ",
+            ".",
+            "..",
+            "a/b",
+            r"a\b",
+            "a:b",
+            "a?",
+            "end.",
+            "end ",
+            " start",
+            "nul",
+            "CON",
+            "con.txt",
+            "Aux.tar.gz",
+            "COM1",
+            "lpt9.log",
         ] {
             assert!(check_name(bad).is_err(), "{bad:?} was accepted");
+        }
+        for ok in [
+            "COM0",
+            "COM10",
+            "console",
+            "nullable.h",
+            "LPT",
+            "connect.cpp",
+        ] {
+            assert!(check_name(ok).is_ok(), "{ok:?} was refused");
         }
     }
 

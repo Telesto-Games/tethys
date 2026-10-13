@@ -13,7 +13,7 @@ use tethys_core::scm::Commit;
 use tethys_core::usecases;
 
 use crate::diff_panel::DiffPanel;
-use crate::file_tree::revision_label;
+use crate::file_tree::{file_name, revision_label};
 
 const ROW_HEIGHT: f32 = 44.;
 const LIST_WIDTH: f32 = 320.;
@@ -29,6 +29,9 @@ pub struct HistoryPanel {
     scm: Arc<dyn SourceControl>,
     commits: Commits,
     selected: Option<usize>,
+    /// Counts selections, so a diff that arrives after a later selection or
+    /// a reload (which may select the same index of a new list) is dropped.
+    selection: u64,
     /// What the selected commit changed; `None` until one is chosen.
     diff: Option<Result<Entity<DiffPanel>, String>>,
     focus: FocusHandle,
@@ -43,6 +46,7 @@ impl HistoryPanel {
             scm,
             commits: Commits::Loading,
             selected: None,
+            selection: 0,
             diff: None,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
@@ -70,6 +74,8 @@ impl HistoryPanel {
                 };
                 this.selected = None;
                 this.diff = None;
+                // Nothing in flight for the old list may land now.
+                this.selection += 1;
                 this.select(0, cx);
                 cx.notify();
             });
@@ -86,6 +92,8 @@ impl HistoryPanel {
             return;
         };
         self.selected = Some(ix);
+        self.selection += 1;
+        let selection = self.selection;
         cx.notify();
         let (scm, path) = (self.scm.clone(), self.path.clone());
         let against = format!(
@@ -100,8 +108,8 @@ impl HistoryPanel {
         cx.spawn(async move |this, cx| {
             let diff = diff.await;
             let _ = this.update(cx, |this, cx| {
-                // A later click won the race.
-                if this.selected != Some(ix) {
+                // A later click or reload won the race.
+                if this.selection != selection {
                     return;
                 }
                 match diff {
@@ -125,10 +133,7 @@ impl HistoryPanel {
     }
 
     fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        file_name(&self.path)
     }
 
     fn render_rows(

@@ -7,6 +7,8 @@ use gpui_kit::component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_kit::*;
 use tethys_core::diff::{FileDiff, LineKind};
 
+use crate::file_tree::file_name;
+
 const ROW_HEIGHT: f32 = 20.;
 const GUTTER: f32 = 48.;
 
@@ -82,10 +84,7 @@ impl DiffPanel {
     }
 
     fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        file_name(&self.path)
     }
 
     fn render_rows(

@@ -40,10 +40,16 @@ impl Git {
             .is_ok_and(|o| o.status.success())
     }
 
-    /// Runs git in `dir`.
+    /// Runs git in `dir`. File names are passed as pathspecs, so
+    /// `--literal-pathspecs` keeps `[`, `*` and the like in a name from
+    /// matching other files (`rm` would delete them).
     fn run(&self, dir: &Path, args: &[&str]) -> std::io::Result<Output> {
         let mut cmd = Command::new(&self.program);
-        cmd.arg("--no-optional-locks").arg("-C").arg(dir).args(args);
+        cmd.arg("--no-optional-locks")
+            .arg("--literal-pathspecs")
+            .arg("-C")
+            .arg(dir)
+            .args(args);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -197,6 +203,9 @@ impl SourceControl for Git {
 
     fn history(&self, file: &Path, limit: usize) -> PortResult<Vec<Commit>> {
         let (dir, name) = split(file)?;
+        // The file's path from the top of the repository, for commits whose
+        // record doesn't name it.
+        let prefix = line(self.output(dir, &["rev-parse", "--show-prefix"])?);
         let limit = format!("-n{limit}");
         let out = self.output(
             dir,
@@ -211,7 +220,7 @@ impl SourceControl for Git {
                 name,
             ],
         )?;
-        Ok(parse_history(&out))
+        Ok(parse_history(&out, &format!("{prefix}{name}")))
     }
 
     fn change(&self, file: &Path, commit: &Commit) -> PortResult<(Option<String>, Option<String>)> {
@@ -257,7 +266,12 @@ fn split(path: &Path) -> PortResult<(&Path, &str)> {
 /// and a path, or `R…`/`C…` and the old and new paths. The locator is the
 /// path before and after the commit, from the top of the repository,
 /// separated by a NUL; empty where the file didn't exist.
-pub fn parse_history(out: &str) -> Vec<Commit> {
+///
+/// A merge commit has no status lines (git doesn't diff merges without
+/// `-m`), so its path is taken from the next newer commit, whose "before"
+/// is where the file was after the merge; `path` for the newest commit.
+pub fn parse_history(out: &str, path: &str) -> Vec<Commit> {
+    let mut newer_before: Option<String> = None;
     out.split('\x1e')
         .filter_map(|record| {
             let mut fields = record.split('\0').map(|f| f.trim_matches('\n'));
@@ -265,25 +279,37 @@ pub fn parse_history(out: &str) -> Vec<Commit> {
             let author = fields.next().unwrap_or_default().to_string();
             let date = fields.next().unwrap_or_default().to_string();
             let message = fields.next().unwrap_or_default().to_string();
-            let locator = match fields.next().unwrap_or_default() {
-                s if s.starts_with('A') => format!("\0{}", fields.next().unwrap_or_default()),
-                s if s.starts_with('D') => format!("{}\0", fields.next().unwrap_or_default()),
-                s if s.starts_with('R') || s.starts_with('C') => {
-                    let old = fields.next().unwrap_or_default();
-                    format!("{old}\0{}", fields.next().unwrap_or_default())
+            let (before, after) = match fields.next().unwrap_or_default() {
+                s if s.starts_with('A') => {
+                    (String::new(), fields.next().unwrap_or_default().into())
                 }
-                // M, T, or no status (a merge): the same path both sides.
+                s if s.starts_with('D') => {
+                    (fields.next().unwrap_or_default().into(), String::new())
+                }
+                s if s.starts_with('R') || s.starts_with('C') => {
+                    let old = fields.next().unwrap_or_default().to_string();
+                    (old, fields.next().unwrap_or_default().into())
+                }
+                // No status: a merge. The same path both sides.
+                "" => {
+                    let p = newer_before.clone().unwrap_or_else(|| path.to_string());
+                    (p.clone(), p)
+                }
+                // M, T: the same path both sides.
                 _ => {
-                    let path = fields.next().unwrap_or_default();
-                    format!("{path}\0{path}")
+                    let p = fields.next().unwrap_or_default().to_string();
+                    (p.clone(), p)
                 }
             };
+            if !before.is_empty() {
+                newer_before = Some(before.clone());
+            }
             Some(Commit {
                 revision,
                 author,
                 date,
                 message,
-                locator,
+                locator: format!("{before}\0{after}"),
             })
         })
         .collect()
@@ -519,7 +545,7 @@ mod tests {
         let out = "\x1eaaa\0Chris\x002026-10-13T09:00:00+01:00\0Rename\0\nR095\0Proj/a.txt\0Proj/b.txt\0\
                    \x1ebbb\0Sam\x002026-10-12T09:00:00+01:00\0Edit\0\nM\0Proj/a.txt\0\
                    \x1eccc\0Sam\x002026-10-11T09:00:00+01:00\0Add\0\nA\0Proj/a.txt\0";
-        let log = parse_history(out);
+        let log = parse_history(out, "Proj/b.txt");
         let got: Vec<_> = log
             .iter()
             .map(|c| (c.revision.as_str(), c.message.as_str(), c.locator.as_str()))
@@ -533,6 +559,30 @@ mod tests {
             ]
         );
         assert_eq!(log[0].author, "Chris");
+    }
+
+    /// A merge commit has no status lines: it takes the path the file had
+    /// just after it, from the next newer commit, or the file's own path.
+    #[test]
+    fn merge_commits_take_the_path_from_the_newer_commit() {
+        let out = "\x1eaaa\0Chris\x002026-10-13T09:00:00+01:00\0Merge\0\n\
+                   \x1ebbb\0Chris\x002026-10-12T09:00:00+01:00\0Rename\0\nR095\0Proj/a.txt\0Proj/b.txt\0\
+                   \x1eccc\0Sam\x002026-10-11T09:00:00+01:00\0Merge\0\n\
+                   \x1eddd\0Sam\x002026-10-10T09:00:00+01:00\0Add\0\nA\0Proj/a.txt\0";
+        let log = parse_history(out, "Proj/b.txt");
+        let got: Vec<_> = log
+            .iter()
+            .map(|c| (c.revision.as_str(), c.locator.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("aaa", "Proj/b.txt\0Proj/b.txt"),
+                ("bbb", "Proj/a.txt\0Proj/b.txt"),
+                ("ccc", "Proj/a.txt\0Proj/a.txt"),
+                ("ddd", "\0Proj/a.txt"),
+            ]
+        );
     }
 
     /// Rename, history, a commit's change and delete, against a scratch
@@ -598,6 +648,17 @@ mod tests {
             git.change(&b, &log[2]).unwrap(),
             (None, Some("one\n".into()))
         );
+
+        // A name with glob characters is taken literally: `[b].txt` is
+        // itself, not `b.txt`.
+        let glob = proj.join("[b].txt");
+        std::fs::write(&glob, "g\n").unwrap();
+        assert!(!git.is_versioned(&glob).unwrap());
+        run(&["--literal-pathspecs", "add", "Proj/[b].txt"]);
+        assert!(git.is_versioned(&glob).unwrap());
+        git.delete(&glob).unwrap();
+        assert!(!glob.exists());
+        assert!(b.exists(), "deleting [b].txt must leave b.txt alone");
 
         std::fs::write(&b, "edited\n").unwrap();
         git.delete(&b).unwrap();

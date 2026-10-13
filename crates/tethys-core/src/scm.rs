@@ -1,5 +1,6 @@
 //! Source control: what changed in a working copy, independent of the tool.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// How a file differs from the repository.
@@ -101,15 +102,33 @@ pub struct FileStatus {
 }
 
 /// The changed files of a working copy, for quick lookup by path.
+///
+/// The file tree asks about every visible row on every frame, and a status
+/// with ignored files can run to thousands of entries, so lookups go
+/// through a map keyed by case-folded path rather than scanning the list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingCopyStatus {
     files: Vec<FileStatus>,
+    /// Every entry by [`path_key`]. A path listed twice (a rename's old and
+    /// new paths) keeps the first in path order.
+    by_path: HashMap<String, ChangeKind>,
+    /// Entries that aren't versioned (files, or folders named once).
+    untracked: usize,
 }
 
 impl WorkingCopyStatus {
     pub fn new(mut files: Vec<FileStatus>) -> Self {
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Self { files }
+        let mut by_path = HashMap::with_capacity(files.len());
+        for f in &files {
+            by_path.entry(path_key(&f.path)).or_insert(f.kind);
+        }
+        let untracked = files.iter().filter(|f| !f.kind.is_versioned()).count();
+        Self {
+            files,
+            by_path,
+            untracked,
+        }
     }
 
     pub fn files(&self) -> &[FileStatus] {
@@ -123,25 +142,27 @@ impl WorkingCopyStatus {
 
     /// The change for exactly this file, if any.
     pub fn of(&self, path: &Path) -> Option<ChangeKind> {
-        self.files
-            .iter()
-            .find(|f| same_path(&f.path, path))
-            .map(|f| f.kind)
+        self.by_path.get(&path_key(path)).copied()
     }
 
     /// Whether source control tracks `path`. Status names an untracked or
     /// ignored folder once rather than everything in it, so this looks for
-    /// `path` or any folder above it. Tracked unless status says otherwise.
+    /// `path` or any folder above it, nearest the root first. Tracked unless
+    /// status says otherwise.
     pub fn tracking(&self, path: &Path) -> Tracking {
-        let found = self
-            .files
-            .iter()
-            .find(|f| !f.kind.is_versioned() && starts_with_ci(path, &f.path));
-        match found.map(|f| f.kind) {
-            Some(ChangeKind::Ignored) => Tracking::Ignored,
-            Some(_) => Tracking::Untracked,
-            None => Tracking::Tracked,
+        if self.untracked == 0 {
+            return Tracking::Tracked;
         }
+        let mut key = String::new();
+        for component in path.components() {
+            push_component(&mut key, component.as_os_str());
+            match self.by_path.get(&key) {
+                Some(ChangeKind::Ignored) => return Tracking::Ignored,
+                Some(ChangeKind::Unversioned) => return Tracking::Untracked,
+                _ => {}
+            }
+        }
+        Tracking::Tracked
     }
 
     /// Whether anything under directory `dir` changed (for marking folders).
@@ -149,6 +170,25 @@ impl WorkingCopyStatus {
         self.files
             .iter()
             .any(|f| f.kind.is_versioned() && starts_with_ci(&f.path, dir))
+    }
+}
+
+/// A path as a map key: its components, case-folded, joined by a character
+/// no path contains, so `D:\p\Sub` and `d:/P/sub/` read the same.
+fn path_key(path: &Path) -> String {
+    let mut key = String::new();
+    for component in path.components() {
+        push_component(&mut key, component.as_os_str());
+    }
+    key
+}
+
+fn push_component(key: &mut String, component: &std::ffi::OsStr) {
+    if !key.is_empty() {
+        key.push('\0');
+    }
+    for c in component.to_string_lossy().chars() {
+        key.extend(c.to_lowercase());
     }
 }
 
@@ -160,10 +200,6 @@ pub enum Tracking {
     Untracked,
     /// Not under source control, and matching its ignore rules.
     Ignored,
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
 }
 
 /// Case-insensitive `Path::starts_with`, since Windows paths are.
@@ -252,6 +288,12 @@ mod tests {
             Tracking::Ignored
         );
         assert_eq!(tracking(r"D:\p\IntermediateNot"), Tracking::Tracked);
+        // A folder's own entry answers for it however it's spelled.
+        assert_eq!(tracking(r"D:/p/scratch/"), Tracking::Untracked);
+        assert_eq!(
+            s.of(Path::new(r"d:/P/INTERMEDIATE")),
+            Some(ChangeKind::Ignored)
+        );
         // Nothing tracked changed under an ignored folder.
         assert!(!s.contains_changes_under(Path::new(r"D:\p\Intermediate")));
     }

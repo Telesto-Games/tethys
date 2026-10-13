@@ -264,12 +264,7 @@ impl FileTreePanel {
                     .unwrap_or_default();
                 Row {
                     entry: Entry {
-                        name: f
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default()
-                            .into(),
+                        name: file_name(&f.path).into(),
                         path: f.path.clone(),
                         is_dir: false,
                     },
@@ -466,6 +461,13 @@ pub fn change_color(kind: ChangeKind) -> Hsla {
         ChangeKind::Unversioned => rgb(0x6b7280).into(),
         ChangeKind::Ignored => Hsla::from(rgb(0x6b7280)).opacity(0.6),
     }
+}
+
+/// The last part of `path`, for display in a tab or a title.
+pub fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// SVN revision numbers read as `r712`; git hashes as they are.
