@@ -122,7 +122,7 @@ impl TextCodec {
 }
 
 /// Replaces tabs with spaces up to the next tab stop.
-fn expand_tabs(line: &str) -> String {
+pub(crate) fn expand_tabs(line: &str) -> String {
     if !line.contains('\t') {
         return line.to_string();
     }
@@ -258,20 +258,12 @@ impl EditorPanel {
         let theme = cx.theme();
         let (red, orange) = (theme.danger.opacity(0.28), theme.primary.opacity(0.35));
         let text = self.state.read(cx).text();
+        let line_starts: Vec<usize> = (0..text.lines_len())
+            .map(|row| text.line_start_offset(row))
+            .collect();
         let fill = |line: u32, color: Hsla| {
-            let row = line.saturating_sub(1) as usize;
-            if row >= text.lines_len() {
-                return None;
-            }
-            // Through the newline, so empty lines are marked too.
-            let start = text.line_start_offset(row);
-            let end = if row + 1 < text.lines_len() {
-                text.line_start_offset(row + 1)
-            } else {
-                text.len()
-            };
             Some(
-                RangeDecoration::new(start..end.max(start + 1).min(text.len()))
+                RangeDecoration::new(line_fill_range(line, &line_starts, text.len())?)
                     .with_style(RangeDecorationStyle::Fill)
                     .with_color(color),
             )
@@ -390,12 +382,27 @@ impl Panel for EditorPanel {
 
 impl EditorPanel {
     fn title_text(&self) -> String {
-        if self.dirty {
-            format!("{} ●", self.file_name())
-        } else {
-            self.file_name()
-        }
+        title(&self.file_name(), self.dirty)
     }
+}
+
+/// The tab title: the file name, marked when there are unsaved edits.
+fn title(name: &str, dirty: bool) -> String {
+    if dirty {
+        format!("{name} ●")
+    } else {
+        name.to_string()
+    }
+}
+
+/// The byte range to fill for a 1-based `line`, given each row's start
+/// offset and the text's length: through the newline, so empty lines are
+/// marked too, and at least one byte. `None` past the end.
+fn line_fill_range(line: u32, line_starts: &[usize], len: usize) -> Option<std::ops::Range<usize>> {
+    let row = line.saturating_sub(1) as usize;
+    let start = *line_starts.get(row)?;
+    let end = line_starts.get(row + 1).copied().unwrap_or(len);
+    Some(start..end.max(start + 1).min(len))
 }
 
 impl Focusable for EditorPanel {
@@ -547,7 +554,7 @@ mod tests {
 
 #[cfg(test)]
 mod round_trip {
-    use super::{TextCodec, read_text};
+    use super::{MAX_EDIT_BYTES, TextCodec, expand_tabs, line_fill_range, read_text, title};
 
     /// Run with `TETHYS_ROUNDTRIP_DIR=<folder> cargo test -- --ignored`: every
     /// text file under it must survive decode + encode byte for byte.
@@ -572,5 +579,73 @@ mod round_trip {
             }
         }
         eprintln!("round-tripped {checked} files");
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tethys-editor-{name}-{}.txt", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_text_reads_text_lossily() {
+        let path = temp_file("utf8", b"caf\xc3\xa9\n");
+        assert_eq!(read_text(&path).unwrap(), "café\n");
+        let path = temp_file("lossy", b"bad \xff byte\n");
+        assert_eq!(read_text(&path).unwrap(), "bad \u{fffd} byte\n");
+    }
+
+    #[test]
+    fn read_text_refuses_binary_large_and_missing_files() {
+        let path = temp_file("binary", b"MZ\0\0text");
+        assert!(read_text(&path).unwrap_err().contains("binary"));
+        // A NUL after the first 8 KiB isn't checked.
+        let mut late = vec![b'x'; 8192];
+        late.push(0);
+        let path = temp_file("late-nul", &late);
+        assert!(read_text(&path).is_ok());
+
+        let path = temp_file("large", &[]);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_EDIT_BYTES + 1).unwrap();
+        drop(file);
+        assert!(read_text(&path).unwrap_err().contains("too large"));
+
+        let missing = std::env::temp_dir().join("tethys-editor-does-not-exist.txt");
+        assert!(read_text(&missing).unwrap_err().starts_with("Can't open"));
+    }
+
+    #[test]
+    fn tabs_expand_to_tab_stops() {
+        assert_eq!(expand_tabs("no tabs"), "no tabs");
+        assert_eq!(expand_tabs("\tx"), "    x");
+        assert_eq!(expand_tabs("ab\tx"), "ab  x");
+        assert_eq!(expand_tabs("abcd\tx"), "abcd    x");
+        assert_eq!(expand_tabs("a\tb\tc"), "a   b   c");
+        assert_eq!(expand_tabs("\t\t"), "        ");
+    }
+
+    #[test]
+    fn line_fill_ranges_run_through_the_newline() {
+        // "ab\n\ncd" : rows start at 0, 3, 4; length 6.
+        let starts = [0, 3, 4];
+        assert_eq!(line_fill_range(1, &starts, 6), Some(0..3));
+        // An empty line still gets its newline.
+        assert_eq!(line_fill_range(2, &starts, 6), Some(3..4));
+        // The last line runs to the end.
+        assert_eq!(line_fill_range(3, &starts, 6), Some(4..6));
+        assert_eq!(line_fill_range(4, &starts, 6), None);
+        // Line 0 is treated as line 1.
+        assert_eq!(line_fill_range(0, &starts, 6), Some(0..3));
+        // An empty last line is at least a byte, but never past the end.
+        assert_eq!(line_fill_range(2, &[0, 2], 2), Some(2..2));
+        assert_eq!(line_fill_range(1, &[0], 0), Some(0..0));
+    }
+
+    #[test]
+    fn titles_mark_unsaved_edits() {
+        assert_eq!(title("Foo.cpp", false), "Foo.cpp");
+        assert_eq!(title("Foo.cpp", true), "Foo.cpp ●");
     }
 }

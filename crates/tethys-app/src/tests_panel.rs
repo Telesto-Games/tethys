@@ -16,7 +16,8 @@ use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use tethys_core::automation::{
-    AutomationTest, EntryKind, TestCatalog, TestEnd, TestEvent, TestRow, TestState,
+    AutomationTest, EntryKind, TestCatalog, TestCounts, TestEnd, TestEntry, TestEvent, TestRow,
+    TestState,
 };
 use tethys_core::usecases::TestTarget;
 
@@ -51,68 +52,48 @@ enum Connection {
     Connected(String),
 }
 
-pub struct TestsPanel {
-    focus: FocusHandle,
+/// The pane's state apart from GPUI handles, so it can be driven and read
+/// without a window.
+struct TestsState {
     project_root: PathBuf,
     catalog: TestCatalog,
     connection: Connection,
     /// Tests in the current run, and how many have finished.
     run: Option<(usize, usize)>,
-    filter: Entity<InputState>,
+    /// The filter, trimmed and lowercased.
     filter_text: String,
     project_only: bool,
     expanded: HashSet<String>,
     selected: Option<String>,
     rows: Vec<TestRow>,
-    scroll: UniformListScrollHandle,
-    _filter_events: Subscription,
 }
 
-impl TestsPanel {
-    pub fn new(project_root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter tests"));
-        let filter_events = cx.subscribe(&filter, |this, input, event: &InputEvent, cx| {
-            if let InputEvent::Change = event {
-                this.filter_text = input.read(cx).value().trim().to_lowercase();
-                this.rebuild();
-                cx.notify();
-            }
-        });
+impl TestsState {
+    fn new(project_root: PathBuf) -> Self {
         Self {
-            focus: cx.focus_handle(),
             project_root,
             catalog: TestCatalog::default(),
             connection: Connection::Disconnected(None),
             run: None,
-            filter,
             filter_text: String::new(),
             project_only: true,
             expanded: HashSet::new(),
             selected: None,
             rows: Vec::new(),
-            scroll: UniformListScrollHandle::new(),
-            _filter_events: filter_events,
         }
     }
 
-    pub fn is_disconnected(&self) -> bool {
-        matches!(self.connection, Connection::Disconnected(_))
+    fn set_filter(&mut self, text: &str) {
+        self.filter_text = text.trim().to_lowercase();
+        self.rebuild();
     }
 
-    /// Connecting has started; `status` says how.
-    pub fn set_connecting(&mut self, status: String, cx: &mut Context<Self>) {
-        self.connection = Connection::Connecting(status);
-        cx.notify();
+    fn set_project_only(&mut self, project_only: bool) {
+        self.project_only = project_only;
+        self.rebuild();
     }
 
-    /// Connecting failed before a session existed.
-    pub fn set_failed(&mut self, error: String, cx: &mut Context<Self>) {
-        self.connection = Connection::Disconnected(Some(error));
-        self.run = None;
-        cx.notify();
-    }
-
-    pub fn apply(&mut self, event: TestEvent, cx: &mut Context<Self>) {
+    fn apply(&mut self, event: TestEvent) {
         match event {
             TestEvent::Status(status) => {
                 if let Connection::Connecting(s) = &mut self.connection
@@ -160,26 +141,23 @@ impl TestsPanel {
             }
         }
         self.rebuild();
-        cx.notify();
     }
 
-    /// Marks `tests` as queued; the workspace sends them to the editor.
-    fn start_run(&mut self, tests: Vec<AutomationTest>, cx: &mut Context<Self>) {
+    /// Marks `tests` as queued and starts a run of them, or returns false
+    /// when there's nothing to run or a run is already going.
+    fn start_run(&mut self, tests: &[AutomationTest]) -> bool {
         if tests.is_empty() || self.run.is_some() {
-            return;
+            return false;
         }
-        self.catalog.queue(&tests);
+        self.catalog.queue(tests);
         self.run = Some((tests.len(), 0));
         self.rebuild();
-        cx.emit(TestsPanelEvent::Run(tests));
-        cx.notify();
+        true
     }
 
     fn keep(&self) -> impl Fn(&AutomationTest) -> bool + '_ {
         move |t: &AutomationTest| {
-            (!self.project_only || t.is_under(&self.project_root))
-                && (self.filter_text.is_empty()
-                    || t.path.to_lowercase().contains(&self.filter_text))
+            keep_test(t, self.project_only, &self.project_root, &self.filter_text)
         }
     }
 
@@ -210,7 +188,8 @@ impl TestsPanel {
         }
     }
 
-    fn click_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+    /// Selects row `ix`, and opens or closes it if it's a group.
+    fn click_row(&mut self, ix: usize) {
         let Some(row) = self.rows.get(ix).cloned() else {
             return;
         };
@@ -221,6 +200,89 @@ impl TestsPanel {
             self.rebuild();
         }
         self.selected = Some(row.key);
+    }
+
+    /// Totals for a group: the tests under it that are shown.
+    fn group_counts(&self, key: &str) -> TestCounts {
+        self.catalog
+            .counts(|t| in_group(&t.path, key) && self.keep()(t))
+    }
+
+    /// The text under the toolbar, and whether it's an error.
+    fn status_line(&self) -> (String, bool) {
+        status_line(&self.connection, self.run, self.catalog.counts(self.keep()))
+    }
+
+    /// Why the list is empty, if it is and that needs explaining.
+    fn empty_note(&self) -> Option<&'static str> {
+        empty_note(
+            self.catalog.is_empty(),
+            self.rows.is_empty(),
+            self.project_only,
+            self.filter_text.is_empty(),
+        )
+    }
+}
+
+pub struct TestsPanel {
+    focus: FocusHandle,
+    state: TestsState,
+    filter: Entity<InputState>,
+    scroll: UniformListScrollHandle,
+    _filter_events: Subscription,
+}
+
+impl TestsPanel {
+    pub fn new(project_root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter tests"));
+        let filter_events = cx.subscribe(&filter, |this, input, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                let text = input.read(cx).value().to_string();
+                this.state.set_filter(&text);
+                cx.notify();
+            }
+        });
+        Self {
+            focus: cx.focus_handle(),
+            state: TestsState::new(project_root),
+            filter,
+            scroll: UniformListScrollHandle::new(),
+            _filter_events: filter_events,
+        }
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self.state.connection, Connection::Disconnected(_))
+    }
+
+    /// Connecting has started; `status` says how.
+    pub fn set_connecting(&mut self, status: String, cx: &mut Context<Self>) {
+        self.state.connection = Connection::Connecting(status);
+        cx.notify();
+    }
+
+    /// Connecting failed before a session existed.
+    pub fn set_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        self.state.connection = Connection::Disconnected(Some(error));
+        self.state.run = None;
+        cx.notify();
+    }
+
+    pub fn apply(&mut self, event: TestEvent, cx: &mut Context<Self>) {
+        self.state.apply(event);
+        cx.notify();
+    }
+
+    /// Marks `tests` as queued; the workspace sends them to the editor.
+    fn start_run(&mut self, tests: Vec<AutomationTest>, cx: &mut Context<Self>) {
+        if self.state.start_run(&tests) {
+            cx.emit(TestsPanelEvent::Run(tests));
+            cx.notify();
+        }
+    }
+
+    fn click_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.state.click_row(ix);
         cx.notify();
     }
 
@@ -238,14 +300,15 @@ impl TestsPanel {
         );
         let primary = theme.primary;
         range
-            .filter_map(|ix| self.rows.get(ix).cloned().map(|row| (ix, row)))
+            .filter_map(|ix| self.state.rows.get(ix).cloned().map(|row| (ix, row)))
             .map(|(ix, row)| {
-                let selected = self.selected.as_deref() == Some(row.key.as_str());
+                let selected = self.state.selected.as_deref() == Some(row.key.as_str());
                 let (glyph, color) = state_glyph(row.state, muted, primary);
                 let trailing = if row.is_group {
                     Some(row.count.to_string())
                 } else {
-                    self.catalog
+                    self.state
+                        .catalog
                         .get(&row.key)
                         .and_then(|(_, _, r)| r)
                         .map(|r| format_duration(r.duration_secs))
@@ -296,17 +359,15 @@ impl TestsPanel {
             .flex_col()
             .gap_1()
             .text_xs();
-        let Some(key) = &self.selected else {
+        let Some(key) = &self.state.selected else {
             return body.text_color(muted).child(
                 "Select a test or group to see its results. Run runs the selection, or every \
                  test shown when nothing is selected.",
             );
         };
-        let Some((test, state, result)) = self.catalog.get(key) else {
+        let Some((test, state, result)) = self.state.catalog.get(key) else {
             // A group.
-            let counts = self.catalog.counts(|t| {
-                (t.path == *key || t.path.starts_with(&format!("{key}."))) && self.keep()(t)
-            });
+            let counts = self.state.group_counts(key);
             return body.child(div().text_sm().child(key.clone())).child(
                 div().text_color(muted).child(format!(
                     "{} tests · {} passed · {} failed · {} skipped",
@@ -339,14 +400,7 @@ impl TestsPanel {
         let Some(result) = result else {
             return body;
         };
-        // Problems first, then the log.
-        let problems = result.entries.iter().filter(|e| e.kind != EntryKind::Info);
-        let log = result
-            .entries
-            .iter()
-            .filter(|e| e.kind == EntryKind::Info)
-            .take(MAX_INFO_LINES);
-        for (i, entry) in problems.chain(log).enumerate() {
+        for (i, entry) in ordered_entries(&result.entries).enumerate() {
             let color = match entry.kind {
                 EntryKind::Error => failed_color(),
                 EntryKind::Warning => warning_color(),
@@ -373,49 +427,22 @@ impl TestsPanel {
         body
     }
 
-    fn status_line(&self) -> (String, bool) {
-        let counts = self.catalog.counts(self.keep());
-        match &self.connection {
-            Connection::Disconnected(None) => (
-                "Not connected. Connect to this project's editor, or start a headless test editor."
-                    .into(),
-                false,
-            ),
-            Connection::Disconnected(Some(e)) => (e.clone(), true),
-            Connection::Connecting(status) => (status.clone(), false),
-            Connection::Connected(name) => {
-                let progress = match self.run {
-                    Some((total, done)) => format!("Running {done}/{total} · "),
-                    None => String::new(),
-                };
-                let mut text = format!("{progress}{name} · {} tests", counts.total);
-                if counts.passed + counts.failed + counts.skipped > 0 {
-                    text += &format!(" · {} passed · {} failed", counts.passed, counts.failed);
-                    if counts.skipped > 0 {
-                        text += &format!(" · {} skipped", counts.skipped);
-                    }
-                }
-                (text, false)
-            }
-        }
-    }
-
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (status, is_error) = self.status_line();
+        let (status, is_error) = self.state.status_line();
         let status_color = if is_error {
             theme.danger
         } else {
             theme.foreground
         };
-        let connected = matches!(self.connection, Connection::Connected(_));
-        let running = self.run.is_some();
+        let connected = matches!(self.state.connection, Connection::Connected(_));
+        let running = self.state.run.is_some();
         let targets = if connected {
-            self.run_targets().len()
+            self.state.run_targets().len()
         } else {
             0
         };
-        let failed = self.catalog.failed();
+        let failed = self.state.catalog.failed();
 
         // The status gets its own line: the pane is often narrow, and the
         // buttons would squeeze it to nothing.
@@ -427,7 +454,7 @@ impl TestsPanel {
             .text_color(status_color)
             .child(status);
         let mut bar = div().flex().items_center().gap_1().px_2().py_1();
-        match &self.connection {
+        match &self.state.connection {
             Connection::Disconnected(_) => {
                 let this = cx.entity().downgrade();
                 bar = bar.child(
@@ -479,7 +506,7 @@ impl TestsPanel {
                                 .tooltip("Run the selected test or group, or every test shown")
                                 .disabled(targets == 0)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    let tests = this.run_targets();
+                                    let tests = this.state.run_targets();
                                     this.start_run(tests, cx);
                                 })),
                         )
@@ -490,7 +517,7 @@ impl TestsPanel {
                                 .label(format!("Run failed ({})", failed.len()))
                                 .disabled(failed.is_empty())
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let tests = this.catalog.failed();
+                                    let tests = this.state.catalog.failed();
                                     this.start_run(tests, cx);
                                 })),
                         )
@@ -561,11 +588,88 @@ fn state_label(state: TestState) -> &'static str {
     }
 }
 
+/// `412 ms` under a second, else `1.25 s`; rounded first, so 999.6 ms is `1.00 s`.
 fn format_duration(secs: f64) -> String {
-    if secs < 1.0 {
-        format!("{:.0} ms", secs * 1000.0)
+    let ms = (secs * 1000.0).round();
+    if ms < 1000.0 {
+        format!("{ms:.0} ms")
     } else {
         format!("{secs:.2} s")
+    }
+}
+
+/// Whether a test is shown: the project's own (unless `project_only` is off)
+/// and matching `filter_lower` (a trimmed, lowercased filter, or empty).
+fn keep_test(t: &AutomationTest, project_only: bool, root: &Path, filter_lower: &str) -> bool {
+    (!project_only || t.is_under(root))
+        && (filter_lower.is_empty() || t.path.to_lowercase().contains(filter_lower))
+}
+
+/// Whether a test `path` is the group `key` or inside it: `A.B` holds `A.B`
+/// and `A.B.C`, not `A.BC`.
+fn in_group(path: &str, key: &str) -> bool {
+    path == key
+        || path
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// The text under the toolbar for a connection, run and totals, and whether
+/// it's an error.
+fn status_line(
+    connection: &Connection,
+    run: Option<(usize, usize)>,
+    counts: TestCounts,
+) -> (String, bool) {
+    match connection {
+        Connection::Disconnected(None) => (
+            "Not connected. Connect to this project's editor, or start a headless test editor."
+                .into(),
+            false,
+        ),
+        Connection::Disconnected(Some(e)) => (e.clone(), true),
+        Connection::Connecting(status) => (status.clone(), false),
+        Connection::Connected(name) => {
+            let progress = match run {
+                Some((total, done)) => format!("Running {done}/{total} · "),
+                None => String::new(),
+            };
+            let mut text = format!("{progress}{name} · {} tests", counts.total);
+            if counts.passed + counts.failed + counts.skipped > 0 {
+                text += &format!(" · {} passed · {} failed", counts.passed, counts.failed);
+                if counts.skipped > 0 {
+                    text += &format!(" · {} skipped", counts.skipped);
+                }
+            }
+            (text, false)
+        }
+    }
+}
+
+/// A result's entries for display: problems first, then at most
+/// `MAX_INFO_LINES` of the log.
+fn ordered_entries(entries: &[TestEntry]) -> impl Iterator<Item = &TestEntry> {
+    let problems = entries.iter().filter(|e| e.kind != EntryKind::Info);
+    let log = entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Info)
+        .take(MAX_INFO_LINES);
+    problems.chain(log)
+}
+
+/// Why the list is empty when the catalog isn't, if it is.
+fn empty_note(
+    catalog_empty: bool,
+    rows_empty: bool,
+    project_only: bool,
+    filter_empty: bool,
+) -> Option<&'static str> {
+    if catalog_empty || !rows_empty {
+        None
+    } else if project_only && filter_empty {
+        Some("No tests are defined in this project. Untick Project only to see the engine's.")
+    } else {
+        Some("No tests match.")
     }
 }
 
@@ -632,18 +736,7 @@ impl Focusable for TestsPanel {
 impl Render for TestsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let empty_note = if self.catalog.is_empty() {
-            None
-        } else if self.rows.is_empty() {
-            Some(if self.project_only && self.filter_text.is_empty() {
-                "No tests are defined in this project. Untick Project only to see the engine's."
-            } else {
-                "No tests match."
-            })
-        } else {
-            None
-        };
-        let list = match empty_note {
+        let list = match self.state.empty_note() {
             Some(note) => div()
                 .flex_1()
                 .p_2()
@@ -651,12 +744,16 @@ impl Render for TestsPanel {
                 .text_color(theme.muted_foreground)
                 .child(note)
                 .into_any_element(),
-            None => uniform_list("tests", self.rows.len(), cx.processor(Self::render_rows))
-                .track_scroll(&self.scroll)
-                .flex_1()
-                .into_any_element(),
+            None => uniform_list(
+                "tests",
+                self.state.rows.len(),
+                cx.processor(Self::render_rows),
+            )
+            .track_scroll(&self.scroll)
+            .flex_1()
+            .into_any_element(),
         };
-        let project_only = self.project_only;
+        let project_only = self.state.project_only;
 
         div()
             .track_focus(&self.focus)
@@ -704,8 +801,8 @@ impl Render for TestsPanel {
                                                         .checked(project_only)
                                                         .on_click(cx.listener(
                                                             |this, checked: &bool, _, cx| {
-                                                                this.project_only = *checked;
-                                                                this.rebuild();
+                                                                this.state
+                                                                    .set_project_only(*checked);
                                                                 cx.notify();
                                                             },
                                                         )),
@@ -725,5 +822,341 @@ impl Render for TestsPanel {
                             ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use gpui_kit::{Hsla, rgb};
+    use tethys_core::automation::{
+        AutomationTest, EntryKind, TestCounts, TestEnd, TestEntry, TestEvent, TestResult, TestState,
+    };
+
+    use super::{
+        Connection, MAX_INFO_LINES, TestsState, empty_note, format_duration, in_group, keep_test,
+        ordered_entries, state_glyph, state_label, status_line,
+    };
+
+    const ROOT: &str = r"D:\dev\Game";
+
+    fn test(path: &str, file: Option<&str>) -> AutomationTest {
+        AutomationTest {
+            path: path.into(),
+            command: path.into(),
+            source: file.map(|f| (PathBuf::from(f), 1)),
+        }
+    }
+
+    fn project_test(path: &str) -> AutomationTest {
+        test(path, Some(r"D:\dev\Game\Source\Tests.cpp"))
+    }
+
+    fn engine_test(path: &str) -> AutomationTest {
+        test(path, Some(r"C:\UE\Engine\Source\Tests.cpp"))
+    }
+
+    fn passed(secs: f64) -> TestResult {
+        TestResult {
+            state: TestState::Passed,
+            duration_secs: secs,
+            entries: Vec::new(),
+        }
+    }
+
+    fn entry(kind: EntryKind, message: &str) -> TestEntry {
+        TestEntry {
+            kind,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A connected state with the project's tests listed.
+    fn connected(tests: Vec<AutomationTest>) -> TestsState {
+        let mut state = TestsState::new(PathBuf::from(ROOT));
+        state.apply(TestEvent::Connected {
+            name: "Editor".into(),
+        });
+        state.apply(TestEvent::Tests(tests));
+        state
+    }
+
+    fn catalog() -> Vec<AutomationTest> {
+        vec![
+            project_test("Project.Inventory.Accounting"),
+            project_test("Project.Inventory.Stacking"),
+            project_test("Project.Hull.Livery"),
+            engine_test("Engine.Core.Math"),
+        ]
+    }
+
+    #[test]
+    fn durations_round_before_choosing_the_unit() {
+        assert_eq!(format_duration(0.412), "412 ms");
+        assert_eq!(format_duration(0.0004), "0 ms");
+        assert_eq!(format_duration(0.9996), "1.00 s");
+        assert_eq!(format_duration(1.0), "1.00 s");
+        assert_eq!(format_duration(12.345), "12.35 s");
+    }
+
+    #[test]
+    fn states_have_a_label_and_a_glyph() {
+        let muted: Hsla = rgb(0x111111).into();
+        let running: Hsla = rgb(0x222222).into();
+        assert_eq!(state_label(TestState::NotRun), "Not run");
+        assert_eq!(state_label(TestState::Failed), "Failed");
+        assert_eq!(state_glyph(TestState::NotRun, muted, running), ("", muted));
+        assert_eq!(state_glyph(TestState::Queued, muted, running), ("○", muted));
+        assert_eq!(
+            state_glyph(TestState::Running, muted, running),
+            ("●", running)
+        );
+        assert_eq!(state_glyph(TestState::Passed, muted, running).0, "✓");
+        assert_eq!(state_glyph(TestState::Failed, muted, running).0, "✗");
+        assert_eq!(
+            state_glyph(TestState::Skipped, muted, running),
+            ("–", muted)
+        );
+    }
+
+    #[test]
+    fn keep_respects_project_only_and_the_filter() {
+        let root = Path::new(ROOT);
+        let mine = project_test("Project.Hull.Livery");
+        let theirs = engine_test("Engine.Core.Math");
+        let nowhere = test("Unknown.Test", None);
+        assert!(keep_test(&mine, true, root, ""));
+        assert!(!keep_test(&theirs, true, root, ""));
+        assert!(!keep_test(&nowhere, true, root, ""));
+        assert!(keep_test(&theirs, false, root, ""));
+        assert!(keep_test(&nowhere, false, root, ""));
+        // The filter is already lowercased; paths match case-insensitively.
+        assert!(keep_test(&mine, true, root, "hull"));
+        assert!(keep_test(&theirs, false, root, "core.math"));
+        assert!(!keep_test(&mine, true, root, "engine"));
+        assert!(!keep_test(&theirs, true, root, "engine"));
+    }
+
+    #[test]
+    fn groups_hold_their_prefix_and_not_lookalikes() {
+        assert!(in_group("A.B", "A.B"));
+        assert!(in_group("A.B.C", "A.B"));
+        assert!(in_group("A.B.C.D", "A.B"));
+        assert!(!in_group("A.BC", "A.B"));
+        assert!(!in_group("A", "A.B"));
+        assert!(!in_group("B.A.B", "A.B"));
+    }
+
+    #[test]
+    fn status_line_follows_the_connection() {
+        let none = TestCounts::default();
+        let (text, error) = status_line(&Connection::Disconnected(None), None, none);
+        assert!(text.starts_with("Not connected."));
+        assert!(!error);
+        assert_eq!(
+            status_line(&Connection::Disconnected(Some("Lost".into())), None, none),
+            ("Lost".to_string(), true)
+        );
+        assert_eq!(
+            status_line(&Connection::Connecting("Finding…".into()), None, none),
+            ("Finding…".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn status_line_counts_only_what_has_happened() {
+        let connected = Connection::Connected("Editor".into());
+        let fresh = TestCounts {
+            total: 4,
+            ..TestCounts::default()
+        };
+        assert_eq!(
+            status_line(&connected, None, fresh),
+            ("Editor · 4 tests".to_string(), false)
+        );
+        let some = TestCounts {
+            total: 4,
+            passed: 2,
+            failed: 1,
+            skipped: 0,
+            pending: 1,
+        };
+        assert_eq!(
+            status_line(&connected, Some((4, 3)), some).0,
+            "Running 3/4 · Editor · 4 tests · 2 passed · 1 failed"
+        );
+        let skipped = TestCounts { skipped: 1, ..some };
+        assert_eq!(
+            status_line(&connected, None, skipped).0,
+            "Editor · 4 tests · 2 passed · 1 failed · 1 skipped"
+        );
+    }
+
+    #[test]
+    fn problems_come_first_and_the_log_is_capped() {
+        let mut entries = vec![entry(EntryKind::Info, "first log")];
+        entries.push(entry(EntryKind::Error, "boom"));
+        entries.extend((0..MAX_INFO_LINES + 5).map(|i| entry(EntryKind::Info, &i.to_string())));
+        entries.push(entry(EntryKind::Warning, "hmm"));
+        let shown: Vec<&TestEntry> = ordered_entries(&entries).collect();
+        assert_eq!(shown[0].message, "boom");
+        assert_eq!(shown[1].message, "hmm");
+        assert_eq!(shown[2].message, "first log");
+        assert_eq!(shown.len(), 2 + MAX_INFO_LINES);
+        assert!(shown.iter().skip(2).all(|e| e.kind == EntryKind::Info));
+    }
+
+    #[test]
+    fn empty_notes_explain_why_nothing_shows() {
+        assert_eq!(empty_note(true, true, true, true), None);
+        assert_eq!(empty_note(false, false, true, true), None);
+        assert!(
+            empty_note(false, true, true, true)
+                .unwrap()
+                .starts_with("No tests are defined in this project.")
+        );
+        assert_eq!(
+            empty_note(false, true, false, true),
+            Some("No tests match.")
+        );
+        assert_eq!(
+            empty_note(false, true, true, false),
+            Some("No tests match.")
+        );
+    }
+
+    #[test]
+    fn listing_tests_opens_the_projects_groups_once() {
+        let state = connected(catalog());
+        let mut expanded: Vec<_> = state.expanded.iter().cloned().collect();
+        expanded.sort();
+        assert_eq!(expanded, ["Project", "Project.Hull", "Project.Inventory"]);
+        let labels: Vec<_> = state.rows.iter().map(|r| r.label.clone()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Project",
+                "Hull",
+                "Livery",
+                "Inventory",
+                "Accounting",
+                "Stacking"
+            ]
+        );
+
+        // A refresh keeps whatever the user has opened or closed since.
+        let mut state = state;
+        state.expanded.clear();
+        state.expanded.insert("Project".into());
+        state.apply(TestEvent::Tests(catalog()));
+        assert_eq!(state.expanded.len(), 1);
+    }
+
+    #[test]
+    fn status_only_updates_while_connecting() {
+        let mut state = TestsState::new(PathBuf::from(ROOT));
+        state.apply(TestEvent::Status("ignored".into()));
+        assert!(matches!(state.connection, Connection::Disconnected(None)));
+        state.connection = Connection::Connecting("Finding".into());
+        state.apply(TestEvent::Status(String::new()));
+        assert!(matches!(&state.connection, Connection::Connecting(s) if s == "Finding"));
+        state.apply(TestEvent::Status("Connecting".into()));
+        assert!(matches!(&state.connection, Connection::Connecting(s) if s == "Connecting"));
+    }
+
+    #[test]
+    fn a_run_counts_finishes_and_ends_with_the_run_or_the_session() {
+        let mut state = connected(catalog());
+        let targets = state.run_targets();
+        assert_eq!(targets.len(), 3, "project tests only");
+        assert!(state.start_run(&targets));
+        assert_eq!(state.run, Some((3, 0)));
+        assert!(!state.start_run(&targets), "one run at a time");
+        assert!(!TestsState::new(PathBuf::from(ROOT)).start_run(&[]));
+
+        state.apply(TestEvent::Started("Project.Hull.Livery".into()));
+        state.apply(TestEvent::Finished(
+            "Project.Hull.Livery".into(),
+            passed(0.5),
+        ));
+        assert_eq!(state.run, Some((3, 1)));
+        state.apply(TestEvent::RunEnded { stopped: true });
+        assert_eq!(state.run, None);
+        assert!(matches!(state.connection, Connection::Connected(_)));
+
+        assert!(state.start_run(&targets));
+        state.apply(TestEvent::Ended(TestEnd::Failed("editor quit".into())));
+        assert_eq!(state.run, None);
+        assert!(
+            matches!(&state.connection, Connection::Disconnected(Some(e)) if e == "editor quit")
+        );
+        state.apply(TestEvent::Ended(TestEnd::Disconnected));
+        assert!(matches!(state.connection, Connection::Disconnected(None)));
+    }
+
+    #[test]
+    fn run_targets_follow_the_selection_and_the_filter() {
+        let mut state = connected(catalog());
+        state.selected = Some("Project.Inventory".into());
+        let paths: Vec<_> = state.run_targets().into_iter().map(|t| t.path).collect();
+        assert_eq!(
+            paths,
+            ["Project.Inventory.Accounting", "Project.Inventory.Stacking"]
+        );
+        state.set_filter("  STACK ");
+        assert_eq!(state.filter_text, "stack");
+        let paths: Vec<_> = state.run_targets().into_iter().map(|t| t.path).collect();
+        assert_eq!(paths, ["Project.Inventory.Stacking"]);
+
+        state.selected = None;
+        state.set_filter("");
+        state.set_project_only(false);
+        assert_eq!(state.run_targets().len(), 4);
+        assert_eq!(state.group_counts("Project.Inventory").total, 2);
+        assert_eq!(state.group_counts("Engine").total, 1);
+    }
+
+    #[test]
+    fn clicking_a_group_toggles_it_and_clicking_anything_selects_it() {
+        let mut state = connected(catalog());
+        // Row 1 is the open Hull group.
+        state.click_row(1);
+        assert_eq!(state.selected.as_deref(), Some("Project.Hull"));
+        assert!(!state.expanded.contains("Project.Hull"));
+        let labels: Vec<_> = state.rows.iter().map(|r| r.label.clone()).collect();
+        assert_eq!(
+            labels,
+            ["Project", "Hull", "Inventory", "Accounting", "Stacking"]
+        );
+        state.click_row(1);
+        assert!(state.expanded.contains("Project.Hull"));
+        state.click_row(4);
+        assert_eq!(
+            state.selected.as_deref(),
+            Some("Project.Inventory.Accounting")
+        );
+        assert_eq!(state.rows.len(), 6);
+        state.click_row(99);
+        assert_eq!(
+            state.selected.as_deref(),
+            Some("Project.Inventory.Accounting")
+        );
+    }
+
+    #[test]
+    fn the_list_explains_itself_when_filtered_to_nothing() {
+        let mut state = connected(vec![engine_test("Engine.Core.Math")]);
+        assert!(
+            state
+                .empty_note()
+                .unwrap()
+                .starts_with("No tests are defined")
+        );
+        state.set_project_only(false);
+        assert_eq!(state.empty_note(), None);
+        state.set_filter("nothing");
+        assert_eq!(state.empty_note(), Some("No tests match."));
     }
 }

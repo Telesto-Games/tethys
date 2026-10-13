@@ -2,7 +2,7 @@
 //! breakpoint list. It only draws what the workspace hands it and reports
 //! clicks back; the workspace owns the debug session.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::base::Disableable;
 use gpui_kit::component::ActiveTheme;
@@ -60,6 +60,65 @@ pub enum DebugPanelEvent {
     OpenFrame(usize),
     OpenBreakpoint(PathBuf, u32),
     RemoveBreakpoint(BreakpointId),
+}
+
+/// How a piece of status text is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Muted,
+    Normal,
+    /// The accent: something to look at.
+    Primary,
+    Danger,
+}
+
+/// The toolbar for a status: its text and which controls are live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolbarState {
+    text: String,
+    tone: Tone,
+    continue_enabled: bool,
+    pause_enabled: bool,
+    /// Detach replaces Debug while attached.
+    show_detach: bool,
+    attach_enabled: bool,
+}
+
+fn toolbar_state(status: &DebugStatus) -> ToolbarState {
+    let (text, tone) = match status {
+        DebugStatus::Detached => ("Not attached".to_string(), Tone::Muted),
+        DebugStatus::Attaching => ("Starting the debugger…".to_string(), Tone::Muted),
+        DebugStatus::Running => ("Running".to_string(), Tone::Normal),
+        DebugStatus::Stopped(reason) => (format!("Stopped: {reason}"), Tone::Primary),
+    };
+    let stopped = matches!(status, DebugStatus::Stopped(_));
+    ToolbarState {
+        text,
+        tone,
+        continue_enabled: stopped,
+        pause_enabled: *status == DebugStatus::Running,
+        show_detach: stopped || *status == DebugStatus::Running,
+        attach_enabled: *status != DebugStatus::Attaching,
+    }
+}
+
+/// A breakpoint's state as the list shows it.
+fn breakpoint_state_label(state: &BreakpointState) -> (String, Tone) {
+    match state {
+        BreakpointState::Unset => ("not attached".to_string(), Tone::Muted),
+        BreakpointState::Bound => ("set".to_string(), Tone::Normal),
+        BreakpointState::Pending => ("waiting for its module".to_string(), Tone::Muted),
+        BreakpointState::Failed(e) => (e.clone(), Tone::Danger),
+    }
+}
+
+/// `File.cpp:42`: a file's name and a 1-based line.
+pub(crate) fn file_line_label(file: &Path, line: u32) -> String {
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{name}:{line}")
 }
 
 pub struct DebugPanel {
@@ -145,18 +204,16 @@ impl DebugPanel {
         let muted = theme.muted_foreground;
         let danger = theme.danger;
         let hover = theme.secondary_hover;
+        let tone_color = |tone: Tone| match tone {
+            Tone::Muted => muted,
+            Tone::Normal => theme.foreground,
+            Tone::Primary => theme.primary,
+            Tone::Danger => danger,
+        };
         let rows = self.view.breakpoints.iter().map(|b| {
-            let (state, color) = match &b.state {
-                BreakpointState::Unset => ("not attached".to_string(), muted),
-                BreakpointState::Bound => ("set".to_string(), theme.foreground),
-                BreakpointState::Pending => ("waiting for its module".to_string(), muted),
-                BreakpointState::Failed(e) => (e.clone(), danger),
-            };
-            let name = b
-                .file
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let (state, tone) = breakpoint_state_label(&b.state);
+            let color = tone_color(tone);
+            let label = file_line_label(&b.file, b.line);
             let (file, line, id) = (b.file.clone(), b.line, b.id);
             div()
                 .flex()
@@ -175,7 +232,7 @@ impl DebugPanel {
                         .gap_2()
                         .py_0p5()
                         .cursor_pointer()
-                        .child(div().flex_none().child(format!("{name}:{line}")))
+                        .child(div().flex_none().child(label))
                         .child(div().min_w_0().truncate().text_color(color).child(state))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(DebugPanelEvent::OpenBreakpoint(file.clone(), line));
@@ -262,17 +319,13 @@ impl Focusable for DebugPanel {
 impl Render for DebugPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let status = &self.view.status;
-        let (text, color) = match status {
-            DebugStatus::Detached => ("Not attached".to_string(), theme.muted_foreground),
-            DebugStatus::Attaching => {
-                ("Starting the debugger…".to_string(), theme.muted_foreground)
-            }
-            DebugStatus::Running => ("Running".to_string(), theme.foreground),
-            DebugStatus::Stopped(reason) => (format!("Stopped: {reason}"), theme.primary),
+        let bar = toolbar_state(&self.view.status);
+        let color = match bar.tone {
+            Tone::Muted => theme.muted_foreground,
+            Tone::Normal => theme.foreground,
+            Tone::Primary => theme.primary,
+            Tone::Danger => theme.danger,
         };
-        let attached = matches!(status, DebugStatus::Running | DebugStatus::Stopped(_));
-        let stopped = matches!(status, DebugStatus::Stopped(_));
 
         let toolbar = div()
             .flex()
@@ -289,7 +342,7 @@ impl Render for DebugPanel {
                     .flex()
                     .gap_2()
                     .text_sm()
-                    .child(div().truncate().text_color(color).child(text))
+                    .child(div().truncate().text_color(color).child(bar.text.clone()))
                     .children(self.view.process.clone().map(|p| {
                         div()
                             .flex_none()
@@ -304,7 +357,7 @@ impl Render for DebugPanel {
                     .primary()
                     .label("Continue")
                     .tooltip("Continue (F5)")
-                    .disabled(!stopped)
+                    .disabled(!bar.continue_enabled)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DebugPanelEvent::Continue))),
             )
             .child(
@@ -312,10 +365,10 @@ impl Render for DebugPanel {
                     .xsmall()
                     .outline()
                     .label("Pause")
-                    .disabled(*status != DebugStatus::Running)
+                    .disabled(!bar.pause_enabled)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DebugPanelEvent::Pause))),
             )
-            .child(if attached {
+            .child(if bar.show_detach {
                 Button::new("detach")
                     .xsmall()
                     .outline()
@@ -330,7 +383,7 @@ impl Render for DebugPanel {
                     .tooltip(
                         "Attach to this project's editor, or launch it under the debugger (F5)",
                     )
-                    .disabled(*status == DebugStatus::Attaching)
+                    .disabled(!bar.attach_enabled)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DebugPanelEvent::Attach)))
             });
 
@@ -362,5 +415,83 @@ impl Render for DebugPanel {
                             .child(self.render_breakpoints(cx)),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tethys_core::debug::BreakpointState;
+
+    use super::{DebugStatus, Tone, breakpoint_state_label, file_line_label, toolbar_state};
+
+    #[test]
+    fn detached_offers_only_debug() {
+        let bar = toolbar_state(&DebugStatus::Detached);
+        assert_eq!(bar.text, "Not attached");
+        assert_eq!(bar.tone, Tone::Muted);
+        assert!(!bar.continue_enabled);
+        assert!(!bar.pause_enabled);
+        assert!(!bar.show_detach);
+        assert!(bar.attach_enabled);
+    }
+
+    #[test]
+    fn attaching_disables_debug_until_it_is_done() {
+        let bar = toolbar_state(&DebugStatus::Attaching);
+        assert_eq!(bar.text, "Starting the debugger…");
+        assert!(!bar.attach_enabled);
+        assert!(!bar.show_detach);
+        assert!(!bar.continue_enabled && !bar.pause_enabled);
+    }
+
+    #[test]
+    fn running_can_pause_or_detach() {
+        let bar = toolbar_state(&DebugStatus::Running);
+        assert_eq!((bar.text.as_str(), bar.tone), ("Running", Tone::Normal));
+        assert!(bar.pause_enabled);
+        assert!(!bar.continue_enabled);
+        assert!(bar.show_detach);
+    }
+
+    #[test]
+    fn stopped_can_continue_or_detach() {
+        let bar = toolbar_state(&DebugStatus::Stopped("Breakpoint at A.cpp:3".into()));
+        assert_eq!(bar.text, "Stopped: Breakpoint at A.cpp:3");
+        assert_eq!(bar.tone, Tone::Primary);
+        assert!(bar.continue_enabled);
+        assert!(!bar.pause_enabled);
+        assert!(bar.show_detach);
+    }
+
+    #[test]
+    fn breakpoint_states_read_as_words_and_failures_as_their_error() {
+        assert_eq!(
+            breakpoint_state_label(&BreakpointState::Unset),
+            ("not attached".into(), Tone::Muted)
+        );
+        assert_eq!(
+            breakpoint_state_label(&BreakpointState::Bound),
+            ("set".into(), Tone::Normal)
+        );
+        assert_eq!(
+            breakpoint_state_label(&BreakpointState::Pending),
+            ("waiting for its module".into(), Tone::Muted)
+        );
+        assert_eq!(
+            breakpoint_state_label(&BreakpointState::Failed("no symbols".into())),
+            ("no symbols".into(), Tone::Danger)
+        );
+    }
+
+    #[test]
+    fn file_line_labels_use_the_file_name_only() {
+        assert_eq!(
+            file_line_label(Path::new(r"D:\dev\Game\Source\A.cpp"), 42),
+            "A.cpp:42"
+        );
+        assert_eq!(file_line_label(Path::new("B.h"), 1), "B.h:1");
+        assert_eq!(file_line_label(Path::new(""), 7), ":7");
     }
 }

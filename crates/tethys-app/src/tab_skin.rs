@@ -363,21 +363,14 @@ impl Tabs {
             return None;
         }
         let open = area.is_dock_open(placement);
-        let icon = match (placement, open) {
-            (DockPlacement::Left, true) => IconName::PanelLeft,
-            (DockPlacement::Left, false) => IconName::PanelLeftOpen,
-            (DockPlacement::Right, true) => IconName::PanelRight,
-            (DockPlacement::Right, false) => IconName::PanelRightOpen,
-            (_, true) => IconName::PanelBottom,
-            (_, false) => IconName::PanelBottomOpen,
-        };
+        let (icon, tooltip) = dock_toggle_icon(placement, open);
         Some(
             Button::new(SharedString::from(format!("dock-toggle:{placement:?}")))
                 .icon(icon)
                 .xsmall()
                 .ghost()
                 .tab_stop(false)
-                .tooltip(if open { "Collapse" } else { "Expand" })
+                .tooltip(tooltip)
                 .on_click(move |_, window, cx| {
                     handle.update(cx, |area, cx| area.toggle_dock(placement, window, cx));
                 }),
@@ -397,27 +390,16 @@ impl Tabs {
             theme.tokens.drop_target,
         );
 
-        // Terminal sessions first, then files, each in tab order, with a
-        // divider between them. `None` marks the divider.
-        let (sessions, files): (Vec<usize>, Vec<usize>) = group
-            .panels()
-            .iter()
-            .enumerate()
-            .filter(|(_, panel)| panel.visible(cx))
-            .map(|(ix, _)| ix)
-            .partition(|ix| group.panels()[*ix].panel_name(cx) == SESSION_PANEL_NAME);
-        let divided = !sessions.is_empty() && !files.is_empty();
-        let rows: Vec<Option<usize>> = sessions
-            .into_iter()
-            .map(Some)
-            .chain(divided.then_some(None))
-            .chain(files.into_iter().map(Some))
-            .collect();
+        let rows = side_rows(group.panels().iter().map(|panel| {
+            (
+                panel.visible(cx),
+                panel.panel_name(cx) == SESSION_PANEL_NAME,
+            )
+        }));
         let active_ix = group.active_ix();
         let shown = group.active_panel().map(|panel| panel.panel_id(cx));
-        if self.last_active_ix.replace(Some(active_ix)) != Some(active_ix)
-            && let Some(pos) = rows.iter().position(|row| *row == Some(active_ix))
-        {
+        let last = self.last_active_ix.replace(Some(active_ix));
+        if let Some(pos) = scroll_target(last, active_ix, &rows) {
             self.scroll.scroll_to_item(pos);
         }
         let droppable = group.is_droppable();
@@ -702,6 +684,53 @@ fn tab_name(panel: &Arc<dyn BasePanelView>, cx: &App) -> SharedString {
         .unwrap_or_else(|| panel.panel_name(cx).into())
 }
 
+/// The side list's rows for a group's panels, given each panel's
+/// `(visible, is_session)`: sessions first, then files, each in tab order,
+/// with a divider (`None`) between the two when both are present. Hidden
+/// panels get no row.
+fn side_rows(panels: impl Iterator<Item = (bool, bool)>) -> Vec<Option<usize>> {
+    let (mut sessions, mut files) = (Vec::new(), Vec::new());
+    for (ix, (visible, is_session)) in panels.enumerate() {
+        if !visible {
+            continue;
+        }
+        if is_session {
+            sessions.push(ix);
+        } else {
+            files.push(ix);
+        }
+    }
+    let divided = !sessions.is_empty() && !files.is_empty();
+    sessions
+        .into_iter()
+        .map(Some)
+        .chain(divided.then_some(None))
+        .chain(files.into_iter().map(Some))
+        .collect()
+}
+
+/// The row to scroll into view when the active tab changed: its position in
+/// `rows`, if it has one. `last` is the previously active tab.
+fn scroll_target(last: Option<usize>, active: usize, rows: &[Option<usize>]) -> Option<usize> {
+    if last == Some(active) {
+        return None;
+    }
+    rows.iter().position(|row| *row == Some(active))
+}
+
+/// A dock's collapse button: the icon for its side and state, and the tooltip.
+fn dock_toggle_icon(placement: DockPlacement, open: bool) -> (IconName, &'static str) {
+    let icon = match (placement, open) {
+        (DockPlacement::Left, true) => IconName::PanelLeft,
+        (DockPlacement::Left, false) => IconName::PanelLeftOpen,
+        (DockPlacement::Right, true) => IconName::PanelRight,
+        (DockPlacement::Right, false) => IconName::PanelRightOpen,
+        (_, true) => IconName::PanelBottom,
+        (_, false) => IconName::PanelBottomOpen,
+    };
+    (icon, if open { "Collapse" } else { "Expand" })
+}
+
 /// What follows the pointer while a tab is dragged by this skin.
 struct DragPreview {
     name: SharedString,
@@ -718,5 +747,89 @@ impl Render for DragPreview {
             .border_1()
             .border_color(cx.theme().drag_border)
             .child(self.name.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::component::IconName;
+    use gpui_kit::component::dock::DockPlacement;
+
+    use super::{dock_toggle_icon, scroll_target, side_rows};
+
+    #[test]
+    fn side_rows_put_sessions_first_with_a_divider() {
+        // (visible, is_session), in tab order.
+        let panels = [
+            (true, false),
+            (true, true),
+            (false, true),
+            (true, false),
+            (true, true),
+        ];
+        assert_eq!(
+            side_rows(panels.into_iter()),
+            [Some(1), Some(4), None, Some(0), Some(3)]
+        );
+    }
+
+    #[test]
+    fn side_rows_omit_the_divider_when_one_group_is_empty() {
+        assert_eq!(
+            side_rows([(true, true), (true, true)].into_iter()),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            side_rows([(true, false), (false, true)].into_iter()),
+            [Some(0)]
+        );
+        assert!(side_rows(std::iter::empty()).is_empty());
+        assert!(side_rows([(false, true), (false, false)].into_iter()).is_empty());
+    }
+
+    #[test]
+    fn scrolls_to_the_active_row_only_when_it_changes() {
+        let rows = [Some(2), None, Some(0), Some(1)];
+        assert_eq!(scroll_target(None, 1, &rows), Some(3));
+        assert_eq!(scroll_target(Some(0), 2, &rows), Some(0));
+        assert_eq!(scroll_target(Some(1), 1, &rows), None);
+        // A hidden active tab has no row.
+        assert_eq!(scroll_target(None, 7, &rows), None);
+    }
+
+    #[test]
+    fn dock_toggles_show_their_side_and_state() {
+        let toggle = |placement, open| {
+            let (icon, tooltip) = dock_toggle_icon(placement, open);
+            (icon, tooltip)
+        };
+        assert!(matches!(
+            toggle(DockPlacement::Left, true),
+            (IconName::PanelLeft, "Collapse")
+        ));
+        assert!(matches!(
+            toggle(DockPlacement::Left, false),
+            (IconName::PanelLeftOpen, "Expand")
+        ));
+        assert!(matches!(
+            toggle(DockPlacement::Right, true),
+            (IconName::PanelRight, "Collapse")
+        ));
+        assert!(matches!(
+            toggle(DockPlacement::Right, false),
+            (IconName::PanelRightOpen, "Expand")
+        ));
+        assert!(matches!(
+            toggle(DockPlacement::Bottom, true),
+            (IconName::PanelBottom, "Collapse")
+        ));
+        assert!(matches!(
+            toggle(DockPlacement::Bottom, false),
+            (IconName::PanelBottomOpen, "Expand")
+        ));
+        assert!(matches!(
+            toggle(DockPlacement::Center, false),
+            (IconName::PanelBottomOpen, "Expand")
+        ));
     }
 }

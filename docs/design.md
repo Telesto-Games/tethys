@@ -224,6 +224,14 @@ Three crates is the minimum that lets Cargo enforce "core depends on nothing".
   want opencode over ACP. The port is designed so that adding it later is cheap, but we don't
   build it ahead of time.
 - Test the core with fake adapters, without any UI or processes.
+- Test the app too. Views keep their decisions in plain functions or plain state structs
+  (`TestsState`, `Debug::apply`, `row_status`, `cell_style`, …) that unit tests call with data;
+  the GPUI entity is a thin shell that renders them and forwards events. Where the behaviour
+  is the interaction itself, `#[gpui_kit::test]` renders the real view in a headless window
+  (`test_support.rs` sets the app up as `main` does, with the config in a temp dir) and clicks
+  elements by id (`themes_ui::view_tests`). A plain element that a test must find gets
+  `.test_support()`, a no-op outside tests. Test modules import names explicitly: a glob of
+  `gpui_kit` brings in its `test` attribute macro and the `#[test]` expansion recurses.
 
 ### Terminal adapter notes
 

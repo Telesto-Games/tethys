@@ -22,12 +22,14 @@ const STARTUP_DELAY: Duration = Duration::from_secs(5);
 /// The running version. `TETHYS_PRETEND_VERSION=0.0.1` overrides it, to try
 /// an update against a real release.
 pub fn current_version() -> Version {
-    std::env::var("TETHYS_PRETEND_VERSION")
-        .ok()
-        .and_then(|v| Version::parse(&v))
-        .unwrap_or_else(|| {
-            Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate version is a version")
-        })
+    version_override(std::env::var("TETHYS_PRETEND_VERSION").ok()).unwrap_or_else(|| {
+        Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate version is a version")
+    })
+}
+
+/// The version `TETHYS_PRETEND_VERSION` asks for, if it names one.
+fn version_override(pretend: Option<String>) -> Option<Version> {
+    pretend.and_then(|v| Version::parse(&v))
 }
 
 /// Whether the quiet startup check should run, once per process. Off in
@@ -35,9 +37,17 @@ pub fn current_version() -> Version {
 /// `TETHYS_NO_UPDATE_CHECK` is set.
 pub fn claim_startup_check() -> bool {
     static CLAIMED: AtomicBool = AtomicBool::new(false);
-    let enabled = std::env::var_os("TETHYS_NO_UPDATE_CHECK").is_none()
-        && (!cfg!(debug_assertions) || std::env::var_os("TETHYS_PRETEND_VERSION").is_some());
+    let enabled = startup_check_enabled(
+        std::env::var_os("TETHYS_NO_UPDATE_CHECK").is_some(),
+        std::env::var_os("TETHYS_PRETEND_VERSION").is_some(),
+        cfg!(debug_assertions),
+    );
     enabled && !CLAIMED.swap(true, Ordering::Relaxed)
+}
+
+/// See [`claim_startup_check`].
+fn startup_check_enabled(no_check_set: bool, pretend_set: bool, debug_build: bool) -> bool {
+    !no_check_set && (!debug_build || pretend_set)
 }
 
 pub fn startup_delay() -> Duration {
@@ -63,27 +73,12 @@ pub fn check(manual: bool, project: Option<PathBuf>, window: &mut Window, cx: &m
         .spawn(async move { source.latest() });
     window
         .spawn(cx, async move |cx| {
-            let stage = match latest.await {
-                Ok(Some(release))
-                    if update::should_offer(current_version(), &release, skipped, manual) =>
-                {
-                    Stage::Available(release)
+            let stage = stage_for(latest.await, current_version(), skipped, manual);
+            if !surfaces(manual, &stage) {
+                if let Stage::Failed { error, .. } = &stage {
+                    eprintln!("tethys: update check failed: {error}");
                 }
-                Ok(_) => Stage::UpToDate,
-                Err(e) => Stage::Failed {
-                    error: e.to_string(),
-                    release: None,
-                },
-            };
-            if !manual {
-                match &stage {
-                    Stage::Available(_) => {}
-                    Stage::Failed { error, .. } => {
-                        eprintln!("tethys: update check failed: {error}");
-                        return;
-                    }
-                    _ => return,
-                }
+                return;
             }
             let _ = cx.update(|window, cx| {
                 flow.update(cx, |flow, cx| {
@@ -99,11 +94,38 @@ pub fn check(manual: bool, project: Option<PathBuf>, window: &mut Window, cx: &m
         .detach();
 }
 
+/// What a check found: a release worth offering (see `update::should_offer`),
+/// nothing newer, or a failure.
+fn stage_for(
+    latest: Result<Option<Release>, PortError>,
+    current: Version,
+    skipped: Option<Version>,
+    manual: bool,
+) -> Stage {
+    match latest {
+        Ok(Some(release)) if update::should_offer(current, &release, skipped, manual) => {
+            Stage::Available(release)
+        }
+        Ok(_) => Stage::UpToDate,
+        Err(e) => Stage::Failed {
+            error: e.to_string(),
+            release: None,
+        },
+    }
+}
+
+/// Whether a check's result opens the dialog: a manual check always shows
+/// what it found; a quiet one only an update to offer.
+fn surfaces(manual: bool, stage: &Stage) -> bool {
+    manual || matches!(stage, Stage::Available(_))
+}
+
 pub struct UpdateFlow {
     stage: Stage,
     project: Option<PathBuf>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Stage {
     Checking,
     UpToDate,
@@ -262,4 +284,88 @@ fn install(flow: Entity<UpdateFlow>, window: &mut Window, cx: &mut App) {
             });
         })
         .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use tethys_core::ports::PortError;
+    use tethys_core::update::{Release, Version};
+
+    use super::{Stage, stage_for, startup_check_enabled, surfaces, version_override};
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
+    fn release(version: &str) -> Release {
+        Release {
+            version: v(version),
+            notes: String::new(),
+            page_url: String::new(),
+            exe_url: String::new(),
+            sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_newer_release_is_available_unless_skipped() {
+        let current = v("0.4.0");
+        assert_eq!(
+            stage_for(Ok(Some(release("0.5.0"))), current, None, false),
+            Stage::Available(release("0.5.0"))
+        );
+        assert_eq!(
+            stage_for(Ok(Some(release("0.4.0"))), current, None, false),
+            Stage::UpToDate
+        );
+        assert_eq!(stage_for(Ok(None), current, None, true), Stage::UpToDate);
+        // A skipped version is up to date quietly, but offered when asked.
+        assert_eq!(
+            stage_for(Ok(Some(release("0.5.0"))), current, Some(v("0.5.0")), false),
+            Stage::UpToDate
+        );
+        assert_eq!(
+            stage_for(Ok(Some(release("0.5.0"))), current, Some(v("0.5.0")), true),
+            Stage::Available(release("0.5.0"))
+        );
+        let failed: Result<Option<Release>, PortError> = Err("no network".into());
+        assert_eq!(
+            stage_for(failed, current, None, false),
+            Stage::Failed {
+                error: "no network".into(),
+                release: None
+            }
+        );
+    }
+
+    #[test]
+    fn quiet_checks_only_surface_an_update() {
+        let failed = Stage::Failed {
+            error: String::new(),
+            release: None,
+        };
+        assert!(surfaces(false, &Stage::Available(release("1.0.0"))));
+        assert!(!surfaces(false, &Stage::UpToDate));
+        assert!(!surfaces(false, &failed));
+        assert!(surfaces(true, &Stage::UpToDate));
+        assert!(surfaces(true, &failed));
+    }
+
+    #[test]
+    fn startup_check_rules() {
+        // Release build: on unless opted out.
+        assert!(startup_check_enabled(false, false, false));
+        assert!(!startup_check_enabled(true, false, false));
+        // Debug build: only when pretending to be an old version.
+        assert!(!startup_check_enabled(false, false, true));
+        assert!(startup_check_enabled(false, true, true));
+        assert!(!startup_check_enabled(true, true, true));
+    }
+
+    #[test]
+    fn pretend_version_must_parse() {
+        assert_eq!(version_override(None), None);
+        assert_eq!(version_override(Some("0.0.1".into())), Some(v("0.0.1")));
+        assert_eq!(version_override(Some("latest".into())), None);
+    }
 }

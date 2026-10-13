@@ -3,6 +3,7 @@
 //! a font (`ThemeSpec`); the built-in Telesto theme can be copied but not
 //! changed. Themes live in `state.toml`.
 
+use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::WindowExt;
@@ -10,7 +11,6 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::color_picker::{ColorPickerState, ColorSelect};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::base::TestSupportExt;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use tethys_core::ports::ConfigStore;
@@ -609,7 +609,10 @@ mod view_tests {
         // Back to the built-in row (row 0), then to the copy (row 1).
         click_row(&fixture, 0, cx);
         assert_eq!(state(&fixture, cx, |e, _| e.selected), None);
-        assert_eq!(state(&fixture, cx, |e, _| e.themes[0].name.clone()), "Night");
+        assert_eq!(
+            state(&fixture, cx, |e, _| e.themes[0].name.clone()),
+            "Night"
+        );
         click_row(&fixture, 1, cx);
         assert_eq!(state(&fixture, cx, |e, _| e.selected), Some(0));
         assert_eq!(
