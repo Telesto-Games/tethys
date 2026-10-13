@@ -1,7 +1,9 @@
 //! `SourceControl` for Subversion, through the `svn` command-line client.
 //!
-//! Read-only: `svn status --xml` and `svn cat -r BASE` only. `-r BASE` reads
-//! the working copy's pristine copy, so neither command touches the network.
+//! Status and diffs use `svn status --xml` and `svn cat -r BASE`. `-r BASE`
+//! reads the working copy's pristine copy, so neither touches the network.
+//! History (`svn log`, `svn cat -r N`) asks the repository. The only changes
+//! made are `svn move` and `svn delete`, when the user renames or deletes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -9,7 +11,7 @@ use std::process::{Command, Output};
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use tethys_core::ports::{PortResult, SourceControl};
-use tethys_core::scm::{ChangeKind, FileStatus, LastChange, WorkingCopyInfo};
+use tethys_core::scm::{ChangeKind, Commit, FileStatus, LastChange, WorkingCopyInfo};
 
 #[derive(Debug, Clone)]
 pub struct Subversion {
@@ -82,7 +84,8 @@ impl SourceControl for Subversion {
 
     fn status(&self, root: &Path) -> PortResult<Vec<FileStatus>> {
         let target = svn_path(root);
-        let out = self.run(&["status", "--xml", &target])?;
+        // `--no-ignore` reports ignored items too, so the tree can mark them.
+        let out = self.run(&["status", "--xml", "--no-ignore", &target])?;
         if !out.status.success() {
             return Err(format!(
                 "svn status failed: {}",
@@ -111,6 +114,162 @@ impl SourceControl for Subversion {
         }
         Err(format!("svn cat failed: {}", stderr.trim()).into())
     }
+
+    fn is_versioned(&self, path: &Path) -> PortResult<bool> {
+        let target = svn_path(path);
+        let out = self.run(&["info", "--xml", &target])?;
+        if out.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Not under version control (W155010), reported as E200009.
+        if ["W155010", "E200009"]
+            .iter()
+            .any(|code| stderr.contains(code))
+        {
+            return Ok(false);
+        }
+        Err(format!("svn info failed: {}", stderr.trim()).into())
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> PortResult<()> {
+        let (from, to) = (svn_path(from), svn_target(to));
+        self.checked(&["move", "-q", &from, &to])
+    }
+
+    fn delete(&self, path: &Path) -> PortResult<()> {
+        let target = svn_path(path);
+        self.checked(&["delete", "-q", "--force", &target])
+    }
+
+    fn history(&self, file: &Path, limit: usize) -> PortResult<Vec<Commit>> {
+        let (target, limit) = (svn_path(file), limit.to_string());
+        let out = self.run(&["log", "--xml", "-l", &limit, &target])?;
+        if !out.status.success() {
+            return Err(format!(
+                "svn log failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn change(&self, file: &Path, commit: &Commit) -> PortResult<(Option<String>, Option<String>)> {
+        let revision: u64 = commit
+            .revision
+            .parse()
+            .map_err(|_| format!("{} isn't a Subversion revision", commit.revision))?;
+        // Pegged at BASE, svn follows the file back through renames.
+        let target = format!("{}@BASE", file.display());
+        let text = |revision: u64| -> PortResult<Option<String>> {
+            let revision = revision.to_string();
+            let out = self.run(&["cat", "-r", &revision, &target])?;
+            if out.status.success() {
+                return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // The file didn't exist at that revision.
+            if ["E195012", "E160013", "W160013"]
+                .iter()
+                .any(|code| stderr.contains(code))
+            {
+                return Ok(None);
+            }
+            Err(format!("svn cat failed: {}", stderr.trim()).into())
+        };
+        Ok((text(revision - 1)?, text(revision)?))
+    }
+}
+
+impl Subversion {
+    /// Runs a command that must succeed.
+    fn checked(&self, args: &[&str]) -> PortResult<()> {
+        let out = self.run(args)?;
+        if !out.status.success() {
+            return Err(format!(
+                "svn {} failed: {}",
+                args.first().unwrap_or(&""),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+/// A destination path: svn refuses a peg revision there, so `@` is only
+/// escaped when the name has one.
+fn svn_target(path: &Path) -> String {
+    let path = path.display().to_string();
+    if path.contains('@') {
+        format!("{path}@")
+    } else {
+        path
+    }
+}
+
+/// Parses `svn log --xml`.
+pub fn parse_log(xml: &str) -> PortResult<Vec<Commit>> {
+    let mut reader = Reader::from_str(xml);
+    let mut commits = Vec::new();
+    let mut commit: Option<Commit> = None;
+    let mut current = String::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(e) => {
+                let name = e.name().as_ref().to_string();
+                if name == "logentry" {
+                    commit = Some(Commit {
+                        revision: attribute(&e, "revision")?.unwrap_or_default(),
+                        author: String::new(),
+                        date: String::new(),
+                        message: String::new(),
+                        locator: String::new(),
+                    });
+                }
+                current = name;
+            }
+            Event::Text(t) => {
+                if let Some(commit) = commit.as_mut() {
+                    let text = t.xml10_content().into_owned();
+                    match current.as_str() {
+                        "author" => commit.author.push_str(&text),
+                        "date" => commit.date.push_str(&text),
+                        "msg" => commit.message.push_str(&text),
+                        _ => {}
+                    }
+                }
+            }
+            Event::GeneralRef(r) => {
+                // An entity in the message text, e.g. `&amp;`.
+                if let (Some(commit), "msg") = (commit.as_mut(), current.as_str())
+                    && let Some(c) = r.resolve_char_ref()?.or_else(|| match r.as_ref() {
+                        "amp" => Some('&'),
+                        "lt" => Some('<'),
+                        "gt" => Some('>'),
+                        "quot" => Some('"'),
+                        "apos" => Some('\''),
+                        _ => None,
+                    })
+                {
+                    commit.message.push(c);
+                }
+            }
+            Event::End(e) => {
+                if e.name().as_ref() == "logentry"
+                    && let Some(mut commit) = commit.take()
+                {
+                    commit.message = commit.message.trim().to_string();
+                    commits.push(commit);
+                }
+                current.clear();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(commits)
 }
 
 /// Parses `svn info --xml` for the first entry.
@@ -231,7 +390,8 @@ fn change_kind(item: &str) -> Option<ChangeKind> {
         "replaced" => ChangeKind::Replaced,
         "conflicted" => ChangeKind::Conflicted,
         "unversioned" => ChangeKind::Unversioned,
-        // normal, ignored, external, incomplete, obstructed, none
+        "ignored" => ChangeKind::Ignored,
+        // normal, external, incomplete, obstructed, none
         _ => return None,
     })
 }
@@ -257,6 +417,9 @@ mod tests {
 </entry>
 <entry path="D:\p\Source\Ext">
 <wc-status props="none" item="external"></wc-status>
+</entry>
+<entry path="D:\p\Intermediate">
+<wc-status props="none" item="ignored"></wc-status>
 </entry>
 </target>
 </status>"#;
@@ -307,6 +470,7 @@ mod tests {
                     r"D:\p\Source\New & Shiny.cpp".to_string(),
                     ChangeKind::Added
                 ),
+                (r"D:\p\Intermediate".to_string(), ChangeKind::Ignored),
             ]
         );
     }
@@ -367,6 +531,101 @@ mod tests {
             &["add", "-q", wc.join("added.txt").to_str().unwrap()],
         );
         assert_eq!(svn.base_text(&wc.join("added.txt")).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parses_log_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<log>
+<logentry revision="12">
+<author>chris</author>
+<date>2026-10-13T09:00:00.000000Z</date>
+<msg>Fix &amp; tidy
+second line</msg>
+</logentry>
+<logentry revision="3">
+<author>sam</author>
+<date>2026-10-01T09:00:00.000000Z</date>
+<msg></msg>
+</logentry>
+</log>"#;
+        let log = parse_log(xml).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].revision, "12");
+        assert_eq!(log[0].author, "chris");
+        assert_eq!(log[0].message, "Fix & tidy\nsecond line");
+        assert_eq!(log[1].revision, "3");
+        assert_eq!(log[1].message, "");
+    }
+
+    /// Rename, history, a commit's change and delete, against a scratch
+    /// repository when svn and svnadmin exist.
+    #[test]
+    fn edits_and_history_against_a_real_repository() {
+        let svn = Subversion::new();
+        let svnadmin_ok = Command::new("svnadmin")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !svn.is_available() || !svnadmin_ok {
+            eprintln!("svn/svnadmin not found; skipping");
+            return;
+        }
+
+        let base = std::env::temp_dir().join(format!("tethys-svn-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let wc = base.join("wc");
+        std::fs::create_dir_all(&base).unwrap();
+        let run = |program: &str, args: &[&str]| {
+            let out = Command::new(program).args(args).output().unwrap();
+            assert!(out.status.success(), "{program} {args:?}: {out:?}");
+        };
+        let wc_arg = wc.to_str().unwrap();
+        run("svnadmin", &["create", repo.to_str().unwrap()]);
+        let url = format!("file:///{}", repo.display().to_string().replace('\\', "/"));
+        run("svn", &["checkout", "-q", &url, wc_arg]);
+        std::fs::write(wc.join("a.txt"), "one\n").unwrap();
+        run("svn", &["add", "-q", wc.join("a.txt").to_str().unwrap()]);
+        run("svn", &["commit", "-q", "-m", "add a", wc_arg]);
+        std::fs::write(wc.join("a.txt"), "one\ntwo\n").unwrap();
+        run("svn", &["commit", "-q", "-m", "grow a", wc_arg]);
+
+        std::fs::write(wc.join("loose.txt"), "x\n").unwrap();
+        assert!(svn.is_versioned(&wc.join("a.txt")).unwrap());
+        assert!(!svn.is_versioned(&wc.join("loose.txt")).unwrap());
+
+        // Renamed through svn, so history follows it.
+        svn.rename(&wc.join("a.txt"), &wc.join("b.txt")).unwrap();
+        run("svn", &["commit", "-q", "-m", "rename", wc_arg]);
+        run("svn", &["update", "-q", wc_arg]);
+        let b = wc.join("b.txt");
+        let log = svn.history(&b, 10).unwrap();
+        let revisions: Vec<_> = log.iter().map(|c| c.revision.as_str()).collect();
+        assert_eq!(revisions, ["3", "2", "1"]);
+        assert_eq!(log[1].message, "grow a");
+
+        assert_eq!(
+            svn.change(&b, &log[1]).unwrap(),
+            (Some("one\n".into()), Some("one\ntwo\n".into()))
+        );
+        // Added in r1: nothing before.
+        assert_eq!(
+            svn.change(&b, &log[2]).unwrap(),
+            (None, Some("one\n".into()))
+        );
+
+        std::fs::write(&b, "edited\n").unwrap();
+        svn.delete(&b).unwrap();
+        assert!(!b.exists(), "deleted from disk, local edit and all");
+        let status = svn.status(&wc).unwrap();
+        assert!(
+            status
+                .iter()
+                .any(|f| f.path.ends_with("b.txt") && f.kind == ChangeKind::Deleted),
+            "{status:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

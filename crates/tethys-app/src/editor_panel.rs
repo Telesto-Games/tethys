@@ -14,6 +14,8 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::*;
 
+use crate::file_tree::file_name;
+
 gpui_kit::actions!(editor, [Save, ToggleBreakpoint]);
 
 /// Files larger than this aren't opened in the editor.
@@ -202,11 +204,14 @@ impl EditorPanel {
         &self.path
     }
 
+    /// Follows the file to its new path after a rename.
+    pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.path = path;
+        cx.notify();
+    }
+
     fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        file_name(&self.path)
     }
 
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
@@ -351,6 +356,10 @@ impl EventEmitter<EditorEvent> for EditorPanel {}
 impl EventEmitter<PanelEvent> for EditorPanel {}
 
 impl gpui_kit::component::dock::BasePanel for EditorPanel {
+    fn zoomable(&self, _: &App) -> bool {
+        false
+    }
+
     fn panel_name(&self) -> &'static str {
         "TethysEditor"
     }

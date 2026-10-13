@@ -12,7 +12,7 @@ use crate::ports::{
     AgentHost, AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EngineLocator,
     EventSink, PortError, ProcessLauncher, SourceControl, TestEventSink, TestRunner, TestSession,
 };
-use crate::scm::{WorkingCopyInfo, WorkingCopyStatus};
+use crate::scm::{Commit, WorkingCopyInfo, WorkingCopyStatus};
 use crate::unreal::{self, Configuration, ToolError};
 
 /// Lines of unchanged context shown around each change in a diff.
@@ -85,6 +85,167 @@ pub fn diff_against_base(
 ) -> Result<FileDiff, PortError> {
     let base = scm.base_text(file)?.unwrap_or_default();
     Ok(diff::diff_lines(&base, current, DIFF_CONTEXT))
+}
+
+/// How many commits View History lists.
+pub const HISTORY_LIMIT: usize = 100;
+
+/// The commits that changed `file`, newest first.
+pub fn file_history(scm: &dyn SourceControl, file: &Path) -> Result<Vec<Commit>, PortError> {
+    scm.history(file, HISTORY_LIMIT)
+}
+
+/// What `commit` changed in `file`.
+pub fn commit_diff(
+    scm: &dyn SourceControl,
+    file: &Path,
+    commit: &Commit,
+) -> Result<FileDiff, PortError> {
+    let (before, after) = scm.change(file, commit)?;
+    Ok(diff::diff_lines(
+        &before.unwrap_or_default(),
+        &after.unwrap_or_default(),
+        DIFF_CONTEXT,
+    ))
+}
+
+/// Checks a file or folder name typed by the user. Errors say why it's
+/// refused, for display.
+pub fn check_name(name: &str) -> Result<(), String> {
+    const RESERVED: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    if name.trim().is_empty() {
+        return Err("Enter a name.".into());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("\"{name}\" isn't a valid name."));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| RESERVED.contains(c) || c.is_control())
+    {
+        return Err(format!("A name can't contain \"{c}\"."));
+    }
+    if name.ends_with(['.', ' ']) || name.starts_with(' ') {
+        return Err("A name can't start with a space or end with a space or dot.".into());
+    }
+    if is_reserved_device_name(name) {
+        return Err(format!(
+            "\"{name}\" is a device name on Windows, not a file name."
+        ));
+    }
+    Ok(())
+}
+
+/// `CON`, `nul.txt`, `COM1`…: names Windows gives to devices, in any case
+/// and with any extension. Creating one opens the device instead.
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let stem = stem.to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        s => {
+            s.len() == 4
+                && (s.starts_with("COM") || s.starts_with("LPT"))
+                && s.as_bytes()[3].is_ascii_digit()
+                && s.as_bytes()[3] != b'0'
+        }
+    }
+}
+
+/// The path `name` would have in `dir`, if it's a valid name not taken there.
+fn new_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    check_name(name)?;
+    let path = dir.join(name);
+    if path.exists() {
+        return Err(format!("{name} already exists here."));
+    }
+    Ok(path)
+}
+
+/// Creates an empty file `name` in `dir`. It isn't added to source control.
+pub fn create_file(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let path = new_path(dir, name)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| format!("Can't create {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Creates folder `name` in `dir`.
+pub fn create_folder(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let path = new_path(dir, name)?;
+    std::fs::create_dir(&path).map_err(|e| format!("Can't create {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Renames the file or folder at `from` to `name`, in the same folder. A
+/// versioned one is renamed through source control so its history follows.
+/// Returns the new path.
+pub fn rename_path(
+    scm: Option<&dyn SourceControl>,
+    from: &Path,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let dir = from
+        .parent()
+        .ok_or_else(|| format!("Can't rename {}.", from.display()))?;
+    let old = from.file_name().unwrap_or_default().to_string_lossy();
+    if name == old {
+        return Ok(from.to_path_buf());
+    }
+    // A change of case only: the "existing" file is this one.
+    let to = if name.eq_ignore_ascii_case(&old) {
+        check_name(name)?;
+        dir.join(name)
+    } else {
+        new_path(dir, name)?
+    };
+    match versioned(scm, from)? {
+        Some(scm) => scm.rename(from, &to).map_err(|e| e.to_string())?,
+        None => std::fs::rename(from, &to)
+            .map_err(|e| format!("Can't rename {}: {e}", from.display()))?,
+    }
+    Ok(to)
+}
+
+/// Deletes the file or folder at `path` for good, local edits included. A
+/// versioned one is deleted through source control, so the deletion shows
+/// as a change to commit.
+pub fn delete_path(scm: Option<&dyn SourceControl>, path: &Path) -> Result<(), String> {
+    if let Some(scm) = versioned(scm, path)? {
+        scm.delete(path).map_err(|e| e.to_string())?;
+    }
+    // Whatever source control left: an unversioned path, or unversioned
+    // files in a versioned folder.
+    let removed = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    };
+    removed.map_err(|e| format!("Can't delete {}: {e}", path.display()))
+}
+
+/// `scm`, if it versions `path`.
+fn versioned<'a>(
+    scm: Option<&'a dyn SourceControl>,
+    path: &Path,
+) -> Result<Option<&'a dyn SourceControl>, String> {
+    let Some(scm) = scm else {
+        return Ok(None);
+    };
+    match scm.is_versioned(path) {
+        Ok(true) => Ok(Some(scm)),
+        Ok(false) => Ok(None),
+        Err(e) => Err(format!(
+            "Can't tell whether {} is under {}: {e}",
+            path.display(),
+            scm.name()
+        )),
+    }
 }
 
 /// How many recent projects to remember.
@@ -915,7 +1076,7 @@ mod scm_tests {
     use super::*;
     use crate::diff::LineKind;
     use crate::ports::PortResult;
-    use crate::scm::{ChangeKind, FileStatus, WorkingCopyInfo};
+    use crate::scm::{ChangeKind, Commit, FileStatus, WorkingCopyInfo};
 
     struct FakeScm;
     impl SourceControl for FakeScm {
@@ -941,6 +1102,38 @@ mod scm_tests {
         }
         fn base_text(&self, file: &Path) -> PortResult<Option<String>> {
             Ok(file.ends_with("a.cpp").then(|| "one\ntwo\n".to_string()))
+        }
+        fn is_versioned(&self, _: &Path) -> PortResult<bool> {
+            Ok(false)
+        }
+        fn rename(&self, _: &Path, _: &Path) -> PortResult<()> {
+            unimplemented!()
+        }
+        fn delete(&self, _: &Path) -> PortResult<()> {
+            unimplemented!()
+        }
+        fn history(&self, _: &Path, _: usize) -> PortResult<Vec<Commit>> {
+            Ok(vec![commit("7")])
+        }
+        fn change(
+            &self,
+            _: &Path,
+            commit: &Commit,
+        ) -> PortResult<(Option<String>, Option<String>)> {
+            Ok(match commit.revision.as_str() {
+                "1" => (None, Some("a\n".into())),
+                _ => (Some("a\nb\n".into()), Some("a\nc\n".into())),
+            })
+        }
+    }
+
+    fn commit(revision: &str) -> Commit {
+        Commit {
+            revision: revision.into(),
+            author: "chris".into(),
+            date: "2026-10-13T09:00:00Z".into(),
+            message: "msg".into(),
+            locator: String::new(),
         }
     }
 
@@ -971,6 +1164,21 @@ mod scm_tests {
             unimplemented!()
         }
         fn base_text(&self, _: &Path) -> PortResult<Option<String>> {
+            unimplemented!()
+        }
+        fn is_versioned(&self, _: &Path) -> PortResult<bool> {
+            unimplemented!()
+        }
+        fn rename(&self, _: &Path, _: &Path) -> PortResult<()> {
+            unimplemented!()
+        }
+        fn delete(&self, _: &Path) -> PortResult<()> {
+            unimplemented!()
+        }
+        fn history(&self, _: &Path, _: usize) -> PortResult<Vec<Commit>> {
+            unimplemented!()
+        }
+        fn change(&self, _: &Path, _: &Commit) -> PortResult<(Option<String>, Option<String>)> {
             unimplemented!()
         }
     }
@@ -1006,5 +1214,161 @@ mod scm_tests {
         // No base: everything is added.
         let d = diff_against_base(&FakeScm, &root.join("new.cpp"), "x\ny\n").unwrap();
         assert!(d.hunks[0].lines.iter().all(|l| l.kind == LineKind::Added));
+    }
+
+    #[test]
+    fn history_and_commit_diffs_go_through_the_port() {
+        let file = Path::new(r"D:\p\a.cpp");
+        assert_eq!(file_history(&FakeScm, file).unwrap(), [commit("7")]);
+
+        let d = commit_diff(&FakeScm, file, &commit("7")).unwrap();
+        assert_eq!((d.added, d.removed), (1, 1));
+        // Added by the commit: nothing before it.
+        let d = commit_diff(&FakeScm, file, &commit("1")).unwrap();
+        assert_eq!((d.added, d.removed), (1, 0));
+    }
+
+    #[test]
+    fn refuses_names_windows_cant_use() {
+        assert!(check_name("Thing.cpp").is_ok());
+        assert!(check_name(".gitignore").is_ok());
+        for bad in [
+            "",
+            "  ",
+            ".",
+            "..",
+            "a/b",
+            r"a\b",
+            "a:b",
+            "a?",
+            "end.",
+            "end ",
+            " start",
+            "nul",
+            "CON",
+            "con.txt",
+            "Aux.tar.gz",
+            "COM1",
+            "lpt9.log",
+        ] {
+            assert!(check_name(bad).is_err(), "{bad:?} was accepted");
+        }
+        for ok in [
+            "COM0",
+            "COM10",
+            "console",
+            "nullable.h",
+            "LPT",
+            "connect.cpp",
+        ] {
+            assert!(check_name(ok).is_ok(), "{ok:?} was refused");
+        }
+    }
+
+    /// A temporary folder, removed when dropped.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("tethys-fileops-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn creates_renames_and_deletes_unversioned_paths() {
+        let tmp = TempDir::new("plain");
+        let dir = &tmp.0;
+
+        let file = create_file(dir, "a.txt").unwrap();
+        assert!(file.is_file());
+        assert!(
+            create_file(dir, "a.txt").is_err(),
+            "an existing name is refused"
+        );
+        let folder = create_folder(dir, "Sub").unwrap();
+        std::fs::write(folder.join("inner.txt"), "x").unwrap();
+
+        let renamed = rename_path(None, &file, "b.txt").unwrap();
+        assert!(renamed.is_file() && !file.exists());
+        assert!(
+            rename_path(None, &renamed, "Sub").is_err(),
+            "taken by the folder"
+        );
+        // Case only: allowed, though the name "exists".
+        let cased = rename_path(None, &renamed, "B.txt").unwrap();
+        assert!(cased.ends_with("B.txt"));
+
+        delete_path(None, &cased).unwrap();
+        delete_path(None, &folder).unwrap();
+        assert!(!cased.exists() && !folder.exists());
+    }
+
+    /// Versions everything and records what it was asked to do.
+    #[derive(Default)]
+    struct VersioningScm(std::sync::Mutex<Vec<String>>);
+    impl SourceControl for VersioningScm {
+        fn name(&self) -> &'static str {
+            "Versioning"
+        }
+        fn working_copy_root(&self, dir: &Path) -> Option<PathBuf> {
+            Some(dir.to_path_buf())
+        }
+        fn info(&self, _: &Path) -> PortResult<WorkingCopyInfo> {
+            unimplemented!()
+        }
+        fn status(&self, _: &Path) -> PortResult<Vec<FileStatus>> {
+            unimplemented!()
+        }
+        fn base_text(&self, _: &Path) -> PortResult<Option<String>> {
+            unimplemented!()
+        }
+        fn is_versioned(&self, _: &Path) -> PortResult<bool> {
+            Ok(true)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> PortResult<()> {
+            self.0.lock().unwrap().push("rename".into());
+            Ok(std::fs::rename(from, to)?)
+        }
+        fn delete(&self, path: &Path) -> PortResult<()> {
+            // Leaves the file, as `git rm` leaves untracked files behind.
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("delete {}", path.display()));
+            Ok(())
+        }
+        fn history(&self, _: &Path, _: usize) -> PortResult<Vec<Commit>> {
+            unimplemented!()
+        }
+        fn change(&self, _: &Path, _: &Commit) -> PortResult<(Option<String>, Option<String>)> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn renames_and_deletes_versioned_paths_through_source_control() {
+        let tmp = TempDir::new("versioned");
+        let scm = VersioningScm::default();
+        let file = create_file(&tmp.0, "a.txt").unwrap();
+
+        let renamed = rename_path(Some(&scm), &file, "b.txt").unwrap();
+        assert!(renamed.is_file());
+        delete_path(Some(&scm), &renamed).unwrap();
+        assert!(!renamed.exists(), "what source control left is removed");
+        assert_eq!(
+            *scm.0.lock().unwrap(),
+            [
+                "rename".to_string(),
+                format!("delete {}", renamed.display())
+            ]
+        );
     }
 }

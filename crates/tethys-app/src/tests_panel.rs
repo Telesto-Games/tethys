@@ -600,6 +600,10 @@ impl EventEmitter<TestsPanelEvent> for TestsPanel {}
 impl EventEmitter<PanelEvent> for TestsPanel {}
 
 impl gpui_kit::component::dock::BasePanel for TestsPanel {
+    fn zoomable(&self, _: &App) -> bool {
+        false
+    }
+
     fn panel_name(&self) -> &'static str {
         "TethysTests"
     }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::automation::{AutomationTest, TestEvent, TestInstance};
 use crate::debug::{DebugEvent, ProcessInfo, SourceBreakpoint};
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
-use crate::scm::{FileStatus, WorkingCopyInfo};
+use crate::scm::{Commit, FileStatus, WorkingCopyInfo};
 use crate::unreal::{CommandSpec, Configuration};
 use crate::update::{Release, Version};
 
@@ -47,7 +47,9 @@ pub trait ConfigStore {
 
 /// A source control system (Subversion and git now; Perforce later).
 ///
-/// Read-only: Tethys shows what changed but never commits, reverts or updates.
+/// Tethys never commits, reverts or updates. The only working-copy changes it
+/// makes are renames and deletes the user asks for, so history follows a
+/// renamed file and a deletion shows as one.
 pub trait SourceControl: Send + Sync {
     /// Display name, e.g. "Subversion".
     fn name(&self) -> &'static str;
@@ -69,6 +71,20 @@ pub trait SourceControl: Send + Sync {
     /// The file as last checked out (BASE, or HEAD for git), or `None` if it
     /// has no base (unversioned or newly added).
     fn base_text(&self, file: &Path) -> PortResult<Option<String>>;
+    /// Whether the file or folder at `path` is under source control (a
+    /// folder: anything in it is).
+    fn is_versioned(&self, path: &Path) -> PortResult<bool>;
+    /// Renames a versioned file or folder, on disk and in source control.
+    fn rename(&self, from: &Path, to: &Path) -> PortResult<()>;
+    /// Deletes a versioned file or folder, on disk and in source control,
+    /// local edits included.
+    fn delete(&self, path: &Path) -> PortResult<()>;
+    /// The commits that changed `file`, newest first, at most `limit`,
+    /// following it back through renames.
+    fn history(&self, file: &Path, limit: usize) -> PortResult<Vec<Commit>>;
+    /// `file`'s text before and after `commit`, or `None` where it didn't
+    /// exist (added or deleted by the commit).
+    fn change(&self, file: &Path, commit: &Commit) -> PortResult<(Option<String>, Option<String>)>;
 }
 
 /// Starts programs that outlive Tethys, like the Unreal Editor.

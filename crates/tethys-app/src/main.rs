@@ -7,6 +7,7 @@ mod debug_panel;
 mod diff_panel;
 mod editor_panel;
 mod file_tree;
+mod history_panel;
 mod keys;
 mod session_panel;
 mod settings_ui;

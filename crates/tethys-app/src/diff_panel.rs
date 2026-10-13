@@ -7,6 +7,8 @@ use gpui_kit::component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_kit::*;
 use tethys_core::diff::{FileDiff, LineKind};
 
+use crate::file_tree::file_name;
+
 const ROW_HEIGHT: f32 = 20.;
 const GUTTER: f32 = 48.;
 
@@ -53,6 +55,12 @@ impl DiffPanel {
         &self.path
     }
 
+    /// Shows a diff of something else, e.g. another commit.
+    pub fn show(&mut self, against: String, diff: FileDiff, cx: &mut Context<Self>) {
+        self.against = against;
+        self.set_diff(diff, cx);
+    }
+
     pub fn set_diff(&mut self, diff: FileDiff, cx: &mut Context<Self>) {
         self.added = diff.added;
         self.removed = diff.removed;
@@ -76,10 +84,7 @@ impl DiffPanel {
     }
 
     fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        file_name(&self.path)
     }
 
     fn render_rows(
@@ -160,6 +165,10 @@ impl DiffPanel {
 impl EventEmitter<PanelEvent> for DiffPanel {}
 
 impl gpui_kit::component::dock::BasePanel for DiffPanel {
+    fn zoomable(&self, _: &App) -> bool {
+        false
+    }
+
     fn panel_name(&self) -> &'static str {
         "TethysDiff"
     }

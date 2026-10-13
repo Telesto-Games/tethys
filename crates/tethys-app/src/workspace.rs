@@ -1,6 +1,8 @@
 //! One window: a project summary plus its agent sessions as tabs.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -8,10 +10,12 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Disableable, GlobalState};
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{
     DockArea, DockEvent, DockPlacement, Panel, PanelHandle, PanelId, PanelStyle,
 };
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::component::{Icon, WindowExt};
@@ -46,7 +50,8 @@ use crate::debug_panel::{
 };
 use crate::diff_panel::DiffPanel;
 use crate::editor_panel::{self, EditorEvent, EditorPanel};
-use crate::file_tree::{FileTreeEvent, FileTreePanel};
+use crate::file_tree::{FileTreeEvent, FileTreePanel, file_name};
+use crate::history_panel::HistoryPanel;
 use crate::session_panel::{SessionKind, SessionPanel};
 use crate::settings_ui;
 use crate::tab_skin;
@@ -245,6 +250,9 @@ pub struct Workspace {
     file_tree: Option<Entity<FileTreePanel>>,
     editors: Vec<Entity<EditorPanel>>,
     diffs: Vec<Entity<DiffPanel>>,
+    histories: Vec<Entity<HistoryPanel>>,
+    /// Submits the open name prompt on Enter.
+    name_prompt: Option<Subscription>,
     /// The source control managing the project folder, if any.
     scm: Option<Arc<dyn SourceControl>>,
     subscriptions: Vec<Subscription>,
@@ -329,6 +337,7 @@ impl Workspace {
             cx.subscribe_in(&dock, window, |this, _, event: &DockEvent, window, cx| {
                 if let DockEvent::LayoutChanged = event {
                     this.prune_closed_panels(cx);
+                    this.collapse_empty_docks(window, cx);
                     this.ensure_build_pane(window, cx);
                 }
             });
@@ -374,6 +383,8 @@ impl Workspace {
             file_tree: None,
             editors: Vec::new(),
             diffs: Vec::new(),
+            histories: Vec::new(),
+            name_prompt: None,
             scm: None,
             subscriptions: Vec::new(),
             debug: Debug {
@@ -690,15 +701,7 @@ impl Workspace {
                 if kind == SessionKind::Build {
                     self.close_finished_builds(window, cx);
                 }
-                self.dock.update(cx, |dock, cx| {
-                    dock.add_panel_view(
-                        Arc::new(PanelHandle::new(panel.clone())),
-                        placement,
-                        Some(BUILD_PANE_WIDTH),
-                        window,
-                        cx,
-                    )
-                });
+                self.add_dock_panel(&panel, placement, Some(BUILD_PANE_WIDTH), window, cx);
                 self.panels.push(panel);
                 if kind == SessionKind::Build
                     && let Some(placeholder) = self.build_placeholder.take()
@@ -723,6 +726,8 @@ impl Workspace {
         if self.unreal_project().is_none() || has_build || self.build_placeholder.is_some() {
             return;
         }
+        // The placeholder doesn't reopen a collapsed pane: nothing happened
+        // that the user needs to see.
         let placeholder = cx.new(BuildPlaceholder::new);
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
@@ -734,6 +739,31 @@ impl Workspace {
             )
         });
         self.build_placeholder = Some(placeholder);
+    }
+
+    /// Adds a panel to a side or bottom dock and makes sure it can be seen:
+    /// a dock collapses once its last tab is dragged away, and adding to it
+    /// doesn't open it again by itself.
+    fn add_dock_panel<P: Panel>(
+        &mut self,
+        panel: &Entity<P>,
+        placement: DockPlacement,
+        size: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                Arc::new(PanelHandle::new(panel.clone())),
+                placement,
+                size,
+                window,
+                cx,
+            );
+            if placement != DockPlacement::Center && !dock.is_dock_open(placement) {
+                dock.toggle_dock(placement, window, cx);
+            }
+        });
     }
 
     /// Removes build tabs whose build has finished, so the pane shows the latest log.
@@ -758,20 +788,21 @@ impl Workspace {
         self.scm = usecases::detect_source_control(&cx.global::<Services>().scms, &root);
 
         let tree = cx.new(|cx| FileTreePanel::new(root, cx));
-        let events = cx.subscribe_in(&tree, window, |this, _, event, window, cx| match event {
-            FileTreeEvent::Open(path) => this.open_file(path.clone(), window, cx),
-            FileTreeEvent::Diff(path) => this.show_diff(path.clone(), None, window, cx),
-        });
+        let events = cx.subscribe_in(
+            &tree,
+            window,
+            |this, _, event: &FileTreeEvent, window, cx| {
+                this.on_file_tree_event(event.clone(), window, cx)
+            },
+        );
         self.subscriptions.push(events);
-        self.dock.update(cx, |dock, cx| {
-            dock.add_panel_view(
-                Arc::new(PanelHandle::new(tree.clone())),
-                DockPlacement::Left,
-                Some(FILES_PANE_WIDTH),
-                window,
-                cx,
-            )
-        });
+        self.add_dock_panel(
+            &tree,
+            DockPlacement::Left,
+            Some(FILES_PANE_WIDTH),
+            window,
+            cx,
+        );
         self.file_tree = Some(tree);
 
         // Pick up changes made outside Tethys whenever the window comes back.
@@ -782,6 +813,328 @@ impl Workspace {
         });
         self.subscriptions.push(activation);
         self.refresh_status(cx);
+    }
+
+    fn on_file_tree_event(
+        &mut self,
+        event: FileTreeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            FileTreeEvent::Open(path) => self.open_file(path, window, cx),
+            FileTreeEvent::Diff(path) => self.show_diff(path, None, window, cx),
+            FileTreeEvent::NewFile(dir) => self.prompt_for_name(
+                "New File",
+                "Create",
+                "",
+                window,
+                cx,
+                move |name| usecases::create_file(&dir, name),
+                |this, path, window, cx| {
+                    this.reveal_in_files(&path, cx);
+                    this.open_file(path, window, cx);
+                },
+            ),
+            FileTreeEvent::NewFolder(dir) => self.prompt_for_name(
+                "New Folder",
+                "Create",
+                "",
+                window,
+                cx,
+                move |name| usecases::create_folder(&dir, name),
+                |this, path, _, cx| this.reveal_in_files(&path, cx),
+            ),
+            FileTreeEvent::Rename(path) => {
+                let name = file_name(&path);
+                let scm = self.scm.clone();
+                let from = path.clone();
+                self.prompt_for_name(
+                    "Rename",
+                    "Rename",
+                    &name,
+                    window,
+                    cx,
+                    move |name| usecases::rename_path(scm.as_deref(), &path, name),
+                    move |this, to, window, cx| this.moved(&from, &to, window, cx),
+                )
+            }
+            FileTreeEvent::Delete(path) => self.confirm_delete(path, window, cx),
+            FileTreeEvent::History(path) => self.show_history(path, window, cx),
+        }
+    }
+
+    /// Asks for a name in a dialog. On OK or Enter, `work` gets the name on
+    /// a background thread (it may run source control, which can take a
+    /// while on a big folder). An error it returns is shown in the dialog,
+    /// which stays open to try again; otherwise `done` gets its result and
+    /// the dialog closes.
+    #[allow(clippy::too_many_arguments)]
+    fn prompt_for_name<T: Send + 'static>(
+        &mut self,
+        title: &'static str,
+        ok: &'static str,
+        initial: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        work: impl Fn(&str) -> Result<T, String> + Send + Sync + 'static,
+        done: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial.to_string()));
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            // Typing replaces the name.
+            input.select_all(window, cx);
+        });
+        let error: Rc<RefCell<Option<String>>> = Rc::default();
+        // Set while `work` runs, so a second Enter doesn't start it again.
+        let busy: Rc<Cell<bool>> = Rc::default();
+        let work = Arc::new(work);
+        let done = Rc::new(done);
+        let this = cx.entity().downgrade();
+        let submit: Rc<WindowAction> = Rc::new({
+            let (input, error, busy) = (input.clone(), error.clone(), busy.clone());
+            move |window, cx| {
+                if busy.get() {
+                    return;
+                }
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                let name = input.read(cx).value().to_string();
+                busy.set(true);
+                let (work, done, error, busy) =
+                    (work.clone(), done.clone(), error.clone(), busy.clone());
+                this.update(cx, |_, cx| {
+                    let result = cx.background_executor().spawn(async move { work(&name) });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = result.await;
+                        busy.set(false);
+                        let _ = this.update_in(cx, |this, window, cx| match result {
+                            Ok(value) => {
+                                done(this, value, window, cx);
+                                window.close_dialog(cx);
+                            }
+                            Err(e) => {
+                                *error.borrow_mut() = Some(e);
+                                window.refresh();
+                            }
+                        });
+                    })
+                    .detach();
+                });
+            }
+        });
+        self.name_prompt = Some(cx.subscribe_in(&input, window, {
+            let submit = submit.clone();
+            move |_, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    submit(window, cx);
+                }
+            }
+        }));
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let submit = submit.clone();
+            dialog
+                .title(title)
+                .w(px(420.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(Input::new(&input))
+                        .children(error.borrow().clone().map(|e| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .whitespace_normal()
+                                .child(e)
+                        })),
+                )
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("name-cancel")
+                                .small()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("name-ok")
+                                .primary()
+                                .small()
+                                .label(ok)
+                                .on_click(move |_, window, cx| submit(window, cx)),
+                        ),
+                )
+        });
+    }
+
+    /// Shows a new or renamed path in the Files panel, and refreshes status.
+    fn reveal_in_files(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if let Some(tree) = &self.file_tree {
+            tree.update(cx, |tree, cx| tree.reveal(path, cx));
+        }
+        self.refresh_status(cx);
+    }
+
+    /// Follows a rename: editors of anything moved now edit it at its new
+    /// path. Diffs and histories of it are closed, being of the old path.
+    fn moved(&mut self, from: &Path, to: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        for editor in &self.editors {
+            let old = editor.read(cx).path().to_path_buf();
+            if let Ok(rest) = old.strip_prefix(from) {
+                let new = if rest.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(rest)
+                };
+                editor.update(cx, |editor, cx| editor.set_path(new, cx));
+            }
+        }
+        self.close_views_under(from, false, window, cx);
+        // Tab titles are drawn by the dock.
+        self.dock.update(cx, |_, cx| cx.notify());
+        self.reveal_in_files(to, cx);
+    }
+
+    /// Closes the diffs and histories of `path` or anything under it, and
+    /// its editors too when `editors`.
+    fn close_views_under(
+        &mut self,
+        path: &Path,
+        editors: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        fn remove<P: Panel>(
+            dock: &Entity<DockArea>,
+            panels: &[Entity<P>],
+            path_of: impl Fn(&P) -> &Path,
+            path: &Path,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let doomed: Vec<_> = panels
+                .iter()
+                .filter(|p| path_of(p.read(cx)).starts_with(path))
+                .cloned()
+                .collect();
+            for panel in doomed {
+                dock.update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+            }
+        }
+        remove(&self.dock, &self.diffs, DiffPanel::path, path, window, cx);
+        remove(
+            &self.dock,
+            &self.histories,
+            HistoryPanel::path,
+            path,
+            window,
+            cx,
+        );
+        if editors {
+            remove(
+                &self.dock,
+                &self.editors,
+                EditorPanel::path,
+                path,
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Asks before deleting `path` for good.
+    fn confirm_delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = file_name(&path);
+        let what = if path.is_dir() {
+            "This folder and everything in it"
+        } else {
+            "This file"
+        };
+        let tracked = match &self.scm {
+            Some(scm) => format!(
+                " If it's under {}, the deletion is marked there, ready to commit.",
+                scm.name()
+            ),
+            None => String::new(),
+        };
+        let description = format!(
+            "{what} will be deleted permanently, including changes not yet saved or \
+             committed.{tracked}"
+        );
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, path) = (this.clone(), path.clone());
+            alert
+                .confirm()
+                .title(format!("Delete {name}?"))
+                .description(description.clone())
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .on_ok(move |_, window, cx| {
+                    let path = path.clone();
+                    let _ = this.update(cx, |this, cx| this.delete(path, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Deletes `path` in the background, then closes its tabs.
+    fn delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let scm = self.scm.clone();
+        let target = path.clone();
+        let deleted = cx
+            .background_executor()
+            .spawn(async move { usecases::delete_path(scm.as_deref(), &target) });
+        cx.spawn_in(window, async move |this, cx| {
+            let deleted = deleted.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match deleted {
+                    // The tabs go only once the file has: a failed delete
+                    // keeps an editor's unsaved edits.
+                    Ok(()) => this.close_views_under(&path, true, window, cx),
+                    Err(e) => this.error = Some(e),
+                }
+                this.refresh_files(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Opens `path`'s history, or brings its open history up to date.
+    fn show_history(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(scm) = self.scm.clone() else {
+            self.error = Some(format!(
+                "{} isn't under source control, so it has no history.",
+                path.display()
+            ));
+            cx.notify();
+            return;
+        };
+        if let Some(panel) = self
+            .histories
+            .iter()
+            .find(|h| h.read(cx).path() == path)
+            .cloned()
+        {
+            panel.update(cx, |panel, cx| panel.reload(cx));
+            self.focus_panel(&panel, window, cx);
+            return;
+        }
+        let panel = cx.new(|cx| HistoryPanel::new(path, scm, cx));
+        self.add_center_panel(&panel, window, cx);
+        self.histories.push(panel);
     }
 
     /// Re-reads the file tree from disk and reloads source-control status.
@@ -970,6 +1323,26 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Collapses docks whose last tab was dragged away, so they leave a strip
+    /// rather than a blank column. The dock stays, and a tab dropped on its
+    /// strip opens it again.
+    fn collapse_empty_docks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for placement in [
+            DockPlacement::Left,
+            DockPlacement::Right,
+            DockPlacement::Bottom,
+        ] {
+            let empty = {
+                let dock = self.dock.read(cx);
+                dock.is_dock_open(placement) && dock.is_empty(placement, cx)
+            };
+            if empty {
+                self.dock
+                    .update(cx, |dock, cx| dock.toggle_dock(placement, window, cx));
+            }
+        }
+    }
+
     /// Drops panels the dock no longer holds (closed from their tab).
     fn prune_closed_panels(&mut self, cx: &mut Context<Self>) {
         let dock = self.dock.read(cx);
@@ -978,6 +1351,7 @@ impl Workspace {
         self.panels.retain(|p| held(p.entity_id()));
         self.editors.retain(|p| held(p.entity_id()));
         self.diffs.retain(|p| held(p.entity_id()));
+        self.histories.retain(|p| held(p.entity_id()));
         if self
             .debug
             .panel
@@ -1341,15 +1715,13 @@ impl Workspace {
             }
         });
         self.subscriptions.push(events);
-        self.dock.update(cx, |dock, cx| {
-            dock.add_panel_view(
-                Arc::new(PanelHandle::new(panel.clone())),
-                DockPlacement::Bottom,
-                Some(DEBUG_PANE_HEIGHT),
-                window,
-                cx,
-            )
-        });
+        self.add_dock_panel(
+            &panel,
+            DockPlacement::Bottom,
+            Some(DEBUG_PANE_HEIGHT),
+            window,
+            cx,
+        );
         self.debug.panel = Some(panel);
     }
 
@@ -1460,15 +1832,13 @@ impl Workspace {
             }
         });
         self.subscriptions.push(events);
-        self.dock.update(cx, |dock, cx| {
-            dock.add_panel_view(
-                Arc::new(PanelHandle::new(panel.clone())),
-                DockPlacement::Bottom,
-                Some(DEBUG_PANE_HEIGHT),
-                window,
-                cx,
-            )
-        });
+        self.add_dock_panel(
+            &panel,
+            DockPlacement::Bottom,
+            Some(DEBUG_PANE_HEIGHT),
+            window,
+            cx,
+        );
         self.tests.panel = Some(panel.clone());
         Some(panel)
     }
@@ -2031,6 +2401,9 @@ impl Render for Workspace {
             .child(content)
     }
 }
+
+/// Something done in a window, outside any one view.
+type WindowAction = dyn Fn(&mut Window, &mut App);
 
 fn is_uproject(path: &Path) -> bool {
     path.extension()
