@@ -30,7 +30,7 @@ impl Global for CurrentTheme {}
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalSkin {
     pub colors: palette::Defaults,
-    pub font_family: String,
+    pub font_family: SharedString,
     pub font_size: f32,
 }
 
@@ -40,7 +40,7 @@ impl Default for TerminalSkin {
     fn default() -> Self {
         Self {
             colors: palette::Defaults::default(),
-            font_family: ThemeSpec::builtin().font_family,
+            font_family: ThemeSpec::builtin().font_family.into(),
             font_size: 14.,
         }
     }
@@ -54,18 +54,14 @@ impl TerminalSkin {
             return Self::default();
         }
         let builtin = ThemeSpec::builtin();
-        let to_rgb = |c: Hsla| {
-            let rgba: Rgba = c.into();
-            let channel = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
-            palette::rgb(channel(rgba.r) << 16 | channel(rgba.g) << 8 | channel(rgba.b))
-        };
+        let to_rgb = |c: Hsla| palette::rgb(packed(c));
         Self {
             colors: palette::Defaults {
                 foreground: to_rgb(colour(&spec.foreground, &builtin.foreground)),
-                background: to_rgb(pane_colour(spec)),
+                background: to_rgb(pane_colour(spec, &builtin)),
                 cursor: to_rgb(colour(&spec.accent, &builtin.accent)),
             },
-            font_family: font_family.to_string(),
+            font_family: font_family.to_string().into(),
             // Terminals read two pixels smaller than the UI, as the defaults do.
             font_size: (font_size - 2.).max(ThemeSpec::MIN_FONT_SIZE),
         }
@@ -74,13 +70,30 @@ impl TerminalSkin {
 
 /// The active tab joins its pane. The built-in theme's tabs match the
 /// terminal backdrop exactly; another theme lifts its own background a little.
-fn pane_colour(spec: &ThemeSpec) -> Hsla {
-    let builtin = ThemeSpec::builtin();
-    if spec.background == builtin.background {
+fn pane_colour(spec: &ThemeSpec, builtin: &ThemeSpec) -> Hsla {
+    let background = colour(&spec.background, &builtin.background);
+    if background == colour(&builtin.background, &builtin.background) {
         hsla_from(palette::BACKGROUND)
     } else {
-        raise(colour(&spec.background, &builtin.background), 0.03)
+        raise(background, 0.03)
     }
+}
+
+/// A spec's font size, or the built-in one if it isn't a finite number,
+/// clamped to the range the dialog allows.
+pub fn font_size_of(size: f32) -> f32 {
+    if size.is_finite() {
+        size.clamp(ThemeSpec::MIN_FONT_SIZE, ThemeSpec::MAX_FONT_SIZE)
+    } else {
+        ThemeSpec::builtin().font_size
+    }
+}
+
+/// A colour as `0xrrggbb`, alpha dropped.
+pub fn packed(colour: Hsla) -> u32 {
+    let rgba: Rgba = colour.into();
+    let channel = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
+    channel(rgba.r) << 16 | channel(rgba.g) << 8 | channel(rgba.b)
 }
 
 /// Applies the saved theme. Needs [`Services`] to be set.
@@ -99,8 +112,8 @@ pub fn saved(config: &impl ConfigStore) -> ThemeSpec {
         .unwrap_or_else(ThemeSpec::builtin)
 }
 
-/// A spec colour, or the built-in theme's if it doesn't parse.
-fn colour(text: &str, fallback: &str) -> Hsla {
+/// A spec colour, or `fallback` (a built-in theme colour) if it doesn't parse.
+pub fn colour(text: &str, fallback: &str) -> Hsla {
     let rgb = theme::parse_hex(text)
         .or_else(|| theme::parse_hex(fallback))
         .expect("the built-in colours parse");
@@ -135,12 +148,10 @@ pub fn apply(spec: &ThemeSpec, cx: &mut App) {
         l: (accent.l + 0.08).min(1.),
         ..accent
     };
-    let pane = pane_colour(spec);
+    let pane = pane_colour(spec, &builtin);
     // Structure is drawn with accent hairlines at low opacity.
     let hairline = accent.opacity(0.22);
-    let font_size = spec
-        .font_size
-        .clamp(ThemeSpec::MIN_FONT_SIZE, ThemeSpec::MAX_FONT_SIZE);
+    let font_size = font_size_of(spec.font_size);
     let font_family = if spec.font_family.trim().is_empty() {
         builtin.font_family.clone()
     } else {
@@ -221,7 +232,10 @@ pub fn apply(spec: &ThemeSpec, cx: &mut App) {
         // The dock and tabs read these derived tokens, not the colors directly.
         theme.tokens = ThemeTokens::from(theme.colors);
     });
-    cx.set_global(TerminalSkin::for_spec(spec, &font_family, font_size));
+    let skin = TerminalSkin::for_spec(spec, &font_family, font_size);
+    // Programs asking for their colours (OSC 10/11/12) are answered from here.
+    palette::set_defaults(skin.colors);
+    cx.set_global(skin);
     cx.set_global(CurrentTheme { spec: spec.clone() });
 }
 
@@ -246,7 +260,7 @@ mod tests {
     use gpui_kit::Hsla;
     use tethys_core::theme::ThemeSpec;
 
-    use super::{TerminalSkin, colour, raise, tracked};
+    use super::{TerminalSkin, colour, font_size_of, packed, raise, tracked};
     use tethys_adapters::agent_terminal::palette;
 
     #[test]
@@ -289,6 +303,21 @@ mod tests {
         assert!(skin.colors.background.r < 255);
         assert_eq!(skin.font_family, "Consolas");
         assert_eq!(skin.font_size, 16.);
+    }
+
+    #[test]
+    fn font_sizes_must_be_finite_and_in_range() {
+        assert_eq!(font_size_of(f32::NAN), 16.);
+        assert_eq!(font_size_of(f32::INFINITY), 16.);
+        assert_eq!(font_size_of(2.), ThemeSpec::MIN_FONT_SIZE);
+        assert_eq!(font_size_of(14.), 14.);
+    }
+
+    #[test]
+    fn packing_round_trips() {
+        for rgb in [0x0b001f, 0xf24b38, 0xffffff, 0x000000, 0xc8b8d8] {
+            assert_eq!(packed(gpui_kit::rgb(rgb).into()), rgb);
+        }
     }
 
     #[test]

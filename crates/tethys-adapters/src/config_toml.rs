@@ -156,16 +156,15 @@ impl ConfigStore for TomlConfigStore {
         Ok(self.read::<StateFile>("state.toml")?.themes)
     }
 
-    fn set_themes(&self, themes: &[ThemeSpec]) -> PortResult<()> {
-        self.update_state(|s| s.themes = themes.to_vec())
-    }
-
     fn active_theme(&self) -> PortResult<Option<String>> {
         Ok(self.read::<StateFile>("state.toml")?.theme)
     }
 
-    fn set_active_theme(&self, name: Option<&str>) -> PortResult<()> {
-        self.update_state(|s| s.theme = name.map(str::to_string))
+    fn set_themes(&self, themes: &[ThemeSpec], active: Option<&str>) -> PortResult<()> {
+        self.update_state(|s| {
+            s.themes = themes.to_vec();
+            s.theme = active.map(str::to_string);
+        })
     }
 }
 
@@ -315,14 +314,16 @@ mod state_tests {
             font_size: 14.,
             ..ThemeSpec::builtin()
         };
-        store.set_themes(std::slice::from_ref(&mine)).unwrap();
-        store.set_active_theme(Some("Mine")).unwrap();
-        assert_eq!(store.themes().unwrap(), vec![mine]);
+        store
+            .set_themes(std::slice::from_ref(&mine), Some("Mine"))
+            .unwrap();
+        assert_eq!(store.themes().unwrap(), vec![mine.clone()]);
         assert_eq!(store.active_theme().unwrap().as_deref(), Some("Mine"));
         assert!(store.vertical_tabs().unwrap());
 
-        store.set_active_theme(None).unwrap();
+        store.set_themes(std::slice::from_ref(&mine), None).unwrap();
         assert_eq!(store.active_theme().unwrap(), None);
+        assert_eq!(store.themes().unwrap(), vec![mine]);
     }
 
     #[test]

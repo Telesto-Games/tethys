@@ -76,7 +76,7 @@ impl TerminalView {
             metrics: Rc::new(Cell::new(Metrics {
                 origin: Point::default(),
                 cell_width: px(8.),
-                line_height: px(TerminalSkin::default().font_size * LINE_HEIGHT),
+                line_height: px(cx.global::<TerminalSkin>().font_size * LINE_HEIGHT),
             })),
             scroll_lines: 0.,
             selecting: false,
@@ -345,7 +345,7 @@ fn layout(
     window: &mut Window,
 ) -> Frame {
     let font_size = px(skin.font_size);
-    let base_font = font(skin.font_family.as_str());
+    let base_font = font(skin.font_family.clone());
     let text_system = window.text_system().clone();
     let font_id = text_system.resolve_font(&base_font);
     let cell_width = text_system

@@ -1,5 +1,7 @@
 //! Default terminal colours, used when the program hasn't overridden them.
 
+use std::sync::Mutex;
+
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
@@ -55,9 +57,29 @@ impl Default for Defaults {
     }
 }
 
-/// The brand default colour for a palette index (0..269, see `NamedColor`).
+/// The defaults in force, for every terminal. Programs that ask for their
+/// colours (OSC 10/11/12) are answered from here, so it must match what
+/// the view draws with.
+static DEFAULTS: Mutex<Defaults> = Mutex::new(Defaults {
+    foreground: FOREGROUND,
+    background: BACKGROUND,
+    cursor: CURSOR,
+});
+
+/// Sets the defaults every terminal starts from (see [`defaults`]).
+pub fn set_defaults(defaults: Defaults) {
+    *DEFAULTS.lock().unwrap_or_else(|e| e.into_inner()) = defaults;
+}
+
+/// The defaults in force: the brand ones until [`set_defaults`] is called.
+pub fn defaults() -> Defaults {
+    *DEFAULTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The default colour for a palette index (0..269, see `NamedColor`), with
+/// the defaults in force.
 pub fn default_color(index: usize) -> Rgb {
-    default_color_with(index, &Defaults::default())
+    default_color_with(index, &defaults())
 }
 
 /// The default colour for a palette index, with `defaults` for the special

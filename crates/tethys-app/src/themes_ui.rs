@@ -67,14 +67,15 @@ impl ThemesEditor {
                 .placeholder("16")
                 .default_value(size_text(spec.font_size))
         });
-        let mut picker = |text: &str, cx: &mut Context<Self>| {
-            let colour = hsla_of(text);
+        let builtin = ThemeSpec::builtin();
+        let mut picker = |text: &str, fallback: &str, cx: &mut Context<Self>| {
+            let colour = app_theme::colour(text, fallback);
             cx.new(|cx| ColorPickerState::new(window, cx).default_value(colour))
         };
-        let background = picker(&spec.background, cx);
-        let foreground = picker(&spec.foreground, cx);
-        let muted_foreground = picker(&spec.muted_foreground, cx);
-        let accent = picker(&spec.accent, cx);
+        let background = picker(&spec.background, &builtin.background, cx);
+        let foreground = picker(&spec.foreground, &builtin.foreground, cx);
+        let muted_foreground = picker(&spec.muted_foreground, &builtin.muted_foreground, cx);
+        let accent = picker(&spec.accent, &builtin.accent, cx);
 
         Self {
             themes,
@@ -130,9 +131,9 @@ impl ThemesEditor {
             },
             font_size: text(&self.font_size)
                 .parse::<f32>()
-                .map_or(base.font_size, |size| {
-                    size.clamp(ThemeSpec::MIN_FONT_SIZE, ThemeSpec::MAX_FONT_SIZE)
-                }),
+                .ok()
+                .filter(|size| size.is_finite())
+                .map_or(base.font_size, app_theme::font_size_of),
             terminal: self.terminal,
         }
     }
@@ -156,13 +157,18 @@ impl ThemesEditor {
         self.font_size.update(cx, |input, cx| {
             input.set_value(size_text(spec.font_size), window, cx)
         });
-        for (picker, text) in [
-            (&self.background, &spec.background),
-            (&self.foreground, &spec.foreground),
-            (&self.muted_foreground, &spec.muted_foreground),
-            (&self.accent, &spec.accent),
+        let builtin = ThemeSpec::builtin();
+        for (picker, text, fallback) in [
+            (&self.background, &spec.background, &builtin.background),
+            (&self.foreground, &spec.foreground, &builtin.foreground),
+            (
+                &self.muted_foreground,
+                &spec.muted_foreground,
+                &builtin.muted_foreground,
+            ),
+            (&self.accent, &spec.accent, &builtin.accent),
         ] {
-            let colour = hsla_of(text);
+            let colour = app_theme::colour(text, fallback);
             picker.update(cx, |picker, cx| picker.set_value(colour, window, cx));
         }
     }
@@ -206,22 +212,19 @@ impl ThemesEditor {
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit(cx);
         let spec = self.selected_spec();
-        let clash = self
-            .themes
-            .iter()
-            .enumerate()
-            .any(|(i, t)| Some(i) != self.selected && t.name == spec.name);
-        if spec.is_builtin() && self.selected.is_some() || clash {
-            self.error = Some(format!("Another theme is already called {}.", spec.name));
+        // Themes are found by name, so every name must be unique, and none
+        // may take the built-in one's.
+        if let Some(taken) = self.themes.iter().enumerate().find_map(|(i, t)| {
+            let earlier = self.themes[..i].iter().any(|other| other.name == t.name);
+            (t.is_builtin() || earlier).then_some(t.name.clone())
+        }) {
+            self.error = Some(format!("Another theme is already called {taken}."));
             cx.notify();
             return;
         }
         let active = self.selected.map(|_| spec.name.as_str());
         let config = &cx.global::<Services>().config;
-        match config
-            .set_themes(&self.themes)
-            .and_then(|()| config.set_active_theme(active))
-        {
+        match config.set_themes(&self.themes, active) {
             Ok(()) => {
                 app_theme::apply(&spec, cx);
                 window.close_dialog(cx);
@@ -473,17 +476,9 @@ impl Render for ThemesEditor {
     }
 }
 
-/// A spec colour as a GPUI colour, the built-in backdrop if it doesn't parse.
-fn hsla_of(text: &str) -> Hsla {
-    let rgb = theme::parse_hex(text).unwrap_or(0x0b001f);
-    gpui_kit::rgb(rgb).into()
-}
-
 /// A GPUI colour as `#rrggbb`, alpha dropped.
 fn hex_of(colour: Hsla) -> String {
-    let rgba: Rgba = colour.into();
-    let channel = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
-    theme::hex(channel(rgba.r) << 16 | channel(rgba.g) << 8 | channel(rgba.b))
+    theme::hex(app_theme::packed(colour))
 }
 
 /// A font size for its input: `14` rather than `14.0`.
@@ -497,12 +492,13 @@ fn size_text(size: f32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_of, hsla_of, size_text};
+    use super::{hex_of, size_text};
+    use crate::theme::colour;
 
     #[test]
     fn colours_round_trip_through_pickers() {
         for text in ["#0b001f", "#f24b38", "#ffffff", "#000000", "#c8b8d8"] {
-            assert_eq!(hex_of(hsla_of(text)), text);
+            assert_eq!(hex_of(colour(text, "#000000")), text);
         }
     }
 

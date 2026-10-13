@@ -686,7 +686,9 @@ Things learned while building M0–M3 that aren't obvious from the code.
   default) sets a `TerminalSkin` global: the terminal's default foreground, background and
   cursor (`palette::Defaults`, taken from the theme's text, pane and accent colours) and its
   font, two pixels smaller than the UI's. Off, terminals keep the brand palette. The ANSI
-  colours and a program's own OSC colour overrides are untouched either way.
+  colours and a program's own OSC colour overrides are untouched either way, but a program
+  asking for its colours (OSC 10/11/12) is answered from the same defaults
+  (`palette::set_defaults`), so one that picks a scheme by background colour picks right.
 - **Docking.** Sessions (Claude and builds) are panels in a gpui-component `DockArea`
   (`SessionPanel`), so tabs can be dragged into splits and resized. The panel owns its
   `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. The layout

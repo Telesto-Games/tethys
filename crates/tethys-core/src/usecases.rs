@@ -687,13 +687,10 @@ mod tests {
         fn themes(&self) -> PortResult<Vec<crate::theme::ThemeSpec>> {
             Ok(Vec::new())
         }
-        fn set_themes(&self, _: &[crate::theme::ThemeSpec]) -> PortResult<()> {
-            Ok(())
-        }
         fn active_theme(&self) -> PortResult<Option<String>> {
             Ok(None)
         }
-        fn set_active_theme(&self, _: Option<&str>) -> PortResult<()> {
+        fn set_themes(&self, _: &[crate::theme::ThemeSpec], _: Option<&str>) -> PortResult<()> {
             Ok(())
         }
     }

@@ -46,10 +46,11 @@ pub trait ConfigStore {
     fn set_skipped_version(&self, version: Option<Version>) -> PortResult<()>;
     /// The themes the user made, in order. The built-in one isn't stored.
     fn themes(&self) -> PortResult<Vec<ThemeSpec>>;
-    fn set_themes(&self, themes: &[ThemeSpec]) -> PortResult<()>;
     /// The name of the theme in use; `None` means the built-in one.
     fn active_theme(&self) -> PortResult<Option<String>>;
-    fn set_active_theme(&self, name: Option<&str>) -> PortResult<()>;
+    /// Saves the user's themes and which one is in use (`None`: the
+    /// built-in), together, so one can't be written without the other.
+    fn set_themes(&self, themes: &[ThemeSpec], active: Option<&str>) -> PortResult<()>;
 }
 
 /// A source control system (Subversion and git now; Perforce later).
