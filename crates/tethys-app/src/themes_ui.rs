@@ -368,8 +368,7 @@ impl Render for ThemesEditor {
                         .text_color(muted)
                         .whitespace_normal()
                         .child(format!(
-                            "An installed font, and a size in pixels ({} to {}) the whole UI \
-                             scales with.",
+                            "Any installed font; the UI scales with the size ({}–{} px).",
                             ThemeSpec::MIN_FONT_SIZE,
                             ThemeSpec::MAX_FONT_SIZE
                         )),
@@ -385,8 +384,7 @@ impl Render for ThemesEditor {
                         })),
                 )
                 .child(div().text_xs().text_color(muted).whitespace_normal().child(
-                    "Sessions and terminals take these colours and the font (two pixels \
-                     smaller). Off, they keep Tethys's own palette.",
+                    "Sessions and terminals take these colours and font, two pixels smaller.",
                 ))
         } else {
             div()
