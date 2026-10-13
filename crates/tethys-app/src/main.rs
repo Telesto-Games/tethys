@@ -13,6 +13,8 @@ mod session_panel;
 mod settings_ui;
 mod tab_skin;
 mod terminal_view;
+#[cfg(test)]
+mod test_support;
 mod tests_panel;
 mod theme;
 mod themes_ui;

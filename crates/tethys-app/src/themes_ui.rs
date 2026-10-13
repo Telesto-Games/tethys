@@ -10,6 +10,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::color_picker::{ColorPickerState, ColorSelect};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::base::TestSupportExt;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use tethys_core::ports::ConfigStore;
@@ -269,6 +270,8 @@ impl ThemesEditor {
                         .child("in use"),
                 )
             })
+            // Lets view tests find and click the row; nothing outside tests.
+            .test_support()
     }
 
     fn colour_field(
@@ -504,5 +507,221 @@ mod tests {
     fn sizes_show_without_a_trailing_zero() {
         assert_eq!(size_text(16.), "16");
         assert_eq!(size_text(13.5), "13.5");
+    }
+}
+
+/// The editor rendered in a headless window, driven by clicks and typing.
+#[cfg(test)]
+mod view_tests {
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{App, AppContext, Entity, Hsla, TestAppContext, WindowHandle, px, size};
+    use tethys_core::ports::ConfigStore;
+    use tethys_core::theme::ThemeSpec;
+
+    use super::ThemesEditor;
+    use crate::test_support::{self, open_window, temp_config};
+    use crate::theme::CurrentTheme;
+    use crate::workspace::Services;
+
+    type Fixture = (WindowHandle<gpui_kit::base::Root>, Entity<ThemesEditor>);
+
+    fn open(name: &str, cx: &mut TestAppContext) -> Fixture {
+        let config = temp_config(name);
+        cx.update(|cx| test_support::init(config, cx));
+        open_window(cx, size(px(900.), px(900.)), |window, cx| {
+            cx.new(|cx| ThemesEditor::new(window, cx))
+        })
+    }
+
+    fn state<R>(
+        (window, editor): &Fixture,
+        cx: &mut TestAppContext,
+        read: impl FnOnce(&ThemesEditor, &App) -> R,
+    ) -> R {
+        cx.update_window((*window).into(), |_, _, cx| read(editor.read(cx), cx))
+            .unwrap()
+    }
+
+    fn set_name(fixture: &Fixture, name: &str, cx: &mut TestAppContext) {
+        let (window, editor) = fixture;
+        cx.update_window((*window).into(), |_, window, cx| {
+            let input = editor.read(cx).name.clone();
+            input.update(cx, |input, cx| input.set_value(name, window, cx));
+        })
+        .unwrap();
+    }
+
+    fn click(fixture: &Fixture, id: &'static str, cx: &mut TestAppContext) {
+        cx.update_window(fixture.0.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx);
+        })
+        .unwrap();
+    }
+
+    fn click_row(fixture: &Fixture, row: usize, cx: &mut TestAppContext) {
+        cx.update_window(fixture.0.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("theme-row", row), cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn starts_on_the_builtin_theme_with_no_fields(cx: &mut TestAppContext) {
+        let fixture = open("start", cx);
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), None);
+        assert!(state(&fixture, cx, |e, _| e.themes.is_empty()));
+        cx.update_window(fixture.0.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("delete-theme").is_none());
+            assert!(window.find("new-theme").visible());
+            assert!(window.find("save-themes").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn new_theme_copies_the_selection_and_is_editable(cx: &mut TestAppContext) {
+        let fixture = open("new", cx);
+        click(&fixture, "new-theme", cx);
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), Some(0));
+        let copy = state(&fixture, cx, |e, _| e.themes[0].clone());
+        assert_eq!(copy.name, "Telesto copy");
+        assert_eq!(copy.accent, ThemeSpec::builtin().accent);
+        click(&fixture, "new-theme", cx);
+        assert_eq!(
+            state(&fixture, cx, |e, _| e.themes[1].name.clone()),
+            "Telesto copy copy"
+        );
+        cx.update_window(fixture.0.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("delete-theme").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn edits_survive_switching_rows(cx: &mut TestAppContext) {
+        let fixture = open("switch", cx);
+        click(&fixture, "new-theme", cx);
+        set_name(&fixture, "Night", cx);
+        // Back to the built-in row (row 0), then to the copy (row 1).
+        click_row(&fixture, 0, cx);
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), None);
+        assert_eq!(state(&fixture, cx, |e, _| e.themes[0].name.clone()), "Night");
+        click_row(&fixture, 1, cx);
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), Some(0));
+        assert_eq!(
+            state(&fixture, cx, |e, cx| e.name.read(cx).value().to_string()),
+            "Night"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn save_refuses_duplicate_and_builtin_names(cx: &mut TestAppContext) {
+        let fixture = open("names", cx);
+        click(&fixture, "new-theme", cx);
+        set_name(&fixture, "Telesto", cx);
+        click(&fixture, "save-themes", cx);
+        let error = state(&fixture, cx, |e, _| e.error.clone());
+        assert_eq!(
+            error.as_deref(),
+            Some("Another theme is already called Telesto.")
+        );
+        assert!(state(&fixture, cx, |_, cx| cx
+            .global::<Services>()
+            .config
+            .themes()
+            .unwrap()
+            .is_empty()));
+
+        // Two user themes with the same name, neither of them selected.
+        set_name(&fixture, "Dusk", cx);
+        click(&fixture, "new-theme", cx);
+        set_name(&fixture, "Dusk", cx);
+        click_row(&fixture, 0, cx);
+        click(&fixture, "save-themes", cx);
+        assert_eq!(
+            state(&fixture, cx, |e, _| e.error.clone()).as_deref(),
+            Some("Another theme is already called Dusk.")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn save_persists_every_theme_and_applies_the_selected_one(cx: &mut TestAppContext) {
+        let fixture = open("save", cx);
+        click(&fixture, "new-theme", cx);
+        set_name(&fixture, "Night", cx);
+        cx.update_window(fixture.0.into(), |_, window, cx| {
+            let accent = fixture.1.read(cx).accent.clone();
+            accent.update(cx, |picker, cx| {
+                picker.set_value(Hsla::from(gpui_kit::rgb(0x00ff00)), window, cx)
+            });
+            fixture.1.update(cx, |editor, _| editor.terminal = true);
+        })
+        .unwrap();
+        click(&fixture, "save-themes", cx);
+        assert_eq!(state(&fixture, cx, |e, _| e.error.clone()), None);
+
+        let (themes, active, current) = state(&fixture, cx, |_, cx| {
+            let config = &cx.global::<Services>().config;
+            (
+                config.themes().unwrap(),
+                config.active_theme().unwrap(),
+                cx.global::<CurrentTheme>().spec.clone(),
+            )
+        });
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].name, "Night");
+        assert_eq!(themes[0].accent, "#00ff00");
+        assert!(themes[0].terminal);
+        assert_eq!(active.as_deref(), Some("Night"));
+        assert_eq!(current, themes[0]);
+    }
+
+    #[gpui_kit::test]
+    fn delete_removes_the_selection_and_falls_back_to_a_neighbour(cx: &mut TestAppContext) {
+        let fixture = open("delete", cx);
+        click(&fixture, "new-theme", cx);
+        set_name(&fixture, "A", cx);
+        click(&fixture, "new-theme", cx);
+        set_name(&fixture, "B", cx);
+        click(&fixture, "new-theme", cx);
+        set_name(&fixture, "C", cx);
+        // Select B (row 2) and delete it: C moves into its place and is selected.
+        click_row(&fixture, 2, cx);
+        click(&fixture, "delete-theme", cx);
+        let names = state(&fixture, cx, |e, _| {
+            e.themes.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+        });
+        assert_eq!(names, ["A", "C"]);
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), Some(1));
+        click(&fixture, "delete-theme", cx);
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), Some(0));
+        click(&fixture, "delete-theme", cx);
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), None);
+        assert!(state(&fixture, cx, |e, _| e.themes.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn reopening_selects_the_theme_in_use(cx: &mut TestAppContext) {
+        let config = temp_config("reopen");
+        let mine = ThemeSpec {
+            name: "Mine".into(),
+            ..ThemeSpec::builtin()
+        };
+        config
+            .set_themes(std::slice::from_ref(&mine), Some("Mine"))
+            .unwrap();
+        cx.update(|cx| test_support::init(config, cx));
+        let fixture = open_window(cx, size(px(900.), px(900.)), |window, cx| {
+            cx.new(|cx| ThemesEditor::new(window, cx))
+        });
+        assert_eq!(state(&fixture, cx, |e, _| e.selected), Some(0));
+        assert_eq!(
+            state(&fixture, cx, |e, cx| e.name.read(cx).value().to_string()),
+            "Mine"
+        );
     }
 }
