@@ -684,6 +684,18 @@ mod tests {
         fn set_skipped_version(&self, _: Option<crate::update::Version>) -> PortResult<()> {
             Ok(())
         }
+        fn themes(&self) -> PortResult<Vec<crate::theme::ThemeSpec>> {
+            Ok(Vec::new())
+        }
+        fn set_themes(&self, _: &[crate::theme::ThemeSpec]) -> PortResult<()> {
+            Ok(())
+        }
+        fn active_theme(&self) -> PortResult<Option<String>> {
+            Ok(None)
+        }
+        fn set_active_theme(&self, _: Option<&str>) -> PortResult<()> {
+            Ok(())
+        }
     }
 
     struct FakeSession(SessionId);

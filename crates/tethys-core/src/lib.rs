@@ -9,6 +9,7 @@ pub mod diff;
 pub mod domain;
 pub mod ports;
 pub mod scm;
+pub mod theme;
 pub mod unreal;
 pub mod update;
 pub mod usecases;

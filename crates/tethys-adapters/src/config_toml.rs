@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tethys_core::AgentProfile;
 use tethys_core::ports::{ConfigStore, PortResult};
+use tethys_core::theme::ThemeSpec;
 use tethys_core::unreal::{self, Configuration};
 use tethys_core::update::Version;
 
@@ -42,6 +43,12 @@ struct StateFile {
     /// A release the user chose to skip, e.g. "0.2.0".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skipped_version: Option<String>,
+    /// The theme in use, by name; `None` for the built-in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
+    /// Themes the user made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    themes: Vec<ThemeSpec>,
 }
 
 impl TomlConfigStore {
@@ -143,6 +150,22 @@ impl ConfigStore for TomlConfigStore {
 
     fn set_skipped_version(&self, version: Option<Version>) -> PortResult<()> {
         self.update_state(|s| s.skipped_version = version.map(|v| v.to_string()))
+    }
+
+    fn themes(&self) -> PortResult<Vec<ThemeSpec>> {
+        Ok(self.read::<StateFile>("state.toml")?.themes)
+    }
+
+    fn set_themes(&self, themes: &[ThemeSpec]) -> PortResult<()> {
+        self.update_state(|s| s.themes = themes.to_vec())
+    }
+
+    fn active_theme(&self) -> PortResult<Option<String>> {
+        Ok(self.read::<StateFile>("state.toml")?.theme)
+    }
+
+    fn set_active_theme(&self, name: Option<&str>) -> PortResult<()> {
+        self.update_state(|s| s.theme = name.map(str::to_string))
     }
 }
 
@@ -275,6 +298,50 @@ mod state_tests {
             "-nullrhi -DisablePlugins=FSR"
         );
         assert_eq!(store.editor_args().unwrap(), unreal::DEFAULT_EDITOR_ARGS);
+    }
+
+    #[test]
+    fn themes_round_trip_beside_other_state() {
+        let dir = std::env::temp_dir().join(format!("tethys-config-themes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        assert!(store.themes().unwrap().is_empty());
+        assert_eq!(store.active_theme().unwrap(), None);
+
+        store.set_vertical_tabs(true).unwrap();
+        let mine = ThemeSpec {
+            name: "Mine".into(),
+            accent: "#00ff00".into(),
+            font_size: 14.,
+            ..ThemeSpec::builtin()
+        };
+        store.set_themes(std::slice::from_ref(&mine)).unwrap();
+        store.set_active_theme(Some("Mine")).unwrap();
+        assert_eq!(store.themes().unwrap(), vec![mine]);
+        assert_eq!(store.active_theme().unwrap().as_deref(), Some("Mine"));
+        assert!(store.vertical_tabs().unwrap());
+
+        store.set_active_theme(None).unwrap();
+        assert_eq!(store.active_theme().unwrap(), None);
+    }
+
+    #[test]
+    fn a_theme_missing_fields_reads_with_builtin_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "tethys-config-theme-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        std::fs::create_dir_all(store.dir()).unwrap();
+        std::fs::write(
+            store.dir().join("state.toml"),
+            "theme = \"Mine\"\n\n[[themes]]\nname = \"Mine\"\nbackground = \"#ffffff\"\n",
+        )
+        .unwrap();
+        let themes = store.themes().unwrap();
+        assert_eq!(themes[0].background, "#ffffff");
+        assert_eq!(themes[0].foreground, ThemeSpec::builtin().foreground);
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod tab_skin;
 mod terminal_view;
 mod tests_panel;
 mod theme;
+mod themes_ui;
 mod update_ui;
 mod workspace;
 
@@ -46,9 +47,9 @@ fn main() {
 
     application().with_assets(assets::AppAssets).run(move |cx| {
         gpui_kit::init(cx);
-        theme::apply(cx);
-        workspace::install_menus(cx);
         cx.set_global(workspace::Services::new());
+        theme::init(cx);
+        workspace::install_menus(cx);
         tab_skin::init(cx);
         cx.bind_keys(workspace::key_bindings());
 

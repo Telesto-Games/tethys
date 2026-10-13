@@ -14,9 +14,8 @@ use tethys_adapters::agent_terminal::backend::vte::ansi::{CursorShape, Rgb};
 use tethys_adapters::agent_terminal::{TerminalHandle, ViewEvent, palette};
 
 use crate::keys;
+use crate::theme::TerminalSkin;
 
-const FONT_FAMILY: &str = "Cascadia Mono";
-const FONT_SIZE: f32 = 14.;
 const LINE_HEIGHT: f32 = 1.3;
 const PADDING: f32 = 6.;
 const SELECTION: Rgb = Rgb {
@@ -77,7 +76,7 @@ impl TerminalView {
             metrics: Rc::new(Cell::new(Metrics {
                 origin: Point::default(),
                 cell_width: px(8.),
-                line_height: px(FONT_SIZE * LINE_HEIGHT),
+                line_height: px(TerminalSkin::default().font_size * LINE_HEIGHT),
             })),
             scroll_lines: 0.,
             selecting: false,
@@ -250,13 +249,15 @@ impl Render for TerminalView {
         let focused = self.focus.is_focused(window);
         let handle = self.handle.clone();
         let metrics = self.metrics.clone();
+        let skin = cx.global::<TerminalSkin>().clone();
+        let background = hsla_from(skin.colors.background);
         div()
             .id("terminal")
             .key_context("Terminal")
             .track_focus(&self.focus)
             .size_full()
             .p(px(PADDING))
-            .bg(hsla_from(palette::BACKGROUND))
+            .bg(background)
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::right_click))
@@ -265,7 +266,9 @@ impl Render for TerminalView {
             .on_scroll_wheel(cx.listener(Self::scroll))
             .child(
                 canvas(
-                    move |bounds, window, _| layout(&handle, bounds, focused, &metrics, window),
+                    move |bounds, window, _| {
+                        layout(&handle, bounds, focused, &metrics, &skin, window)
+                    },
                     move |_, frame, window, cx| frame.paint(window, cx),
                 )
                 .size_full(),
@@ -290,6 +293,7 @@ struct Frame {
     blocks: Vec<(Bounds<Pixels>, Hsla)>,
     text: Vec<(Point<Pixels>, ShapedLine)>,
     cursor_outline: Option<Bounds<Pixels>>,
+    cursor_color: Hsla,
     line_height: Pixels,
 }
 
@@ -305,11 +309,7 @@ impl Frame {
             let _ = line.paint(origin, self.line_height, TextAlign::Left, None, window, cx);
         }
         if let Some(bounds) = self.cursor_outline {
-            window.paint_quad(outline(
-                bounds,
-                hsla_from(palette::CURSOR),
-                BorderStyle::Solid,
-            ));
+            window.paint_quad(outline(bounds, self.cursor_color, BorderStyle::Solid));
         }
     }
 }
@@ -341,17 +341,18 @@ fn layout(
     bounds: Bounds<Pixels>,
     focused: bool,
     metrics: &Rc<Cell<Metrics>>,
+    skin: &TerminalSkin,
     window: &mut Window,
 ) -> Frame {
-    let font_size = px(FONT_SIZE);
-    let base_font = font(FONT_FAMILY);
+    let font_size = px(skin.font_size);
+    let base_font = font(skin.font_family.as_str());
     let text_system = window.text_system().clone();
     let font_id = text_system.resolve_font(&base_font);
     let cell_width = text_system
         .advance(font_id, font_size, 'm')
         .map(|s| s.width)
         .unwrap_or(px(8.));
-    let line_height = px((FONT_SIZE * LINE_HEIGHT).round());
+    let line_height = px((skin.font_size * LINE_HEIGHT).round());
     metrics.set(Metrics {
         origin: bounds.origin,
         cell_width,
@@ -387,8 +388,8 @@ fn layout(
         let row = (indexed.point.line.0 + display_offset) as usize;
         let col = indexed.point.column.0;
 
-        let mut fg = palette::resolve(cell.fg, colors);
-        let mut bg = palette::resolve(cell.bg, colors);
+        let mut fg = palette::resolve(cell.fg, colors, &skin.colors);
+        let mut bg = palette::resolve(cell.bg, colors, &skin.colors);
         if cell.flags.contains(Flags::DIM) {
             fg = Rgb {
                 r: (fg.r as u16 * 2 / 3) as u8,
@@ -404,7 +405,7 @@ fn layout(
         }
         if focused && show_cursor && indexed.point == cursor.point {
             fg = bg;
-            bg = palette::CURSOR;
+            bg = skin.colors.cursor;
         }
         if cell.flags.contains(Flags::HIDDEN) {
             fg = bg;
@@ -481,6 +482,7 @@ fn layout(
         blocks,
         text: Vec::new(),
         cursor_outline,
+        cursor_color: hsla_from(skin.colors.cursor),
         line_height,
     };
     for run in runs {
@@ -488,7 +490,7 @@ fn layout(
             bounds.origin.x + cell_width * run.col as f32,
             bounds.origin.y + line_height * run.row as f32,
         );
-        if run.style.bg != palette::BACKGROUND {
+        if run.style.bg != skin.colors.background {
             frame.backgrounds.push((
                 Bounds::new(origin, size(cell_width * run.cells as f32, line_height)),
                 hsla_from(run.style.bg),

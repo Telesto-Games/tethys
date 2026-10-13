@@ -57,6 +57,7 @@ use crate::settings_ui;
 use crate::tab_skin;
 use crate::tests_panel::{TestsPanel, TestsPanelEvent};
 use crate::theme;
+use crate::themes_ui;
 use crate::update_ui;
 
 /// Initial width of the build pane on the right.
@@ -83,6 +84,7 @@ gpui_kit::actions!(
         LaunchEditor,
         ShowProjects,
         OpenSettings,
+        OpenThemes,
         Exit,
         About,
         CheckForUpdates,
@@ -97,7 +99,8 @@ gpui_kit::actions!(
     ]
 );
 
-/// The menu bar: File, Build and Help. Rendered in-window by `AppMenuBar`.
+/// The menu bar: File, Edit, Build, Debug, Test and Help. Rendered in-window
+/// by `AppMenuBar`.
 pub fn install_menus(cx: &mut App) {
     let menus = vec![
         Menu::new("File")
@@ -114,6 +117,9 @@ pub fn install_menus(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Exit", Exit),
             ])
+            .owned(),
+        Menu::new("Edit")
+            .items([MenuItem::action("Themes…", OpenThemes)])
             .owned(),
         Menu::new("Build")
             .items([
@@ -2367,6 +2373,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(|_, _: &OpenSettings, window, cx| settings_ui::open(window, cx)))
+            .on_action(cx.listener(|_, _: &OpenThemes, window, cx| themes_ui::open(window, cx)))
             .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::attach_or_continue))
             .on_action(cx.listener(Self::attach_to_editor))
