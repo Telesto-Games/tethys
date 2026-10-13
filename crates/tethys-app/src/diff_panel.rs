@@ -160,6 +160,10 @@ impl DiffPanel {
 impl EventEmitter<PanelEvent> for DiffPanel {}
 
 impl gpui_kit::component::dock::BasePanel for DiffPanel {
+    fn zoomable(&self, _: &App) -> bool {
+        false
+    }
+
     fn panel_name(&self) -> &'static str {
         "TethysDiff"
     }

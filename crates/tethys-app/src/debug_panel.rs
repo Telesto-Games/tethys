@@ -230,6 +230,10 @@ impl EventEmitter<DebugPanelEvent> for DebugPanel {}
 impl EventEmitter<PanelEvent> for DebugPanel {}
 
 impl gpui_kit::component::dock::BasePanel for DebugPanel {
+    fn zoomable(&self, _: &App) -> bool {
+        false
+    }
+
     fn panel_name(&self) -> &'static str {
         "TethysDebug"
     }

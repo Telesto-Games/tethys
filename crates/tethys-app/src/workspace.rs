@@ -329,6 +329,7 @@ impl Workspace {
             cx.subscribe_in(&dock, window, |this, _, event: &DockEvent, window, cx| {
                 if let DockEvent::LayoutChanged = event {
                     this.prune_closed_panels(cx);
+                    this.collapse_empty_docks(window, cx);
                     this.ensure_build_pane(window, cx);
                 }
             });
@@ -968,6 +969,26 @@ impl Workspace {
         let focus = panel.focus_handle(cx);
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Collapses docks whose last tab was dragged away, so they leave a strip
+    /// rather than a blank column. The dock stays, and a tab dropped on its
+    /// strip opens it again.
+    fn collapse_empty_docks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for placement in [
+            DockPlacement::Left,
+            DockPlacement::Right,
+            DockPlacement::Bottom,
+        ] {
+            let empty = {
+                let dock = self.dock.read(cx);
+                dock.is_dock_open(placement) && dock.is_empty(placement, cx)
+            };
+            if empty {
+                self.dock
+                    .update(cx, |dock, cx| dock.toggle_dock(placement, window, cx));
+            }
+        }
     }
 
     /// Drops panels the dock no longer holds (closed from their tab).

@@ -105,6 +105,10 @@ impl SessionPanel {
 pub const SESSION_PANEL_NAME: &str = "TethysSession";
 
 impl gpui_kit::component::dock::BasePanel for SessionPanel {
+    fn zoomable(&self, _: &App) -> bool {
+        false
+    }
+
     fn panel_name(&self) -> &'static str {
         SESSION_PANEL_NAME
     }

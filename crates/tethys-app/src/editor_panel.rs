@@ -351,6 +351,10 @@ impl EventEmitter<EditorEvent> for EditorPanel {}
 impl EventEmitter<PanelEvent> for EditorPanel {}
 
 impl gpui_kit::component::dock::BasePanel for EditorPanel {
+    fn zoomable(&self, _: &App) -> bool {
+        false
+    }
+
     fn panel_name(&self) -> &'static str {
         "TethysEditor"
     }
