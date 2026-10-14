@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
@@ -66,6 +67,8 @@ pub struct FileTreePanel {
     changes_only: bool,
     /// Source control details for the footer; `None` until loaded.
     scm: Option<ScmSummary>,
+    /// Whether the footer shows its detail lines under the headline.
+    scm_expanded: bool,
     scroll: UniformListScrollHandle,
     /// The row last right-clicked, which the context menu acts on; `None`
     /// for the space below the rows, which means the project folder.
@@ -84,6 +87,7 @@ impl FileTreePanel {
             status: Arc::default(),
             changes_only: false,
             scm: None,
+            scm_expanded: false,
             scroll: UniformListScrollHandle::new(),
             menu_target: None,
         };
@@ -148,13 +152,15 @@ impl FileTreePanel {
         cx.notify();
     }
 
-    /// The source control footer: provider, branch, revision and last change.
+    /// The source control footer: a headline of provider, branch and
+    /// revision, which clicking expands to show the URL and last change.
     fn render_scm_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let line = || div().text_xs().truncate().text_color(muted);
+        let line = || div().text_xs().truncate().text_color(muted).pl(px(18.));
         let (provider, ok, lines) = scm_footer(self.scm.as_ref());
         let dot = if ok { Hsla::from(rgb(0x98c379)) } else { muted };
+        let expanded = self.scm_expanded;
         div()
             .flex_none()
             .flex()
@@ -167,14 +173,37 @@ impl FileTreePanel {
             .border_color(theme.border)
             .child(
                 div()
+                    .id("scm-footer-header")
                     .flex()
                     .items_center()
                     .gap_1p5()
                     .text_sm()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.scm_expanded = !this.scm_expanded;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(if expanded { "▾" } else { "▸" }),
+                    )
                     .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
-                    .child(div().truncate().child(provider)),
+                    .child(div().truncate().child(provider))
+                    // Lets view tests find and click the header; nothing outside tests.
+                    .test_support(),
             )
-            .children(lines.into_iter().map(|l| line().child(l)))
+            .when(expanded, |d| {
+                d.children(
+                    lines
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, l)| line().id(("scm-footer-line", ix)).child(l).test_support()),
+                )
+            })
     }
 
     pub fn set_status(&mut self, status: Arc<WorkingCopyStatus>, cx: &mut Context<Self>) {
@@ -1149,5 +1178,55 @@ mod tests {
         let ignored = row_status(&status, Path::new("C:/p/Binaries/x.dll"), false);
         assert_eq!(ignored.untracked, Some(ChangeKind::Ignored));
         assert!(!ignored.diffable);
+    }
+}
+
+/// The panel rendered in a headless window: the source control footer
+/// starts collapsed and its header click toggles the detail lines.
+#[cfg(test)]
+mod view_tests {
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AppContext, TestAppContext, px, size};
+    use tethys_core::scm::WorkingCopyInfo;
+    use tethys_core::usecases::ScmSummary;
+
+    use super::FileTreePanel;
+    use crate::test_support::{self, open_window, temp_config};
+
+    #[gpui_kit::test]
+    fn scm_footer_starts_collapsed_and_toggles_on_click(cx: &mut TestAppContext) {
+        let config = temp_config("scm-footer");
+        cx.update(|cx| test_support::init(config, cx));
+        let root = std::env::temp_dir();
+        let (window, panel) = open_window(cx, size(px(300.), px(600.)), |_, cx| {
+            cx.new(|cx| {
+                let mut panel = FileTreePanel::new(root, cx);
+                panel.set_scm(
+                    ScmSummary::Ready {
+                        provider: "Git",
+                        info: WorkingCopyInfo::default(),
+                    },
+                    cx,
+                );
+                panel
+            })
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("scm-footer-header").visible());
+            assert!(window.try_find(("scm-footer-line", 0usize)).is_none());
+            assert!(!panel.read(cx).scm_expanded);
+
+            window.click("scm-footer-header", cx);
+            window.render_frame(cx);
+            assert!(panel.read(cx).scm_expanded);
+            assert!(window.find(("scm-footer-line", 0usize)).visible());
+
+            window.click("scm-footer-header", cx);
+            window.render_frame(cx);
+            assert!(!panel.read(cx).scm_expanded);
+            assert!(window.try_find(("scm-footer-line", 0usize)).is_none());
+        })
+        .unwrap();
     }
 }
