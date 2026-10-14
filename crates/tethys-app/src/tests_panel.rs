@@ -3,15 +3,18 @@
 //! view state (filter, expanded groups, selection); the workspace owns the
 //! connection and forwards its events here.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use gpui_kit::base::Disableable;
+use gpui_kit::base::{Disableable, TestSupportExt};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -25,6 +28,10 @@ const ROW_HEIGHT: f32 = 22.;
 const INDENT: f32 = 14.;
 /// Log lines shown for one test; a chatty test can log thousands.
 const MAX_INFO_LINES: usize = 500;
+/// The gap between cells of the results grid.
+const CELL_GAP: f32 = 1.;
+/// The results grid's starting height; the split under it is draggable.
+const GRID_HEIGHT: f32 = 120.;
 
 fn passed_color() -> Hsla {
     rgb(0x98c379).into()
@@ -202,6 +209,41 @@ impl TestsState {
         self.selected = Some(row.key);
     }
 
+    /// One entry per test shown, in path order: what the results grid draws.
+    fn cells(&self) -> Vec<(String, TestState)> {
+        let keep = self.keep();
+        self.catalog
+            .all()
+            .iter()
+            .filter(|t| keep(t))
+            .filter_map(|t| {
+                self.catalog
+                    .get(&t.path)
+                    .map(|(_, s, _)| (t.path.clone(), s))
+            })
+            .collect()
+    }
+
+    /// Selects the test behind grid cell `ix`, and opens its groups so the
+    /// tree shows it.
+    fn click_cell(&mut self, ix: usize) {
+        let Some((path, _)) = self.cells().into_iter().nth(ix) else {
+            return;
+        };
+        let mut prefix = String::new();
+        for part in path.split('.') {
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(part);
+            if prefix != path {
+                self.expanded.insert(prefix.clone());
+            }
+        }
+        self.selected = Some(path);
+        self.rebuild();
+    }
+
     /// Totals for a group: the tests under it that are shown.
     fn group_counts(&self, key: &str) -> TestCounts {
         self.catalog
@@ -229,6 +271,8 @@ pub struct TestsPanel {
     state: TestsState,
     filter: Entity<InputState>,
     scroll: UniformListScrollHandle,
+    /// Where the results grid was last drawn, so a click can find its cell.
+    grid_bounds: Rc<Cell<Bounds<Pixels>>>,
     _filter_events: Subscription,
 }
 
@@ -247,6 +291,7 @@ impl TestsPanel {
             state: TestsState::new(project_root),
             filter,
             scroll: UniformListScrollHandle::new(),
+            grid_bounds: Rc::new(Cell::new(Bounds::default())),
             _filter_events: filter_events,
         }
     }
@@ -343,6 +388,67 @@ impl TestsPanel {
                     .into_any_element()
             })
             .collect()
+    }
+
+    /// The results grid: one cell per test shown, coloured by its state, so a
+    /// run's progress and failures can be seen at a glance.
+    fn render_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let palette = CellPalette {
+            not_run: theme.secondary,
+            queued: theme.muted_foreground.opacity(0.35),
+            running: theme.primary,
+            passed: passed_color(),
+            failed: failed_color(),
+            skipped: warning_color().opacity(0.6),
+        };
+        let cells = self.state.cells();
+        let count = cells.len();
+        let selected = self
+            .state
+            .selected
+            .as_deref()
+            .and_then(|key| cells.iter().position(|(path, _)| path == key));
+        let colors: Vec<Hsla> = cells.iter().map(|(_, s)| palette.color(*s)).collect();
+        let bounds_out = self.grid_bounds.clone();
+        let outline = theme.foreground;
+        div()
+            .id("test-grid")
+            .size_full()
+            .p_1()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    let bounds = this.grid_bounds.get();
+                    let count = this.state.cells().len();
+                    if let Some(ix) = cell_at(count, bounds, event.position) {
+                        this.state.click_cell(ix);
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        bounds_out.set(bounds);
+                        bounds
+                    },
+                    move |_, bounds, window, _| {
+                        for (ix, color) in colors.iter().enumerate() {
+                            let Some(cell) = cell_bounds(count, bounds, ix) else {
+                                break;
+                            };
+                            window.paint_quad(fill(cell, *color));
+                            if selected == Some(ix) {
+                                window.paint_quad(outline_quad(cell, outline));
+                            }
+                        }
+                    },
+                )
+                .size_full(),
+            )
+            // Lets view tests find and click the grid; nothing outside tests.
+            .test_support()
     }
 
     fn render_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -588,6 +694,91 @@ fn state_label(state: TestState) -> &'static str {
     }
 }
 
+/// The grid's colour for each state.
+struct CellPalette {
+    not_run: Hsla,
+    queued: Hsla,
+    running: Hsla,
+    passed: Hsla,
+    failed: Hsla,
+    skipped: Hsla,
+}
+
+impl CellPalette {
+    fn color(&self, state: TestState) -> Hsla {
+        match state {
+            TestState::NotRun => self.not_run,
+            TestState::Queued => self.queued,
+            TestState::Running => self.running,
+            TestState::Passed => self.passed,
+            TestState::Failed => self.failed,
+            TestState::Skipped => self.skipped,
+        }
+    }
+}
+
+/// Columns and rows that split a `width` x `height` rectangle into `count`
+/// cells as near to square as it can: no rows for nothing, and never more
+/// columns than cells.
+fn grid_dims(count: usize, width: f32, height: f32) -> (usize, usize) {
+    if count == 0 {
+        return (0, 0);
+    }
+    let aspect = if height > 0. && width > 0. {
+        width / height
+    } else {
+        1.
+    };
+    let cols = ((count as f32 * aspect).sqrt().ceil() as usize).clamp(1, count);
+    let rows = count.div_ceil(cols);
+    (cols, rows)
+}
+
+/// Where cell `ix` of `count` is drawn inside `bounds`, cells reading left to
+/// right then down, with [`CELL_GAP`] between them.
+fn cell_bounds(count: usize, bounds: Bounds<Pixels>, ix: usize) -> Option<Bounds<Pixels>> {
+    if ix >= count {
+        return None;
+    }
+    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+    let (cols, rows) = grid_dims(count, w, h);
+    let cell_w = (w - CELL_GAP * (cols - 1) as f32) / cols as f32;
+    let cell_h = (h - CELL_GAP * (rows - 1) as f32) / rows as f32;
+    if cell_w <= 0. || cell_h <= 0. {
+        return None;
+    }
+    let (col, row) = (ix % cols, ix / cols);
+    let x = f32::from(bounds.origin.x) + col as f32 * (cell_w + CELL_GAP);
+    let y = f32::from(bounds.origin.y) + row as f32 * (cell_h + CELL_GAP);
+    Some(Bounds::new(
+        point(px(x), px(y)),
+        size(px(cell_w), px(cell_h)),
+    ))
+}
+
+/// The cell under `position`, if it's over one of the `count` cells in
+/// `bounds` (gaps count as the cell to their left or above).
+fn cell_at(count: usize, bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<usize> {
+    if count == 0 || !bounds.contains(&position) {
+        return None;
+    }
+    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+    let (cols, rows) = grid_dims(count, w, h);
+    let fx = f32::from(position.x - bounds.origin.x) / w;
+    let fy = f32::from(position.y - bounds.origin.y) / h;
+    let col = ((fx * cols as f32) as usize).min(cols - 1);
+    let row = ((fy * rows as f32) as usize).min(rows - 1);
+    let ix = row * cols + col;
+    (ix < count).then_some(ix)
+}
+
+/// A one-pixel border around `cell`, for the selected test.
+fn outline_quad(cell: Bounds<Pixels>, color: Hsla) -> PaintQuad {
+    fill(cell, transparent_black())
+        .border_color(color)
+        .border_widths(Edges::all(px(1.)))
+}
+
 /// `412 ms` under a second, else `1.25 s`; rounded first, so 999.6 ms is `1.00 s`.
 fn format_duration(secs: f64) -> String {
     let ms = (secs * 1000.0).round();
@@ -813,12 +1004,26 @@ impl Render for TestsPanel {
                             )
                             .child(div().w_px().h_full().bg(theme.border))
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(self.render_details(cx)),
+                                div().flex_1().min_w_0().child(
+                                    v_resizable("test-results")
+                                        .child(
+                                            resizable_panel()
+                                                .size(px(GRID_HEIGHT))
+                                                .size_range(px(40.)..px(f32::MAX))
+                                                .child(self.render_grid(cx)),
+                                        )
+                                        .child(
+                                            resizable_panel().child(
+                                                div()
+                                                    .id("test-details-pane")
+                                                    .size_full()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(self.render_details(cx))
+                                                    .test_support(),
+                                            ),
+                                        ),
+                                ),
                             ),
                     ),
             )
@@ -835,9 +1040,10 @@ mod tests {
     };
 
     use super::{
-        Connection, MAX_INFO_LINES, TestsState, empty_note, format_duration, in_group, keep_test,
-        ordered_entries, state_glyph, state_label, status_line,
+        Connection, MAX_INFO_LINES, TestsState, cell_at, cell_bounds, empty_note, format_duration,
+        grid_dims, in_group, keep_test, ordered_entries, state_glyph, state_label, status_line,
     };
+    use gpui_kit::{Bounds, Pixels, point, px, size};
 
     const ROOT: &str = r"D:\dev\Game";
 
@@ -890,6 +1096,100 @@ mod tests {
             project_test("Project.Hull.Livery"),
             engine_test("Engine.Core.Math"),
         ]
+    }
+
+    fn bounds(w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(10.), px(20.)), size(px(w), px(h)))
+    }
+
+    #[test]
+    fn grid_dims_fill_the_rectangle_with_near_square_cells() {
+        assert_eq!(grid_dims(0, 100., 100.), (0, 0));
+        assert_eq!(grid_dims(1, 100., 100.), (1, 1));
+        assert_eq!(grid_dims(4, 100., 100.), (2, 2));
+        assert_eq!(grid_dims(9, 300., 300.), (3, 3));
+        // Twice as wide as high: twice the columns.
+        assert_eq!(grid_dims(8, 200., 100.), (4, 2));
+        // Never more columns than tests, and a row for the remainder.
+        assert_eq!(grid_dims(3, 1000., 10.), (3, 1));
+        assert_eq!(grid_dims(5, 100., 100.), (3, 2));
+        assert_eq!(grid_dims(2, 0., 0.), (2, 1));
+    }
+
+    #[test]
+    fn cells_tile_left_to_right_then_down_and_clicks_find_them() {
+        // 201 wide: two 100-pixel cells and the gap between them.
+        let b = bounds(201., 201.);
+        assert_eq!(grid_dims(4, 201., 201.), (2, 2));
+        let c0 = cell_bounds(4, b, 0).unwrap();
+        let c1 = cell_bounds(4, b, 1).unwrap();
+        let c2 = cell_bounds(4, b, 2).unwrap();
+        assert_eq!(c0.origin, point(px(10.), px(20.)));
+        assert_eq!(c0.size, size(px(100.), px(100.)));
+        assert_eq!(c1.origin, point(px(111.), px(20.)));
+        assert_eq!(c2.origin, point(px(10.), px(121.)));
+        assert!(cell_bounds(4, b, 4).is_none());
+        assert!(cell_bounds(0, b, 0).is_none());
+
+        assert_eq!(cell_at(4, b, point(px(10.), px(20.))), Some(0));
+        assert_eq!(cell_at(4, b, point(px(150.), px(30.))), Some(1));
+        assert_eq!(cell_at(4, b, point(px(50.), px(150.))), Some(2));
+        assert_eq!(cell_at(4, b, point(px(200.), px(220.))), Some(3));
+        assert_eq!(cell_at(4, b, point(px(5.), px(30.))), None);
+        assert_eq!(cell_at(0, b, point(px(50.), px(30.))), None);
+        // Three cells in a 2x2 grid: the empty slot is nothing.
+        assert_eq!(cell_at(3, b, point(px(200.), px(220.))), None);
+    }
+
+    #[test]
+    fn grid_cells_follow_the_filter_and_the_run() {
+        let mut state = connected(catalog());
+        let shown: Vec<_> = state.cells().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            shown,
+            [
+                "Project.Hull.Livery",
+                "Project.Inventory.Accounting",
+                "Project.Inventory.Stacking"
+            ]
+        );
+        state.start_run(&[project_test("Project.Inventory.Stacking")]);
+        state.apply(TestEvent::Started("Project.Inventory.Stacking".into()));
+        assert_eq!(state.cells()[2].1, TestState::Running);
+        state.apply(TestEvent::Finished(
+            "Project.Inventory.Stacking".into(),
+            passed(0.1),
+        ));
+        assert_eq!(state.cells()[2].1, TestState::Passed);
+        assert_eq!(state.cells()[0].1, TestState::NotRun);
+        state.set_project_only(false);
+        assert_eq!(state.cells().len(), 4);
+    }
+
+    #[test]
+    fn clicking_a_cell_selects_its_test_and_opens_its_groups() {
+        let mut state = connected(catalog());
+        state.expanded.clear();
+        state.rebuild();
+        state.click_cell(2);
+        assert_eq!(
+            state.selected.as_deref(),
+            Some("Project.Inventory.Stacking")
+        );
+        assert!(state.expanded.contains("Project"));
+        assert!(state.expanded.contains("Project.Inventory"));
+        assert!(!state.expanded.contains("Project.Inventory.Stacking"));
+        assert!(
+            state
+                .rows
+                .iter()
+                .any(|r| r.key == "Project.Inventory.Stacking")
+        );
+        state.click_cell(99);
+        assert_eq!(
+            state.selected.as_deref(),
+            Some("Project.Inventory.Stacking")
+        );
     }
 
     #[test]
@@ -1158,5 +1458,88 @@ mod tests {
         assert_eq!(state.empty_note(), None);
         state.set_filter("nothing");
         assert_eq!(state.empty_note(), Some("No tests match."));
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use std::path::PathBuf;
+
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AppContext, TestAppContext, point, px, size};
+    use tethys_core::automation::{AutomationTest, TestEvent, TestResult, TestState};
+
+    use super::TestsPanel;
+    use crate::test_support::{self, open_window, temp_config};
+
+    fn test(path: &str) -> AutomationTest {
+        AutomationTest {
+            path: path.into(),
+            command: path.into(),
+            source: Some((PathBuf::from(r"D:\dev\Game\Source\Tests.cpp"), 1)),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_grid_draws_above_the_details_and_a_cell_click_selects_its_test(cx: &mut TestAppContext) {
+        let config = temp_config("tests-grid");
+        cx.update(|cx| test_support::init(config, cx));
+        let (window, panel) = open_window(cx, size(px(700.), px(500.)), |window, cx| {
+            cx.new(|cx| TestsPanel::new(PathBuf::from(r"D:\dev\Game"), window, cx))
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.apply(
+                    TestEvent::Connected {
+                        name: "Editor".into(),
+                    },
+                    cx,
+                );
+                panel.apply(
+                    TestEvent::Tests(vec![
+                        test("Project.A"),
+                        test("Project.B"),
+                        test("Project.C"),
+                        test("Project.D"),
+                    ]),
+                    cx,
+                );
+                panel.apply(TestEvent::Started("Project.A".into()), cx);
+                panel.apply(
+                    TestEvent::Finished(
+                        "Project.A".into(),
+                        TestResult {
+                            state: TestState::Failed,
+                            duration_secs: 0.1,
+                            entries: Vec::new(),
+                        },
+                    ),
+                    cx,
+                );
+            });
+            // The split settles its panel sizes after its first layout.
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let grid = window.find("test-grid");
+            let details = window.find("test-details-pane");
+            assert!(grid.visible() && details.visible());
+            assert!(grid.bounds().bottom() <= details.bounds().top());
+            assert_eq!(panel.read(cx).state.selected, None);
+
+            // The last cell is at the bottom right of the grid.
+            let grid_size = grid.bounds().size;
+            window.click_at(
+                "test-grid",
+                point(grid_size.width - px(8.), grid_size.height - px(8.)),
+                cx,
+            );
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).state.selected.as_deref(), Some("Project.D"));
+
+            window.click_at("test-grid", point(px(8.), px(8.)), cx);
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).state.selected.as_deref(), Some("Project.A"));
+        })
+        .unwrap();
     }
 }
