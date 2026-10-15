@@ -659,10 +659,32 @@ Things learned while building M0–M3 that aren't obvious from the code.
   `Source/<Name>Editor.Target.cs` exists, otherwise the first `*Editor` target. The editor
   starts through a new `ProcessLauncher` port as a detached process, outside any Job Object, so
   it outlives Tethys.
-- **Build configuration.** Development or DebugGame, picked in the project header and saved in
-  `state.toml` (`ConfigStore::build_configuration`). DebugGame builds with
-  `Build.bat … DebugGame` and launches `Engine\Binaries\Win64\UnrealEditor-Win64-DebugGame.exe`.
-  Installed engines ship that executable; it loads the project's `-Win64-DebugGame` modules.
+- **Build configuration.** A `unreal::BuildConfig` is a target kind (Editor, Game, Client, Server,
+  from the `*.Target.cs` name suffix) plus a UBT configuration (Debug, DebugGame, Development,
+  Test, Shipping). They're named as in Visual Studio ("DebugGame Editor", "Shipping",
+  "Development Server"). Editors have no Test or Shipping. The header dropdown offers each kind
+  the project has a target for (`unreal::build_configs`). Each kind builds its preferred target:
+  `<Name><Suffix>` if present, otherwise the first target of that kind.
+  - Saved in `state.toml` as `build` (`ConfigStore::build_config`). The kind, not the target
+    name, is stored, so the choice carries across projects.
+  - **Installed engines.** If `Engine/Build/InstalledBuild.txt` exists (`Project::installed_engine`), Debug,
+    Test, Client and Server are greyed and refused (`ToolError::NeedsSourceEngine`). Installed
+    builds ship no Debug or Test engine binaries and can't build Client or Server targets.
+  - **The editor configuration.** Launch, Debug and the test editor always run an editor. They
+    use the last Editor configuration chosen (`ConfigStore::build_configuration`, the pre-existing
+    key), whatever Build is set to. Each configuration's editor is
+    `UnrealEditor[-Win64-<Config>][-Cmd].exe`, e.g. `UnrealEditor-Win64-DebugGame.exe`, which loads
+    the project's `-Win64-DebugGame` modules.
+- **Launch modes.** `unreal::LaunchMode`, chosen from the ▾ beside Launch and saved as
+  `launch_mode`. Every mode runs the editor executable, so none needs cooked content:
+  - Editor
+  - Standalone game: `-game -windowed`
+  - Dedicated server: `-server -log`. The log console is its only window.
+  - Server + client: the server, then `127.0.0.1 -game -windowed`, which connects to it.
+
+  The user's extra editor arguments follow in every mode. With a Game, Client or Server
+  configuration chosen, Launch is disabled: running those builds needs a cook and stage (RunUAT
+  BuildCookRun), which isn't done yet.
 - **Settings.** File → Settings… (Ctrl+,) opens an app-wide dialog (`settings_ui.rs`). It
   has three settings. The first is **extra command-line arguments for the editor**. They're added
   after the `.uproject` whenever Tethys starts the editor, whether through Launch editor or
@@ -708,7 +730,7 @@ Things learned while building M0–M3 that aren't obvious from the code.
   area), and a collapsed side dock leaves a strip that reopens it and takes drops, as the bottom
   dock's tab strip does.
 - **Agent choice.** Without an `agents.toml`, the built-in profiles are Claude Code and opencode,
-  both on the terminal adapter. "New session ▾" lists every profile and Ctrl+Shift+T starts the
+  both on the terminal adapter. The main area's + (new session) button lists every profile and Ctrl+Shift+T starts the
   first. For full-screen TUIs like opencode, the terminal sends mouse-wheel reports (SGR or
   legacy) when the program enables mouse mode, and arrow keys on the alternate screen. Mouse
   clicks aren't forwarded yet.

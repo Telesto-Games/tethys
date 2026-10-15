@@ -8,7 +8,7 @@ use crate::debug::{DebugEvent, ProcessInfo, SourceBreakpoint};
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
 use crate::scm::{Commit, FileStatus, WorkingCopyInfo};
 use crate::theme::ThemeSpec;
-use crate::unreal::{CommandSpec, Configuration};
+use crate::unreal::{BuildConfig, CommandSpec, Configuration, LaunchMode};
 use crate::update::{Release, Version};
 
 pub type PortError = Box<dyn std::error::Error + Send + Sync>;
@@ -27,9 +27,16 @@ pub trait ConfigStore {
     /// Recently opened `.uproject` paths, most recent first.
     fn recent_projects(&self) -> PortResult<Vec<PathBuf>>;
     fn set_recent_projects(&self, projects: &[PathBuf]) -> PortResult<()>;
-    /// The build configuration last chosen, for builds and editor launches.
+    /// What Build builds, last chosen.
+    fn build_config(&self) -> PortResult<BuildConfig>;
+    fn set_build_config(&self, config: BuildConfig) -> PortResult<()>;
+    /// The editor configuration last chosen, for launching, debugging and
+    /// testing the editor (and for Build when it last built the editor).
     fn build_configuration(&self) -> PortResult<Configuration>;
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()>;
+    /// What Launch starts, last chosen.
+    fn launch_mode(&self) -> PortResult<LaunchMode>;
+    fn set_launch_mode(&self, mode: LaunchMode) -> PortResult<()>;
     /// Extra arguments for every editor launch, as typed (see `unreal::split_args`).
     /// [`crate::unreal::DEFAULT_EDITOR_ARGS`] until the user sets them.
     fn editor_args(&self) -> PortResult<String>;

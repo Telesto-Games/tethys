@@ -79,8 +79,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
                 .child(Input::new(&args))
                 .child(div().text_xs().text_color(muted).whitespace_normal().child(
                     "Added after the project whenever Tethys starts the Unreal Editor: \
-                             Launch editor, and Debug when no editor is running. Separate \
-                             arguments with spaces and quote one that contains spaces.",
+                             Launch (as the editor, a game or a server), and Debug when no \
+                             editor is running. Separate arguments with spaces and quote one \
+                             that contains spaces.",
                 ))
                 .child(
                     div()
