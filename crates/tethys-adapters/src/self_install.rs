@@ -4,7 +4,8 @@
 //! running exe is renamed to `<name>.old`, then the download, already next to
 //! it, is renamed into its place. If that fails the old exe is renamed back,
 //! so a failed update never leaves Tethys missing. The `.old` file can't be
-//! deleted while its process runs; the next start removes it.
+//! deleted while its process runs; the relaunched Tethys removes it once the
+//! old one has exited.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,10 @@ use crate::process_launcher::DetachedLauncher;
 /// fail with a sharing violation.
 const RENAME_ATTEMPTS: u32 = 20;
 const RENAME_RETRY_DELAY: Duration = Duration::from_millis(150);
+/// How long the relaunched Tethys keeps trying to remove the `.old` exe: the
+/// Tethys that updated starts it, then takes a few seconds to exit.
+const OLD_REMOVAL_ATTEMPTS: u32 = 30;
+const OLD_REMOVAL_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct ExeReplacer {
@@ -77,9 +82,23 @@ impl SelfInstaller for ExeReplacer {
     }
 
     fn remove_leftovers(&self) {
-        if let Ok(exe) = self.exe() {
-            remove_leftovers(exe);
-        }
+        let Ok(exe) = self.exe() else {
+            return;
+        };
+        let exe = exe.to_path_buf();
+        // Off the UI thread: %TEMP% can be large, and the `.old` exe is held
+        // until the Tethys that updated to this one has exited.
+        thread::spawn(move || {
+            remove_leftovers(&exe, &std::env::temp_dir());
+            let old = old_path(&exe);
+            for _ in 0..OLD_REMOVAL_ATTEMPTS {
+                if !old.exists() {
+                    break;
+                }
+                thread::sleep(OLD_REMOVAL_DELAY);
+                let _ = std::fs::remove_file(&old);
+            }
+        });
     }
 }
 
@@ -104,9 +123,18 @@ fn swap(
         )));
     }
     let old = old_path(exe);
-    // Left by an earlier update. If it's still running it can't be removed,
-    // and the rename below reports that.
-    let _ = std::fs::remove_file(&old);
+    // Left by an earlier update. One that can't be removed is still running:
+    // the Tethys that updated earlier hasn't exited yet.
+    match std::fs::remove_file(&old) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(io::Error::other(format!(
+                "{} is still in use, probably by an earlier Tethys that hasn't exited ({e}). \
+                 Close it and try again.",
+                old.display()
+            )));
+        }
+        _ => {}
+    }
     rename(exe, &old)?;
     if let Err(e) = rename(new_exe, exe) {
         return match rename(&old, exe) {
@@ -134,29 +162,42 @@ fn retrying(attempts: u32, delay: Duration, op: impl Fn() -> io::Result<()>) -> 
     }
 }
 
-/// Removes what earlier updates left next to `exe`: the `.old` exe, and the
-/// moved-away and helper copies the `self-replace` crate (used before) made,
-/// which are named `.<stem>.<random>.__relocated__.exe` and so on. One that is
-/// still running can't be removed and is left for next time.
-fn remove_leftovers(exe: &Path) {
+/// Removes what earlier updates left: the `.old` exe and partial downloads
+/// next to `exe`, and the moved-away and helper copies the `self-replace`
+/// crate (used before) made next to it or in `temp`, named
+/// `.<stem>.<random>.__relocated__.exe` and so on. One that is still running
+/// can't be removed and is left for next time.
+fn remove_leftovers(exe: &Path, temp: &Path) {
     let _ = std::fs::remove_file(old_path(exe));
-    let (Some(dir), Some(stem)) = (exe.parent(), exe.file_stem().and_then(|s| s.to_str())) else {
+    let (Some(dir), Some(stem), Some(file)) = (
+        exe.parent(),
+        exe.file_stem().and_then(|s| s.to_str()),
+        exe.file_name().and_then(|s| s.to_str()),
+    ) else {
         return;
     };
+    let replaced = format!(".{stem}.");
+    let partial = format!("{file}.new.");
+    let is_replaced = |name: &str| {
+        name.starts_with(&replaced)
+            && [".__relocated__.exe", ".__selfdelete__.exe", ".__temp__.exe"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+    };
+    let is_partial = |name: &str| name.starts_with(&partial) && name.ends_with(".part");
+    remove_matching(dir, |name| is_replaced(name) || is_partial(name));
+    if temp != dir {
+        remove_matching(temp, is_replaced);
+    }
+}
+
+/// Removes the files in `dir` whose names `matches` accepts, ignoring errors.
+fn remove_matching(dir: &Path, matches: impl Fn(&str) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let prefix = format!(".{stem}.");
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let leftover = name.starts_with(&prefix)
-            && [".__relocated__.exe", ".__selfdelete__.exe", ".__temp__.exe"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix));
-        if leftover {
+        if entry.file_name().to_str().is_some_and(&matches) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -170,7 +211,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{old_path, remove_leftovers, retrying, swap};
+    use super::{RENAME_ATTEMPTS, RENAME_RETRY_DELAY, old_path, remove_leftovers, retrying, swap};
 
     /// A fresh, empty directory for one test.
     fn scratch(name: &str) -> PathBuf {
@@ -256,7 +297,7 @@ mod tests {
             .unwrap();
 
         let result = swap(&exe, &new, |from, to| {
-            retrying(20, Duration::from_millis(50), || fs::rename(from, to))
+            retrying(RENAME_ATTEMPTS, RENAME_RETRY_DELAY, || fs::rename(from, to))
         });
         let _ = running.kill();
         let _ = running.wait();
@@ -264,6 +305,35 @@ mod tests {
         result.unwrap();
         assert_eq!(fs::read_to_string(&exe).unwrap(), "new");
         assert!(old_path(&exe).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An `.old` exe still in use means an earlier Tethys is still running
+    /// from it: the swap stops before moving anything, and says so.
+    #[cfg(windows)]
+    #[test]
+    fn an_old_exe_in_use_stops_the_swap() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = scratch("old-in-use");
+        let exe = dir.join("tethys.exe");
+        let new = dir.join("tethys.exe.new");
+        fs::write(&exe, "old").unwrap();
+        fs::write(&new, "new").unwrap();
+        fs::write(old_path(&exe), "older").unwrap();
+        // No sharing, as a running exe is held.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old_path(&exe))
+            .unwrap();
+
+        let err = swap(&exe, &new, rename).unwrap_err();
+        drop(held);
+
+        assert!(err.to_string().contains("earlier Tethys"), "{err}");
+        assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
+        assert_eq!(fs::read_to_string(&new).unwrap(), "new");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -315,15 +385,18 @@ mod tests {
     #[test]
     fn leftovers_of_earlier_updates_are_removed() {
         let dir = scratch("leftovers");
+        let temp = scratch("leftovers-temp");
         let exe = dir.join("tethys.exe");
         let keep = [
             "tethys.exe",
+            "tethys.exe.new",
             "tethys.pdb",
             ".tethys.notes.txt",
             ".other.abc.__relocated__.exe",
         ];
         let remove = [
             "tethys.exe.old",
+            "tethys.exe.new.1234.part",
             ".tethys.aausczggvluaaqufkmwxxfnmzyxqbhyd.__selfdelete__.exe",
             ".tethys.cswkecffzkeibtcksolgejfttytvavix.__relocated__.exe",
             ".tethys.qwertyuiopasdfghjklzxcvbnmqwerty.__temp__.exe",
@@ -331,8 +404,13 @@ mod tests {
         for name in keep.iter().chain(&remove) {
             fs::write(dir.join(name), "").unwrap();
         }
+        let temp_keep = ["tethys.exe.new.1234.part", "other.tmp"];
+        let temp_remove = [".tethys.zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.__relocated__.exe"];
+        for name in temp_keep.iter().chain(&temp_remove) {
+            fs::write(temp.join(name), "").unwrap();
+        }
 
-        remove_leftovers(&exe);
+        remove_leftovers(&exe, &temp);
 
         for name in keep {
             assert!(dir.join(name).exists(), "{name} kept");
@@ -340,6 +418,13 @@ mod tests {
         for name in remove {
             assert!(!dir.join(name).exists(), "{name} removed");
         }
+        for name in temp_keep {
+            assert!(temp.join(name).exists(), "{name} kept in temp");
+        }
+        for name in temp_remove {
+            assert!(!temp.join(name).exists(), "{name} removed from temp");
+        }
         let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(temp);
     }
 }
