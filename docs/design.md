@@ -655,10 +655,28 @@ Things learned while building M0–M3 that aren't obvious from the code.
 - **Build and launch (post-M3).** `tethys-core::unreal` builds the command lines as pure
   functions. A build runs `Build.bat <Target> Win64 Development -Project=… -WaitMutex` as a
   terminal session through the same `AgentHost`, so UBT output is live and the exit code marks
-  the tab ✓/✗. Only one build runs at a time. The editor target is `<Name>Editor` if
+  the tab ✓/✗. Only one build runs at a time. Rebuild adds `-Rebuild`, which is all
+  `Rebuild.bat` does. The editor target is `<Name>Editor` if
   `Source/<Name>Editor.Target.cs` exists, otherwise the first `*Editor` target. The editor
   starts through a new `ProcessLauncher` port as a detached process, outside any Job Object, so
   it outlives Tethys.
+- **Is the build current?** `unreal::BuildState::scan` reads the newest source file under the
+  project (the `.uproject`, `Source/`, and each plugin's `.uplugin` and `Source/`; C++, `.cs`
+  and descriptors only, so Content and Intermediate don't count) and the time of each
+  configuration's receipt, `Binaries\Win64\<Target>[-Win64-<Config>].target`, which UBT writes
+  when a target links. `freshness(config)` is Current, Stale (naming the file) or NeverBuilt.
+  The scan runs in the background when the project opens, after an editor save, after a build
+  and when the window is activated; it is numbered so a slow scan can't overwrite a newer one.
+  Build and Rebuild wear a dot: green when current, amber otherwise, none while unknown or
+  building. It is a heuristic (a file touched without changing counts as a change), which is
+  why a build only happens when the user asks to run something.
+- **Launch and Debug build first.** When the editor configuration is out of date, Launch and
+  Launch-with-debugger start a build with an `AfterBuild` to run on exit code 0 (a failure says
+  so and stops). F5 (attach or launch) first asks the debugger whether this project's editor is
+  running: if so it attaches as it is, since rebuilding under a live editor helps nobody; if not
+  it builds, then launches under the debugger. While the build's output is awaited the build
+  state is cleared, so the step that follows doesn't ask for another build. Closing the build
+  tab forgets the pending step.
 - **Build configuration.** A `unreal::BuildConfig` is a target kind (Editor, Game, Client, Server,
   from the `*.Target.cs` name suffix) plus a UBT configuration (Debug, DebugGame, Development,
   Test, Shipping). They're named as in Visual Studio ("DebugGame Editor", "Shipping",

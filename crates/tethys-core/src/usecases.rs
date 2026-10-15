@@ -13,7 +13,7 @@ use crate::ports::{
     EventSink, PortError, ProcessLauncher, SourceControl, TestEventSink, TestRunner, TestSession,
 };
 use crate::scm::{Commit, WorkingCopyInfo, WorkingCopyStatus};
-use crate::unreal::{self, BuildConfig, Configuration, LaunchMode, ToolError};
+use crate::unreal::{self, BuildAction, BuildConfig, Configuration, LaunchMode, ToolError};
 
 /// Lines of unchanged context shown around each change in a diff.
 pub const DIFF_CONTEXT: usize = 3;
@@ -299,12 +299,18 @@ pub fn start_build(
     id: SessionId,
     project: &Project,
     config: BuildConfig,
+    action: BuildAction,
     events: EventSink,
 ) -> Result<Box<dyn AgentSession>, ToolRunError> {
-    let cmd = unreal::build_command(project, config)?;
+    let cmd = unreal::build_command(project, config, action)?;
     let profile = AgentProfile {
         id: "build".into(),
-        name: format!("Build {} {}", cmd.args[0], config.configuration.as_str()),
+        name: format!(
+            "{} {} {}",
+            action.as_str(),
+            cmd.args[0],
+            config.configuration.as_str()
+        ),
         adapter: AdapterKind::Terminal,
         command: cmd.program.display().to_string(),
         args: cmd.args,
@@ -366,6 +372,17 @@ pub enum DebugStartError {
     },
     #[error("can't start {program} under the debugger: {source}")]
     Launch { program: String, source: PortError },
+}
+
+/// Whether this project's editor is running: whether [`debug_editor`] would
+/// attach rather than launch. Several editors count as running; attaching
+/// then says which.
+pub fn editor_is_running(debugger: &dyn Debugger, project: &Project) -> Result<bool, PortError> {
+    let processes = debugger.processes()?;
+    Ok(!matches!(
+        debug::find_editor(&processes, &project.path),
+        Err(FindEditorError::NoneRunning)
+    ))
 }
 
 /// How to start debugging the editor.
@@ -1083,6 +1100,7 @@ mod tool_tests {
             SessionId(1),
             &project(),
             config,
+            BuildAction::Build,
             Arc::new(|_, _| {}),
         )
         .unwrap();
@@ -1100,6 +1118,7 @@ mod tool_tests {
             SessionId(1),
             &project(),
             BuildConfig::editor(Configuration::DebugGame),
+            BuildAction::Build,
             sink,
         )
         .unwrap();
