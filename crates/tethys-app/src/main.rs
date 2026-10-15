@@ -50,6 +50,9 @@ fn main() {
     application().with_assets(assets::AppAssets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(workspace::Services::new());
+        cx.global::<workspace::Services>()
+            .installer
+            .remove_leftovers();
         theme::init(cx);
         workspace::install_menus(cx);
         tab_skin::init(cx);

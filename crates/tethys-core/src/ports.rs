@@ -243,8 +243,13 @@ pub trait SelfInstaller: Send + Sync {
     /// Where to download the new exe: next to the current one, so the swap
     /// is a rename on the same volume.
     fn staging_path(&self) -> PortResult<PathBuf>;
-    /// Makes `new_exe` the program that runs next time, and removes it.
+    /// Makes `new_exe` the program that runs next time, moving it into
+    /// place. If that fails, the current program is left where it was and
+    /// `new_exe` is kept.
     fn install(&self, new_exe: &Path) -> PortResult<()>;
     /// Starts the installed program with `args`, independent of this process.
     fn relaunch(&self, args: &[String]) -> PortResult<()>;
+    /// Removes what earlier updates left behind, such as the replaced exe.
+    /// Best effort: run at startup.
+    fn remove_leftovers(&self) {}
 }
