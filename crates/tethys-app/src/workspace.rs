@@ -13,10 +13,11 @@ use gpui_kit::base::{Disableable, GlobalState};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{
-    DockArea, DockEvent, DockPlacement, Panel, PanelHandle, PanelId, PanelStyle,
+    DockArea, DockEvent, DockPlacement, InsertTarget, NodeId, Panel, PanelHandle, PanelId,
+    PanelStyle,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenuItem};
+use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::component::{Icon, WindowExt};
 use gpui_kit::prelude::FluentBuilder;
@@ -40,7 +41,7 @@ use tethys_core::ports::{
     SelfInstaller, SessionEvent, SourceControl, TestEventSink, TestRunner, TestSession,
     UpdateSource,
 };
-use tethys_core::unreal::Configuration;
+use tethys_core::unreal::{BuildConfig, Configuration, LaunchMode};
 use tethys_core::usecases::{DebugStart, RecentProject, ScmSummary, TestTarget};
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
@@ -54,7 +55,7 @@ use crate::file_tree::{FileTreeEvent, FileTreePanel, file_name};
 use crate::history_panel::HistoryPanel;
 use crate::session_panel::{SessionKind, SessionPanel};
 use crate::settings_ui;
-use crate::tab_skin;
+use crate::tab_skin::{self, NewSessionAt};
 use crate::tests_panel::{TestsPanel, TestsPanelEvent};
 use crate::theme;
 use crate::themes_ui;
@@ -125,7 +126,7 @@ pub fn install_menus(cx: &mut App) {
             .items([
                 MenuItem::action("Build", BuildProject),
                 MenuItem::action("Live Coding (Ctrl+Alt+F11)", LiveCode),
-                MenuItem::action("Launch Editor", LaunchEditor),
+                MenuItem::action("Launch", LaunchEditor),
             ])
             .owned(),
         Menu::new("Debug")
@@ -244,8 +245,16 @@ pub struct Workspace {
     panels: Vec<Entity<SessionPanel>>,
     dock: Entity<DockArea>,
     sessions_started: usize,
-    /// Configuration for builds and editor launches; saved when changed.
+    /// The main area group the next session goes in, when started from that
+    /// group's new session button; otherwise the first group.
+    session_group: Option<NodeId>,
+    /// What Build builds; saved when changed.
+    build: BuildConfig,
+    /// The editor configuration for Launch, Debug and the test editor: the
+    /// last Editor build configuration chosen.
     configuration: Configuration,
+    /// What Launch starts; saved when changed.
+    launch_mode: LaunchMode,
     events: UnboundedSender<(SessionId, SessionEvent)>,
     focus: FocusHandle,
     _events: Task<()>,
@@ -465,7 +474,11 @@ impl Workspace {
         })
         .detach();
 
-        let (dock, skin) = tab_skin::dock_area("sessions", window, cx);
+        let new_session: tab_skin::NewSessionButton = {
+            let this = cx.entity().downgrade();
+            Rc::new(move |at, _, _| new_session_button(this.clone(), at))
+        };
+        let (dock, skin) = tab_skin::dock_area("sessions", new_session, window, cx);
         skin.set_panel_style(PanelStyle::TabBar, cx);
         skin.set_close_button_visible(true, cx);
         let dock_events =
@@ -481,6 +494,11 @@ impl Workspace {
         let recent = usecases::recent_projects(&services.config, &services.locator);
         let (profiles, problems) = usecases::agent_profiles(&services.config);
         let configuration = services.config.build_configuration().unwrap_or_default();
+        let build = services
+            .config
+            .build_config()
+            .unwrap_or(BuildConfig::editor(configuration));
+        let launch_mode = services.config.launch_mode().unwrap_or_default();
 
         // Stop sessions as the window closes, so quitting can wait for them.
         let this = cx.entity().downgrade();
@@ -508,7 +526,10 @@ impl Workspace {
             panels: Vec::new(),
             dock,
             sessions_started: 0,
+            session_group: None,
+            build,
             configuration,
+            launch_mode,
             events: tx,
             focus,
             _events: events,
@@ -723,20 +744,17 @@ impl Workspace {
             self.activate(i, window, cx);
             return;
         }
-        let configuration = self.configuration;
-        let label = format!(
-            "Build {} {}",
-            unreal::editor_target(project),
-            configuration.as_str()
-        );
+        let config = self.build;
+        let target = unreal::build_target(project, config)
+            .unwrap_or_else(|_| config.target.as_str().to_string());
+        let label = format!("Build {target} {}", config.configuration.as_str());
         self.start_tab(
             label,
             SessionKind::Build,
             window,
             cx,
             |host, id, project, sink| {
-                usecases::start_build(&[host], id, project, configuration, sink)
-                    .map_err(|e| e.to_string())
+                usecases::start_build(&[host], id, project, config, sink).map_err(|e| e.to_string())
             },
         );
     }
@@ -770,29 +788,56 @@ impl Workspace {
         .detach();
     }
 
-    fn set_configuration(&mut self, configuration: Configuration, cx: &mut Context<Self>) {
-        self.configuration = configuration;
-        if let Err(e) = cx
-            .global::<Services>()
-            .config
-            .set_build_configuration(configuration)
-        {
+    /// Chooses what Build builds. An Editor configuration also becomes the
+    /// one Launch, Debug and the test editor use.
+    fn set_build_config(&mut self, config: BuildConfig, cx: &mut Context<Self>) {
+        self.build = config;
+        let config_store = &cx.global::<Services>().config;
+        let mut saved = config_store.set_build_config(config);
+        if config.is_editor() {
+            self.configuration = config.configuration;
+            saved = saved.and_then(|()| config_store.set_build_configuration(config.configuration));
+        }
+        if let Err(e) = saved {
             self.error = Some(format!("can't save build configuration: {e}"));
         }
         cx.notify();
+    }
+
+    /// Launches in `mode`, and makes it what Launch starts from now on.
+    fn launch_in(&mut self, mode: LaunchMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch_mode = mode;
+        if let Err(e) = cx.global::<Services>().config.set_launch_mode(mode) {
+            self.error = Some(format!("can't save launch mode: {e}"));
+        }
+        self.launch_editor(&LaunchEditor, window, cx);
     }
 
     fn launch_editor(&mut self, _: &LaunchEditor, _: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.unreal_project() else {
             return;
         };
-        let args = settings_ui::editor_args(cx);
-        if let Err(e) =
-            usecases::launch_editor(project, self.configuration, &args, &DetachedLauncher)
-        {
-            self.error = Some(e.to_string());
+        if !self.build.is_editor() {
+            self.error = Some(format!(
+                "Launch runs Editor configurations. {} is build-only for now: running it needs \
+                 its content cooked. Pick an Editor configuration to launch.",
+                self.build.label()
+            ));
             cx.notify();
+            return;
         }
+        let args = settings_ui::editor_args(cx);
+        let launched = usecases::launch_editor(
+            project,
+            self.configuration,
+            self.launch_mode,
+            &args,
+            &DetachedLauncher,
+        );
+        if let Err(e) = launched {
+            self.error = Some(e.to_string());
+        }
+        cx.notify();
     }
 
     /// Starts a terminal session with `start` and adds it to the dock.
@@ -809,6 +854,7 @@ impl Workspace {
             EventSink,
         ) -> Result<Box<dyn AgentSession>, String>,
     ) {
+        let group = self.session_group.take();
         let Some(project) = self.project.as_ref() else {
             return;
         };
@@ -837,6 +883,17 @@ impl Workspace {
                     self.close_finished_builds(window, cx);
                 }
                 self.add_dock_panel(&panel, placement, Some(BUILD_PANE_WIDTH), window, cx);
+                // The dock adds to the first group; move it to the one asked for.
+                if let Some(node) = group.filter(|_| placement == DockPlacement::Center) {
+                    let id = PanelId::from(panel.entity_id());
+                    let target = InsertTarget::Tabs {
+                        node,
+                        ix: None,
+                        activate: true,
+                    };
+                    self.dock
+                        .update(cx, |dock, cx| dock.move_panel(id, target, window, cx));
+                }
                 self.panels.push(panel);
                 if kind == SessionKind::Build
                     && let Some(placeholder) = self.build_placeholder.take()
@@ -1974,23 +2031,94 @@ impl Workspace {
         }
     }
 
-    /// Debug when detached, Detach when attached.
-    fn render_debug_button(&self, cx: &mut Context<Self>) -> Button {
-        let button = Button::new("debug")
+    /// Launch, in the mode last chosen, joined to a menu of the other modes.
+    /// Only Editor configurations launch; the others are build-only for now.
+    fn render_launch_button(&self, cx: &mut Context<Self>) -> Div {
+        let disabled = !self.build.is_editor();
+        let tooltip = if disabled {
+            format!(
+                "{} is build-only: running it needs its content cooked. Pick an Editor \
+                 configuration to launch.",
+                self.build.label()
+            )
+        } else {
+            format!(
+                "{} in {} (Ctrl+Shift+E)",
+                self.launch_mode.action_label(),
+                BuildConfig::editor(self.configuration).label()
+            )
+        };
+        // Inside the border, so both halves fill the toolbar height together.
+        let inner_height = TOOLBAR_HEIGHT - px(2.);
+        let launch = Button::new("launch-editor")
             .small()
+            .h(inner_height)
+            .ghost()
+            .icon(Icon::new(IconName::Play))
+            .label(self.launch_mode.action_label())
+            .tooltip(tooltip)
+            .disabled(disabled)
+            .on_click(
+                cx.listener(|this, _, window, cx| this.launch_editor(&LaunchEditor, window, cx)),
+            );
+        let current = self.launch_mode;
+        let modes = Button::new("launch-mode")
+            .small()
+            .h(inner_height)
+            .ghost()
+            .icon(Icon::new(IconName::ChevronDown))
+            .tooltip("Launch the editor, the game, a server, or a server and a client")
+            .disabled(disabled)
+            .dropdown_menu({
+                let this = cx.entity().downgrade();
+                move |menu, _, _| {
+                    LaunchMode::ALL.into_iter().fold(menu, |menu, mode| {
+                        let this = this.clone();
+                        menu.item(
+                            PopupMenuItem::new(mode.as_str())
+                                .checked(mode == current)
+                                .on_click(move |_, window, cx| {
+                                    let _ = this
+                                        .update(cx, |this, cx| this.launch_in(mode, window, cx));
+                                }),
+                        )
+                    })
+                }
+            });
+        let theme = cx.theme();
+        div()
+            .flex()
+            .items_center()
+            .flex_none()
             .h(TOOLBAR_HEIGHT)
-            .outline()
-            .icon(Icon::new(IconName::Bug));
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .child(launch)
+            .child(div().w_px().h_full().bg(theme.border))
+            .child(modes)
+    }
+
+    /// Debug when detached, Detach when attached: an icon for each, named by
+    /// its tooltip.
+    fn render_debug_button(&self, cx: &mut Context<Self>) -> Button {
+        let button = Button::new("debug").small().size(TOOLBAR_HEIGHT).outline();
         match self.debug.status {
             DebugStatus::Detached => button
-                .label("Debug")
-                .tooltip("Attach to this project's editor, or launch it under the debugger (F5)")
+                .icon(Icon::new(IconName::Bug))
+                .tooltip(format!(
+                    "Debug: attach to this project's editor, or launch {} under the debugger (F5)",
+                    BuildConfig::editor(self.configuration).label()
+                ))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.start_debugging(DebugStart::Auto, window, cx)
                 })),
-            DebugStatus::Attaching => button.label("Starting…").disabled(true),
+            DebugStatus::Attaching => button
+                .icon(Icon::new(IconName::LoaderCircle))
+                .tooltip("Starting the debugger…")
+                .disabled(true),
             DebugStatus::Running | DebugStatus::Stopped(_) => button
-                .label("Detach")
+                .icon(Icon::new(IconName::BugOff))
                 .tooltip("Detach, leaving the editor running (Shift+F5)")
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.detach_debugger(&DetachDebugger, window, cx)
@@ -2159,6 +2287,7 @@ impl Workspace {
 
     fn render_project(&self, project: &Project, cx: &mut Context<Self>) -> impl IntoElement {
         let debug_button = self.render_debug_button(cx);
+        let launch_editor = self.render_launch_button(cx);
         let theme = cx.theme();
         let unreal = project.is_unreal();
         let engine_ok = !unreal || project.engine.is_ok();
@@ -2181,7 +2310,6 @@ impl Workspace {
         } else {
             ("Folder".to_string(), project.root().display().to_string())
         };
-        let divider = || div().w_px().h(px(20.)).mx_1().bg(theme.border);
 
         let identity = div()
             .flex_1()
@@ -2231,69 +2359,47 @@ impl Workspace {
             );
 
         // Every header control is TOOLBAR_HEIGHT tall with small-size labels.
-        let configuration = div()
-            .flex()
-            .items_center()
-            .flex_none()
-            .h(TOOLBAR_HEIGHT)
-            .gap_0p5()
-            .p_0p5()
-            .rounded(theme.radius)
-            .bg(theme.background)
-            .border_1()
-            .border_color(theme.border)
-            .children(Configuration::ALL.map(|configuration| {
-                let button =
-                    Button::new(configuration.as_str())
-                        .small()
-                        // Fill the pill: its height minus border and padding.
-                        .h(TOOLBAR_HEIGHT - px(6.))
-                        .label(configuration.as_str())
-                        .tooltip("Configuration for Build and Launch editor")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_configuration(configuration, cx)
-                        }));
-                if configuration == self.configuration {
-                    button.primary()
-                } else {
-                    button.ghost()
-                }
-            }));
-
-        let build = Button::new("build")
+        let configuration = Button::new("build-config")
             .small()
             .h(TOOLBAR_HEIGHT)
             .outline()
+            .label(self.build.label())
+            .dropdown_caret(true)
+            .tooltip(format!(
+                "What Build builds. Launch, Debug and the test editor use the last Editor \
+                 configuration ({}).",
+                BuildConfig::editor(self.configuration).label()
+            ))
+            .dropdown_menu({
+                let this = cx.entity().downgrade();
+                let configs = unreal::build_configs(project);
+                let installed = project.installed_engine;
+                let current = self.build;
+                move |menu, _, _| build_config_menu(menu, &configs, current, installed, &this)
+            });
+
+        // Icon only, square at the toolbar height; the tooltips name them.
+        let build = Button::new("build")
+            .small()
+            .size(TOOLBAR_HEIGHT)
+            .outline()
             .icon(Icon::new(IconName::Hammer))
-            .label("Build")
             .tooltip("Build (Ctrl+Shift+B)")
             .on_click(cx.listener(|this, _, window, cx| this.build(&BuildProject, window, cx)));
         let live_coding = Button::new("live-coding")
             .small()
-            .h(TOOLBAR_HEIGHT)
+            .size(TOOLBAR_HEIGHT)
             .outline()
             .icon(Icon::new(IconName::Zap))
-            .label("Live Coding")
-            .tooltip("Recompile C++ into the running editor (Ctrl+Alt+F11)")
+            .tooltip("Live Coding: recompile C++ into the running editor (Ctrl+Alt+F11)")
             .on_click(cx.listener(|this, _, window, cx| this.live_code(&LiveCode, window, cx)));
-        let launch_editor = Button::new("launch-editor")
-            .small()
-            .h(TOOLBAR_HEIGHT)
-            .outline()
-            .icon(Icon::new(IconName::Play))
-            .label("Launch editor")
-            .tooltip("Launch editor (Ctrl+Shift+E)")
-            .on_click(
-                cx.listener(|this, _, window, cx| this.launch_editor(&LaunchEditor, window, cx)),
-            );
 
         let tests = Button::new("tests")
             .small()
-            .h(TOOLBAR_HEIGHT)
+            .size(TOOLBAR_HEIGHT)
             .outline()
             .icon(Icon::new(IconName::FlaskConical))
-            .label("Tests")
-            .tooltip("List and run this project's automation tests")
+            .tooltip("Tests: list and run this project's automation tests")
             .on_click(cx.listener(|this, _, window, cx| this.show_tests(&ShowTests, window, cx)));
 
         let header = div()
@@ -2311,49 +2417,11 @@ impl Workspace {
                 header
                     .child(configuration)
                     .child(build)
-                    .child(live_coding)
                     .child(launch_editor)
                     .child(debug_button)
+                    .child(live_coding)
                     .child(tests)
-                    .child(divider())
-            })
-            .child(
-                Button::new("new-session")
-                    .small()
-                    .h(TOOLBAR_HEIGHT)
-                    .primary()
-                    .icon(Icon::new(IconName::Plus))
-                    .label("New session")
-                    .tooltip(
-                        "Pick an agent or a plain terminal (Ctrl+Shift+T starts the first agent)",
-                    )
-                    .dropdown_menu({
-                        let this = cx.entity().downgrade();
-                        let names: Vec<String> =
-                            self.profiles.iter().map(|p| p.name.clone()).collect();
-                        move |menu, _, _| {
-                            let menu = names.iter().enumerate().fold(menu, |menu, (i, name)| {
-                                let this = this.clone();
-                                menu.item(PopupMenuItem::new(name.clone()).on_click(
-                                    move |_, window, cx| {
-                                        let _ = this
-                                            .update(cx, |this, cx| this.start_agent(i, window, cx));
-                                    },
-                                ))
-                            });
-                            let this = this.clone();
-                            menu.separator().item(
-                                PopupMenuItem::new("Terminal (Ctrl+Shift+`)").on_click(
-                                    move |_, window, cx| {
-                                        let _ = this.update(cx, |this, cx| {
-                                            this.new_terminal(&NewTerminal, window, cx)
-                                        });
-                                    },
-                                ),
-                            )
-                        }
-                    }),
-            );
+            });
 
         // For a .uproject the build pane is always in the dock, even with no sessions.
         // Drag a tab to an edge of a pane to split, or onto another tab bar to move it.
@@ -2367,6 +2435,61 @@ impl Workspace {
             .child(header)
             .child(body)
     }
+}
+
+/// The button that starts an agent or a terminal at `at` in the main area:
+/// a + at the end of a tab bar, a row in the side tab list, or a labelled
+/// button in an empty main area. The session goes in that group.
+fn new_session_button(this: WeakEntity<Workspace>, at: NewSessionAt) -> AnyElement {
+    let button = Button::new("new-session")
+        .icon(Icon::new(IconName::Plus))
+        .tab_stop(false)
+        .tooltip(
+            "New session: pick an agent or a plain terminal (Ctrl+Shift+T starts the first agent)",
+        );
+    let button = match at {
+        NewSessionAt::TabBar(_) => button.xsmall().ghost(),
+        NewSessionAt::SideList(_) => button.small().ghost().w_full().label("New session"),
+        NewSessionAt::EmptyArea => button.primary().label("New session"),
+    };
+    let group = at.group();
+    button
+        .dropdown_menu(move |menu, _, cx| new_session_menu(menu, this.clone(), group, cx))
+        .into_any_element()
+}
+
+/// The agent profiles, then a plain terminal; the session goes in `group`.
+fn new_session_menu(
+    menu: PopupMenu,
+    this: WeakEntity<Workspace>,
+    group: Option<NodeId>,
+    cx: &App,
+) -> PopupMenu {
+    let names: Vec<String> = this
+        .upgrade()
+        .map(|workspace| {
+            let profiles = &workspace.read(cx).profiles;
+            profiles.iter().map(|p| p.name.clone()).collect()
+        })
+        .unwrap_or_default();
+    let menu = names.into_iter().enumerate().fold(menu, |menu, (i, name)| {
+        let this = this.clone();
+        menu.item(PopupMenuItem::new(name).on_click(move |_, window, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.session_group = group;
+                this.start_agent(i, window, cx)
+            });
+        }))
+    });
+    menu.separator()
+        .item(
+            PopupMenuItem::new("Terminal (Ctrl+Shift+`)").on_click(move |_, window, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.session_group = group;
+                    this.new_terminal(&NewTerminal, window, cx)
+                });
+            }),
+        )
 }
 
 impl Render for Workspace {
@@ -2522,6 +2645,45 @@ fn recent_entry_text(entry: &RecentProject) -> (String, String, bool) {
         Err(e) => (e.clone(), true),
     };
     (name, detail, is_error)
+}
+
+/// The build configuration menu: the configurations in `configs` under a
+/// heading per kind of target, `current` checked. With an installed engine,
+/// those only a source-built engine can build are greyed and say so.
+fn build_config_menu(
+    menu: PopupMenu,
+    configs: &[BuildConfig],
+    current: BuildConfig,
+    installed_engine: bool,
+    workspace: &WeakEntity<Workspace>,
+) -> PopupMenu {
+    let mut menu = menu;
+    let mut kind = None;
+    for &config in configs {
+        if kind != Some(config.target) {
+            if kind.is_some() {
+                menu = menu.separator();
+            }
+            menu = menu.label(config.target.as_str());
+            kind = Some(config.target);
+        }
+        let unavailable = installed_engine && config.needs_source_engine();
+        let label = if unavailable {
+            format!("{}  (needs a source-built engine)", config.label())
+        } else {
+            config.label()
+        };
+        let workspace = workspace.clone();
+        menu = menu.item(
+            PopupMenuItem::new(label)
+                .checked(config == current)
+                .disabled(unavailable)
+                .on_click(move |_, _, cx| {
+                    let _ = workspace.update(cx, |this, cx| this.set_build_config(config, cx));
+                }),
+        );
+    }
+    menu
 }
 
 fn association_label(project: &Project) -> String {

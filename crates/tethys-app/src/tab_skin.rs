@@ -9,6 +9,10 @@
 //! would hold that one in place so no dock is left empty, but the workspace
 //! collapses an emptied dock instead. An empty region takes a dropped tab.
 //!
+//! The main area carries the button that starts a session where it will
+//! appear: at the end of each group's top tab bar, after the sessions in the
+//! side list, or in the middle of an empty main area. The workspace draws it.
+//!
 //! Each dock's collapse button ends its own top tab bar, and a collapsed side
 //! dock leaves a strip that opens it again: the side docks get the pattern
 //! gpui-component gives the bottom dock, whose collapsed tab strip stays.
@@ -38,6 +42,10 @@ use crate::workspace::Services;
 const SIDE_TABS_WIDTH: Pixels = px(200.);
 /// Height of one tab in the side list.
 const SIDE_TAB_HEIGHT: Pixels = px(30.);
+/// The right padding of gpui-component's tab bar controls, and the gap
+/// between them.
+const CONTROLS_PADDING: Pixels = px(8.);
+const CONTROLS_GAP: Pixels = px(4.);
 /// Width of the strip a collapsed side dock leaves.
 const COLLAPSED_STRIP_WIDTH: Pixels = px(28.);
 
@@ -64,10 +72,36 @@ pub fn set_vertical(vertical: bool, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Where the main area shows its new session button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewSessionAt {
+    /// At the end of the top tab bar of the main area group `node`.
+    TabBar(NodeId),
+    /// After the sessions in the side tab list of the group `node`.
+    SideList(NodeId),
+    /// In the middle of a main area with no tabs.
+    EmptyArea,
+}
+
+impl NewSessionAt {
+    /// The group a session started here goes in; `None` for the empty area.
+    pub fn group(self) -> Option<NodeId> {
+        match self {
+            Self::TabBar(node) | Self::SideList(node) => Some(node),
+            Self::EmptyArea => None,
+        }
+    }
+}
+
+/// Draws the new session button for a place in the main area.
+pub type NewSessionButton = Rc<dyn Fn(NewSessionAt, &mut Window, &mut App) -> AnyElement>;
+
 /// A [`DockArea`] wearing this skin, and the gpui-component skin inside it
-/// that its settings are changed through.
+/// that its settings are changed through. `new_session` draws the main
+/// area's new session button.
 pub fn dock_area(
     id: impl Into<SharedString>,
+    new_session: NewSessionButton,
     window: &mut Window,
     cx: &mut App,
 ) -> (Entity<DockArea>, Rc<DockSkin>) {
@@ -92,6 +126,7 @@ pub fn dock_area(
             inner,
             area: cx.weak_entity(),
             snapshot: snapshot.clone(),
+            new_session,
         });
         let area = DockArea::new(id, None, window, cx).with_renderer(this);
         snapshot.set(Snapshot::of(&area, cx));
@@ -189,6 +224,7 @@ struct Skin {
     inner: Rc<DockSkin>,
     area: WeakEntity<DockArea>,
     snapshot: Rc<Cell<Snapshot>>,
+    new_session: NewSessionButton,
 }
 
 impl Skin {
@@ -256,7 +292,14 @@ impl DockAreaRenderer for Skin {
         };
         let area = self.area.clone();
         let drop = cx.theme().tokens.drop_target;
+        // An empty main area offers to start a session in it.
+        let new_session = (placement == DockPlacement::Center)
+            .then(|| (self.new_session)(NewSessionAt::EmptyArea, window, cx));
         frame
+            .when(new_session.is_some(), |this| {
+                this.flex().items_center().justify_center()
+            })
+            .children(new_session)
             .drag_over::<DragPanel>(move |this, _, _, _| this.bg(drop))
             .on_drop(move |drag: &DragPanel, window, cx| {
                 drop_into(&area, placement, drag, window, cx)
@@ -312,6 +355,7 @@ impl DockAreaRenderer for Skin {
         Rc::new(Tabs {
             inner: self.inner.tab_group_renderer(),
             area: self.area.clone(),
+            new_session: self.new_session.clone(),
             scroll: ScrollHandle::new(),
             last_active_ix: Cell::new(None),
         })
@@ -323,6 +367,7 @@ impl DockAreaRenderer for Skin {
 struct Tabs {
     inner: Rc<dyn TabGroupRenderer>,
     area: WeakEntity<DockArea>,
+    new_session: NewSessionButton,
     scroll: ScrollHandle,
     /// The tab the last frame showed, so a newly shown one is scrolled to.
     last_active_ix: Cell<Option<usize>>,
@@ -332,13 +377,16 @@ impl Tabs {
     /// Whether this group lists its tabs down the side: only in the main
     /// area, and not while collapsed (a collapsed group is just its tab strip).
     fn vertical(&self, group: &TabGroupContext, cx: &App) -> bool {
-        cx.global::<TabLayout>().vertical
-            && !group.is_collapsed()
-            && self.area.upgrade().is_some_and(|area| {
-                area.read(cx)
-                    .layout(DockPlacement::Center)
-                    .is_some_and(|tree| tree.find_node(group.node()).is_some())
-            })
+        cx.global::<TabLayout>().vertical && !group.is_collapsed() && self.in_main_area(group, cx)
+    }
+
+    /// Whether this group is in the main area, not a dock.
+    fn in_main_area(&self, group: &TabGroupContext, cx: &App) -> bool {
+        self.area.upgrade().is_some_and(|area| {
+            area.read(cx)
+                .layout(DockPlacement::Center)
+                .is_some_and(|tree| tree.find_node(group.node()).is_some())
+        })
     }
 
     /// The button that collapses or expands the dock this group is in. Every
@@ -377,7 +425,12 @@ impl Tabs {
         )
     }
 
-    fn render_side(&self, group: &TabGroupContext, cx: &mut App) -> AnyElement {
+    fn render_side(
+        &self,
+        group: &TabGroupContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (tab_bar, tab, tab_active, foreground, active_foreground, border, drag_border, drop) = (
             theme.tab_bar,
@@ -390,18 +443,42 @@ impl Tabs {
             theme.tokens.drop_target,
         );
 
-        let rows = side_rows(group.panels().iter().map(|panel| {
-            (
-                panel.visible(cx),
-                panel.panel_name(cx) == SESSION_PANEL_NAME,
-            )
-        }));
+        let panels: Vec<(bool, bool)> = group
+            .panels()
+            .iter()
+            .map(|panel| {
+                (
+                    panel.visible(cx),
+                    panel.panel_name(cx) == SESSION_PANEL_NAME,
+                )
+            })
+            .collect();
+        let rows = side_rows(panels.iter().copied());
+        // The new session button follows the sessions, so it shifts the
+        // rows after it down one.
+        let sessions = panels
+            .iter()
+            .filter(|(visible, session)| *visible && *session)
+            .count();
         let active_ix = group.active_ix();
         let shown = group.active_panel().map(|panel| panel.panel_id(cx));
         let last = self.last_active_ix.replace(Some(active_ix));
         if let Some(pos) = scroll_target(last, active_ix, &rows) {
-            self.scroll.scroll_to_item(pos);
+            self.scroll
+                .scroll_to_item(if pos < sessions { pos } else { pos + 1 });
         }
+        let new_session = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(SIDE_TAB_HEIGHT)
+            .px_1()
+            .child((self.new_session)(
+                NewSessionAt::SideList(group.node()),
+                window,
+                cx,
+            ))
+            .into_any_element();
         let droppable = group.is_droppable();
 
         let tabs = rows.into_iter().map(|row| {
@@ -493,6 +570,8 @@ impl Tabs {
                 })
                 .into_any_element()
         });
+        let mut tabs: Vec<AnyElement> = tabs.collect();
+        tabs.insert(sessions, new_session);
 
         // Room below the last tab to drop a panel at the end.
         let tabs_count = group.panels().len();
@@ -565,7 +644,7 @@ impl TabGroupRenderer for Tabs {
         cx: &mut App,
     ) -> AnyElement {
         if self.vertical(group, cx) {
-            return self.render_side(group, cx);
+            return self.render_side(group, window, cx);
         }
         let bar = self.inner.render_tab_bar(group, window, cx);
         // gpui-component only drags tabs the dock calls draggable, which an
@@ -591,16 +670,54 @@ impl TabGroupRenderer for Tabs {
             }
             _ => None,
         };
-        let toggle = self.dock_toggle(group, cx).map(|button| {
+        // Main area groups end with the new session button, docks with
+        // their collapse button. They join the controls gpui-component ends
+        // the bar with (the panel menu) as one set: its box is as tall as its
+        // buttons, centred in the bar with its own bottom border, so this box
+        // matches it and carries on over its right padding to the set's
+        // spacing. A collapsed group's bar has no controls of its own, so
+        // the box starts one. Around it, the bar's background and bottom
+        // border carry on to the edge.
+        let new_session = (!group.is_collapsed() && self.in_main_area(group, cx))
+            .then(|| (self.new_session)(NewSessionAt::TabBar(group.node()), window, cx));
+        let toggle = self
+            .dock_toggle(group, cx)
+            .map(IntoElement::into_any_element);
+        let buttons: Vec<AnyElement> = new_session.into_iter().chain(toggle).collect();
+        let joined = !group.is_collapsed();
+        let border = cx.theme().border;
+        let controls = (!buttons.is_empty()).then(|| {
             div()
+                .relative()
                 .flex()
                 .flex_none()
                 .items_center()
-                .px_1()
-                .border_b_1()
-                .border_color(cx.theme().border)
                 .bg(cx.theme().tab_bar)
-                .child(button)
+                .map(|this| match joined {
+                    true => this.ml(-CONTROLS_PADDING + CONTROLS_GAP),
+                    false => this,
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .bottom_0()
+                        .size_full()
+                        .border_b_1()
+                        .border_color(border),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .pr_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .when(!joined, |this| this.pl_2().border_l_1())
+                        .children(buttons),
+                )
         });
         div()
             .id("tab-bar")
@@ -613,7 +730,7 @@ impl TabGroupRenderer for Tabs {
                     .child(bar)
                     .children(drag_layer),
             )
-            .children(toggle)
+            .children(controls)
             .context_menu(tab_menu)
             .into_any_element()
     }

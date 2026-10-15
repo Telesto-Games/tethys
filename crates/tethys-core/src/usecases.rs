@@ -13,7 +13,7 @@ use crate::ports::{
     EventSink, PortError, ProcessLauncher, SourceControl, TestEventSink, TestRunner, TestSession,
 };
 use crate::scm::{Commit, WorkingCopyInfo, WorkingCopyStatus};
-use crate::unreal::{self, Configuration, ToolError};
+use crate::unreal::{self, BuildConfig, Configuration, LaunchMode, ToolError};
 
 /// Lines of unchanged context shown around each change in a diff.
 pub const DIFF_CONTEXT: usize = 3;
@@ -268,6 +268,10 @@ pub fn open_project(path: &Path, locator: &dyn EngineLocator) -> Result<Project,
     project.engine = locator
         .locate(&project.engine_association, &project.path)
         .map_err(|e| e.to_string());
+    project.installed_engine = project
+        .engine
+        .as_ref()
+        .is_ok_and(|root| root.join(r"Engine\Build\InstalledBuild.txt").is_file());
     // Missing Source is normal for Blueprint-only projects.
     if let Ok(entries) = std::fs::read_dir(project.root().join("Source")) {
         let names: Vec<String> = entries
@@ -289,22 +293,18 @@ pub enum ToolRunError {
     Launch { program: String, source: PortError },
 }
 
-/// Starts an editor build as a terminal session, so its output is visible.
+/// Starts a build as a terminal session, so its output is visible.
 pub fn start_build(
     hosts: &[&dyn AgentHost],
     id: SessionId,
     project: &Project,
-    configuration: Configuration,
+    config: BuildConfig,
     events: EventSink,
 ) -> Result<Box<dyn AgentSession>, ToolRunError> {
-    let cmd = unreal::build_command(project, configuration)?;
+    let cmd = unreal::build_command(project, config)?;
     let profile = AgentProfile {
         id: "build".into(),
-        name: format!(
-            "Build {} {}",
-            unreal::editor_target(project),
-            configuration.as_str()
-        ),
+        name: format!("Build {} {}", cmd.args[0], config.configuration.as_str()),
         adapter: AdapterKind::Terminal,
         command: cmd.program.display().to_string(),
         args: cmd.args,
@@ -330,21 +330,24 @@ pub fn start_terminal(
     start_session(hosts, id, &profile, project, events)
 }
 
-/// Starts the Unreal Editor on the project, detached from Tethys, with the
-/// user's extra `editor_args`.
+/// Starts the Unreal Editor on the project, or its executable as a game or a
+/// server (`mode`), detached from Tethys, with the user's extra `editor_args`.
 pub fn launch_editor(
     project: &Project,
     configuration: Configuration,
+    mode: LaunchMode,
     editor_args: &[String],
     launcher: &dyn ProcessLauncher,
 ) -> Result<(), ToolRunError> {
-    let cmd = unreal::editor_command(project, configuration, editor_args)?;
-    launcher
-        .spawn_detached(&cmd, project.root())
-        .map_err(|source| ToolRunError::Launch {
-            program: cmd.program.display().to_string(),
-            source,
-        })
+    for cmd in unreal::launch_commands(project, configuration, mode, editor_args)? {
+        launcher
+            .spawn_detached(&cmd, project.root())
+            .map_err(|source| ToolRunError::Launch {
+                program: cmd.program.display().to_string(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -660,6 +663,18 @@ mod tests {
         fn set_build_configuration(&self, _: Configuration) -> PortResult<()> {
             Ok(())
         }
+        fn build_config(&self) -> PortResult<BuildConfig> {
+            Ok(BuildConfig::default())
+        }
+        fn set_build_config(&self, _: BuildConfig) -> PortResult<()> {
+            Ok(())
+        }
+        fn launch_mode(&self) -> PortResult<LaunchMode> {
+            Ok(LaunchMode::Editor)
+        }
+        fn set_launch_mode(&self, _: LaunchMode) -> PortResult<()> {
+            Ok(())
+        }
         fn editor_args(&self) -> PortResult<String> {
             Ok(String::new())
         }
@@ -856,7 +871,7 @@ mod tool_tests {
 
     use super::*;
     use crate::ports::{PortResult, SessionStatus};
-    use crate::unreal::CommandSpec;
+    use crate::unreal::{CommandSpec, TargetKind};
 
     #[derive(Default)]
     struct FakeLauncher(Mutex<Vec<(CommandSpec, PathBuf)>>);
@@ -1020,7 +1035,14 @@ mod tool_tests {
     fn launch_editor_runs_detached_in_project_root() {
         let launcher = FakeLauncher::default();
         let args = vec!["-log".to_string()];
-        launch_editor(&project(), Configuration::Development, &args, &launcher).unwrap();
+        launch_editor(
+            &project(),
+            Configuration::Development,
+            LaunchMode::Editor,
+            &args,
+            &launcher,
+        )
+        .unwrap();
         let calls = launcher.0.lock().unwrap();
         assert_eq!(
             calls[0].0.program,
@@ -1031,6 +1053,45 @@ mod tool_tests {
     }
 
     #[test]
+    fn launching_server_and_client_starts_the_server_first() {
+        let launcher = FakeLauncher::default();
+        launch_editor(
+            &project(),
+            Configuration::DebugGame,
+            LaunchMode::ServerAndClient,
+            &[],
+            &launcher,
+        )
+        .unwrap();
+        let calls = launcher.0.lock().unwrap();
+        let args: Vec<_> = calls
+            .iter()
+            .map(|(cmd, _)| cmd.args[1..].join(" "))
+            .collect();
+        assert_eq!(args, ["-server -log", "127.0.0.1 -game -windowed"]);
+    }
+
+    #[test]
+    fn build_names_the_tab_after_the_target_it_builds() {
+        let host = RecordingHost::default();
+        let config = BuildConfig {
+            target: TargetKind::Game,
+            configuration: Configuration::Shipping,
+        };
+        start_build(
+            &[&host],
+            SessionId(1),
+            &project(),
+            config,
+            Arc::new(|_, _| {}),
+        )
+        .unwrap();
+        let profile = host.0.lock().unwrap().clone().unwrap();
+        assert_eq!(profile.name, "Build Game Shipping");
+        assert_eq!(profile.args[..3], ["Game", "Win64", "Shipping"]);
+    }
+
+    #[test]
     fn build_runs_build_bat_in_a_terminal_session() {
         let host = RecordingHost::default();
         let sink: EventSink = Arc::new(|_, _| {});
@@ -1038,7 +1099,7 @@ mod tool_tests {
             &[&host],
             SessionId(1),
             &project(),
-            Configuration::DebugGame,
+            BuildConfig::editor(Configuration::DebugGame),
             sink,
         )
         .unwrap();
@@ -1074,6 +1135,26 @@ mod tool_tests {
         }
         let p = open_project(&dir.join("Game.uproject"), &NoEngine).unwrap();
         assert_eq!(p.targets, ["GameEditor"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_project_tells_installed_engines_from_source_builds() {
+        let dir = std::env::temp_dir().join(format!("tethys-installed-{}", std::process::id()));
+        let engine = dir.join("UE");
+        std::fs::create_dir_all(engine.join(r"Engine\Build")).unwrap();
+        std::fs::write(dir.join("Game.uproject"), "{}").unwrap();
+        struct At(PathBuf);
+        impl EngineLocator for At {
+            fn locate(&self, _: &str, _: &Path) -> PortResult<PathBuf> {
+                Ok(self.0.clone())
+            }
+        }
+        let locator = At(engine.clone());
+        let uproject = dir.join("Game.uproject");
+        assert!(!open_project(&uproject, &locator).unwrap().installed_engine);
+        std::fs::write(engine.join(r"Engine\Build\InstalledBuild.txt"), "").unwrap();
+        assert!(open_project(&uproject, &locator).unwrap().installed_engine);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

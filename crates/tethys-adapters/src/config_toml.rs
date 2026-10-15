@@ -1,7 +1,8 @@
 //! `ConfigStore` backed by TOML files in `%APPDATA%\tethys`.
 //!
 //! - `agents.toml`: `[[agent]]` profiles (user-edited, read-only to Tethys)
-//! - `state.toml`: recent projects, build configuration and a skipped release
+//! - `state.toml`: recent projects, build configuration, launch mode and a
+//!   skipped release
 //!   (written by Tethys)
 
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tethys_core::AgentProfile;
 use tethys_core::ports::{ConfigStore, PortResult};
 use tethys_core::theme::ThemeSpec;
-use tethys_core::unreal::{self, Configuration};
+use tethys_core::unreal::{self, BuildConfig, Configuration, LaunchMode};
 use tethys_core::update::Version;
 
 #[derive(Debug, Clone)]
@@ -28,8 +29,15 @@ struct AgentsFile {
 struct StateFile {
     #[serde(default)]
     recent_projects: Vec<PathBuf>,
+    /// The editor configuration.
     #[serde(default)]
     build_configuration: Configuration,
+    /// What Build builds; `None` until chosen, when it builds the editor in
+    /// `build_configuration`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build: Option<BuildConfig>,
+    #[serde(default)]
+    launch_mode: LaunchMode,
     /// Extra editor arguments; `None` until the user sets them (then the
     /// default applies), so an empty string means "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +119,25 @@ impl ConfigStore for TomlConfigStore {
 
     fn set_build_configuration(&self, configuration: Configuration) -> PortResult<()> {
         self.update_state(|s| s.build_configuration = configuration)
+    }
+
+    fn build_config(&self) -> PortResult<BuildConfig> {
+        let state = self.read::<StateFile>("state.toml")?;
+        Ok(state
+            .build
+            .unwrap_or(BuildConfig::editor(state.build_configuration)))
+    }
+
+    fn set_build_config(&self, config: BuildConfig) -> PortResult<()> {
+        self.update_state(|s| s.build = Some(config))
+    }
+
+    fn launch_mode(&self) -> PortResult<LaunchMode> {
+        Ok(self.read::<StateFile>("state.toml")?.launch_mode)
+    }
+
+    fn set_launch_mode(&self, mode: LaunchMode) -> PortResult<()> {
+        self.update_state(|s| s.launch_mode = mode)
     }
 
     fn editor_args(&self) -> PortResult<String> {
@@ -251,6 +278,35 @@ mod state_tests {
             Configuration::DebugGame
         );
         assert_eq!(store.recent_projects().unwrap(), recent);
+    }
+
+    #[test]
+    fn build_config_defaults_to_the_editor_configuration_then_round_trips() {
+        let dir = std::env::temp_dir().join(format!("tethys-config-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        store
+            .set_build_configuration(Configuration::DebugGame)
+            .unwrap();
+        assert_eq!(
+            store.build_config().unwrap(),
+            BuildConfig::editor(Configuration::DebugGame)
+        );
+
+        let shipping = BuildConfig {
+            target: unreal::TargetKind::Game,
+            configuration: Configuration::Shipping,
+        };
+        store.set_build_config(shipping).unwrap();
+        store.set_launch_mode(LaunchMode::ServerAndClient).unwrap();
+        store.set_editor_args("-log").unwrap();
+        assert_eq!(store.build_config().unwrap(), shipping);
+        assert_eq!(store.launch_mode().unwrap(), LaunchMode::ServerAndClient);
+        assert_eq!(
+            store.build_configuration().unwrap(),
+            Configuration::DebugGame
+        );
+        assert_eq!(store.editor_args().unwrap(), "-log");
     }
 
     #[test]

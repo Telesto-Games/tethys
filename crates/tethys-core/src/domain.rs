@@ -50,6 +50,11 @@ pub struct Project {
     pub targets: Vec<String>,
     /// Engine install root, or why it couldn't be resolved.
     pub engine: Result<PathBuf, String>,
+    /// Whether the engine is an installed build (the Launcher's, or one made
+    /// with BuildGraph) rather than built from source: it has
+    /// `Engine/Build/InstalledBuild.txt`. Installed builds can't build every
+    /// configuration.
+    pub installed_engine: bool,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +110,7 @@ impl Project {
                 .collect(),
             targets: Vec::new(),
             engine: Err("not resolved".into()),
+            installed_engine: false,
         })
     }
 
@@ -118,6 +124,7 @@ impl Project {
             plugins: Vec::new(),
             targets: Vec::new(),
             engine: Err("not an Unreal project".into()),
+            installed_engine: false,
         }
     }
 

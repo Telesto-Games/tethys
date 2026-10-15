@@ -112,10 +112,10 @@ pub enum FindEditorError {
 }
 
 /// Whether `exe` is an Unreal Editor executable (any configuration), not the
-/// commandlet runner.
+/// commandlet runner (`UnrealEditor-Cmd.exe`, `UnrealEditor-Win64-DebugGame-Cmd.exe`).
 pub fn is_editor_exe(exe: &str) -> bool {
     let exe = exe.to_ascii_lowercase();
-    exe.starts_with("unrealeditor") && exe.ends_with(".exe") && !exe.starts_with("unrealeditor-cmd")
+    exe.starts_with("unrealeditor") && exe.ends_with(".exe") && !exe.ends_with("-cmd.exe")
 }
 
 /// The editor that has `uproject` open: one whose command line names it, or
@@ -301,6 +301,8 @@ mod tests {
         assert!(is_editor_exe("UnrealEditor.exe"));
         assert!(is_editor_exe("UnrealEditor-Win64-DebugGame.exe"));
         assert!(!is_editor_exe("UnrealEditor-Cmd.exe"));
+        assert!(!is_editor_exe("UnrealEditor-Win64-DebugGame-Cmd.exe"));
+        assert!(is_editor_exe("UnrealEditor-Win64-Debug.exe"));
         assert!(!is_editor_exe("UnrealTraceServer.exe"));
     }
 
