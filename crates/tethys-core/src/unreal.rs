@@ -418,7 +418,7 @@ pub fn test_editor_command(
     })
 }
 
-// Splits arguments typed on one line: separated by whitespace, with double
+/// Splits arguments typed on one line: separated by whitespace, with double
 /// quotes grouping an argument that contains spaces (the quotes are dropped;
 /// launching quotes again as needed).
 pub fn split_args(line: &str) -> Vec<String> {

@@ -819,7 +819,8 @@ impl Workspace {
         };
         if !self.build.is_editor() {
             self.error = Some(format!(
-                "Launch runs Editor configurations. {} is build-only for now: running it needs                  its content cooked. Pick an Editor configuration to launch.",
+                "Launch runs Editor configurations. {} is build-only for now: running it needs \
+                 its content cooked. Pick an Editor configuration to launch.",
                 self.build.label()
             ));
             cx.notify();

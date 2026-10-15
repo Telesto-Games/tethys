@@ -667,9 +667,12 @@ Things learned while building M0–M3 that aren't obvious from the code.
   `<Name><Suffix>` if present, otherwise the first target of that kind.
   - Saved in `state.toml` as `build` (`ConfigStore::build_config`). The kind, not the target
     name, is stored, so the choice carries across projects.
-  - **Installed engines.** If `Engine/Build/InstalledBuild.txt` exists (`Project::installed_engine`), Debug,
-    Test, Client and Server are greyed and refused (`ToolError::NeedsSourceEngine`). Installed
-    builds ship no Debug or Test engine binaries and can't build Client or Server targets.
+  - **Installed engines.** If `Engine/Build/InstalledBuild.txt` exists (`Project::installed_engine`),
+    Debug, Test, Client and Server are greyed and refused (`ToolError::NeedsSourceEngine`).
+    That is what the Launcher's builds allow: their `[InstalledPlatforms]` in `BaseEngine.ini`
+    list Editor DebugGame/Development and Game DebugGame/Development/Shipping for Win64. A custom
+    installed build made with Client, Server or extra game configurations can build more than
+    Tethys offers; reading that list instead would fix it.
   - **The editor configuration.** Launch, Debug and the test editor always run an editor. They
     use the last Editor configuration chosen (`ConfigStore::build_configuration`, the pre-existing
     key), whatever Build is set to. Each configuration's editor is
@@ -680,7 +683,10 @@ Things learned while building M0–M3 that aren't obvious from the code.
   - Editor
   - Standalone game: `-game -windowed`
   - Dedicated server: `-server -log`. The log console is its only window.
-  - Server + client: the server, then `127.0.0.1 -game -windowed`, which connects to it.
+  - Server + client: the server, then `127.0.0.1 -game -windowed`, which connects to it. Both
+    start at once; the client keeps retrying until the server is up. Both get the extra editor
+    arguments, so with the default (`-ModelContextProtocolStartServer`) both may try to start the MCP
+    server on the same port.
 
   The user's extra editor arguments follow in every mode. With a Game, Client or Server
   configuration chosen, Launch is disabled: running those builds needs a cook and stage (RunUAT
