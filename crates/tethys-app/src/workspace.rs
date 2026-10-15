@@ -41,7 +41,9 @@ use tethys_core::ports::{
     SelfInstaller, SessionEvent, SourceControl, TestEventSink, TestRunner, TestSession,
     UpdateSource,
 };
-use tethys_core::unreal::{BuildConfig, Configuration, LaunchMode};
+use tethys_core::unreal::{
+    BuildAction, BuildConfig, BuildState, Configuration, Freshness, LaunchMode,
+};
 use tethys_core::usecases::{DebugStart, RecentProject, ScmSummary, TestTarget};
 use tethys_core::{AgentProfile, AssociationKind, Project, SessionId, unreal, usecases};
 
@@ -81,6 +83,7 @@ gpui_kit::actions!(
         NextSession,
         PrevSession,
         BuildProject,
+        RebuildProject,
         LiveCode,
         LaunchEditor,
         ShowProjects,
@@ -125,6 +128,7 @@ pub fn install_menus(cx: &mut App) {
         Menu::new("Build")
             .items([
                 MenuItem::action("Build", BuildProject),
+                MenuItem::action("Rebuild", RebuildProject),
                 MenuItem::action("Live Coding (Ctrl+Alt+F11)", LiveCode),
                 MenuItem::action("Launch", LaunchEditor),
             ])
@@ -255,6 +259,13 @@ pub struct Workspace {
     configuration: Configuration,
     /// What Launch starts; saved when changed.
     launch_mode: LaunchMode,
+    /// When each configuration was last built, against the source; `None`
+    /// until the first scan, and while a scan follows a finished build.
+    build_state: Option<BuildState>,
+    /// Numbers the scans, so a slow one can't overwrite a newer one.
+    build_scan: u64,
+    /// The build that is running, and what follows it.
+    build_run: Option<BuildRun>,
     events: UnboundedSender<(SessionId, SessionEvent)>,
     focus: FocusHandle,
     _events: Task<()>,
@@ -283,6 +294,29 @@ struct Tests {
     /// Tags events, so a late event from an earlier session is ignored.
     generation: u64,
     events: Option<UnboundedSender<(u64, TestEvent)>>,
+}
+
+/// A running build: which configuration, and what to do once it succeeds.
+struct BuildRun {
+    id: SessionId,
+    config: BuildConfig,
+    then: Option<AfterBuild>,
+}
+
+/// What asked for a build because its configuration was out of date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterBuild {
+    Launch,
+    Debug(DebugStart),
+}
+
+impl AfterBuild {
+    fn label(self) -> &'static str {
+        match self {
+            AfterBuild::Launch => "Launch",
+            AfterBuild::Debug(_) => "Debug",
+        }
+    }
 }
 
 /// The debugger side of a window.
@@ -435,10 +469,12 @@ fn stop_line(frames: &[FrameRow], frame: Option<usize>, path: &Path) -> Option<u
 impl Workspace {
     fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let events = cx.spawn(async move |this, cx| {
+        let events = cx.spawn_in(window, async move |this, cx| {
             while let Some((id, event)) = rx.next().await {
                 if this
-                    .update(cx, |this, cx| this.on_session_event(id, event, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.on_session_event(id, event, window, cx)
+                    })
                     .is_err()
                 {
                     break;
@@ -530,6 +566,9 @@ impl Workspace {
             build,
             configuration,
             launch_mode,
+            build_state: None,
+            build_scan: 0,
+            build_run: None,
             events: tx,
             focus,
             _events: events,
@@ -601,6 +640,7 @@ impl Workspace {
                 self.error = None;
                 self.ensure_build_pane(window, cx);
                 self.show_files(window, cx);
+                self.refresh_build_state(cx);
                 self.new_session(&NewSession, window, cx);
             }
             Err(e) => {
@@ -733,30 +773,131 @@ impl Workspace {
     }
 
     fn build(&mut self, _: &BuildProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_build(BuildAction::Build, self.build, None, window, cx);
+    }
+
+    fn rebuild(&mut self, _: &RebuildProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_build(BuildAction::Rebuild, self.build, None, window, cx);
+    }
+
+    /// Builds `config` in the build pane; `then` runs when it succeeds.
+    fn start_build(
+        &mut self,
+        action: BuildAction,
+        config: BuildConfig,
+        then: Option<AfterBuild>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project) = self.unreal_project() else {
             return;
         };
-        // One build at a time: focus the running one instead.
+        // One build at a time: focus the running one instead. A launch
+        // waits for it when it's building the same configuration.
         if let Some(i) = self.panels.iter().position(|p| {
             let p = p.read(cx);
             p.kind() == SessionKind::Build && p.is_running()
         }) {
+            match (&mut self.build_run, then) {
+                (Some(run), Some(then)) if run.config == config => run.then = Some(then),
+                (_, Some(then)) => {
+                    self.error = Some(format!(
+                        "A build is already running. {} again when it finishes.",
+                        then.label()
+                    ));
+                }
+                (_, None) => {}
+            }
             self.activate(i, window, cx);
             return;
         }
-        let config = self.build;
         let target = unreal::build_target(project, config)
             .unwrap_or_else(|_| config.target.as_str().to_string());
-        let label = format!("Build {target} {}", config.configuration.as_str());
-        self.start_tab(
+        let label = format!(
+            "{} {target} {}",
+            action.as_str(),
+            config.configuration.as_str()
+        );
+        let id = self.start_tab(
             label,
             SessionKind::Build,
             window,
             cx,
             |host, id, project, sink| {
-                usecases::start_build(&[host], id, project, config, sink).map_err(|e| e.to_string())
+                usecases::start_build(&[host], id, project, config, action, sink)
+                    .map_err(|e| e.to_string())
             },
         );
+        if let Some(id) = id {
+            self.build_run = Some(BuildRun { id, config, then });
+        }
+    }
+
+    /// A build whose tab was closed is over as far as the toolbar and any
+    /// launch waiting on it are concerned.
+    fn forget_closed_build(&mut self, cx: &App) {
+        if let Some(run) = &self.build_run
+            && !self.panels.iter().any(|p| p.read(cx).id() == run.id)
+        {
+            self.build_run = None;
+        }
+    }
+
+    /// Whether `config` must be built before it's run: its last build is
+    /// older than the source, or there is none. Unknown counts as current,
+    /// so a launch isn't held up by a scan.
+    fn needs_build(&self, config: BuildConfig) -> bool {
+        self.build_state
+            .as_ref()
+            .and_then(|state| state.freshness(config))
+            .is_some_and(|f| !f.is_current())
+    }
+
+    /// Rescans the source and receipts in the background.
+    fn refresh_build_state(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.unreal_project().cloned() else {
+            return;
+        };
+        self.build_scan += 1;
+        let scan = self.build_scan;
+        let scanned = cx
+            .background_executor()
+            .spawn(async move { BuildState::scan(&project) });
+        cx.spawn(async move |this, cx| {
+            let state = scanned.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.build_scan == scan {
+                    this.build_state = Some(state);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The build finished: rescan, then do what waited for it.
+    fn on_build_finished(
+        &mut self,
+        run: BuildRun,
+        code: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Unknown until the scan lands, so what follows doesn't build again.
+        self.build_state = None;
+        self.refresh_build_state(cx);
+        let Some(then) = run.then else {
+            return;
+        };
+        if code != 0 {
+            self.error = Some(format!("The build failed, so {} didn't run.", then.label()));
+            cx.notify();
+            return;
+        }
+        match then {
+            AfterBuild::Launch => self.launch_editor(&LaunchEditor, window, cx),
+            AfterBuild::Debug(how) => self.start_debugging(how, window, cx),
+        }
     }
 
     /// Asks the running editor to Live Code the changed C++.
@@ -813,7 +954,7 @@ impl Workspace {
         self.launch_editor(&LaunchEditor, window, cx);
     }
 
-    fn launch_editor(&mut self, _: &LaunchEditor, _: &mut Window, cx: &mut Context<Self>) {
+    fn launch_editor(&mut self, _: &LaunchEditor, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.unreal_project() else {
             return;
         };
@@ -824,6 +965,17 @@ impl Workspace {
                 self.build.label()
             ));
             cx.notify();
+            return;
+        }
+        let editor = BuildConfig::editor(self.configuration);
+        if self.needs_build(editor) {
+            self.start_build(
+                BuildAction::Build,
+                editor,
+                Some(AfterBuild::Launch),
+                window,
+                cx,
+            );
             return;
         }
         let args = settings_ui::editor_args(cx);
@@ -853,11 +1005,9 @@ impl Workspace {
             &Project,
             EventSink,
         ) -> Result<Box<dyn AgentSession>, String>,
-    ) {
+    ) -> Option<SessionId> {
         let group = self.session_group.take();
-        let Some(project) = self.project.as_ref() else {
-            return;
-        };
+        let project = self.project.as_ref()?;
         let services = cx.global::<Services>();
         let host = services.host.clone();
         let id = services.next_session_id();
@@ -866,11 +1016,11 @@ impl Workspace {
             let _ = tx.unbounded_send((id, event));
         });
 
-        match start(&host, id, project, sink) {
+        let started = match start(&host, id, project, sink) {
             Ok(session) => {
                 let Some(handle) = host.take_handle(id) else {
                     self.error = Some("terminal host lost the session".into());
-                    return;
+                    return None;
                 };
                 let panel = cx.new(|cx| SessionPanel::new(id, kind, label, session, handle, cx));
                 // Agents and terminals go in the main area; builds go in the
@@ -902,10 +1052,15 @@ impl Workspace {
                         .update(cx, |dock, cx| dock.remove_panel(placeholder, window, cx));
                 }
                 self.activate(self.panels.len() - 1, window, cx);
+                Some(id)
             }
-            Err(e) => self.error = Some(e),
-        }
+            Err(e) => {
+                self.error = Some(e);
+                None
+            }
+        };
         cx.notify();
+        started
     }
 
     /// Keeps the build pane on the right: when it has no build tab, it shows
@@ -1318,6 +1473,7 @@ impl Workspace {
             tree.update(cx, |tree, cx| tree.refresh(cx));
         }
         self.refresh_status(cx);
+        self.refresh_build_state(cx);
     }
 
     /// Loads working-copy status in the background and colours the tree with it.
@@ -1384,7 +1540,10 @@ impl Workspace {
         let editor = cx.new(|cx| EditorPanel::new(path, &raw, window, cx));
         let events = cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
             match event {
-                EditorEvent::Saved => this.refresh_status(cx),
+                EditorEvent::Saved => {
+                    this.refresh_status(cx);
+                    this.refresh_build_state(cx);
+                }
                 EditorEvent::Diff(path, text) => {
                     this.show_diff(path.clone(), Some(text.clone()), window, cx)
                 }
@@ -1527,6 +1686,7 @@ impl Workspace {
         self.editors.retain(|p| held(p.entity_id()));
         self.diffs.retain(|p| held(p.entity_id()));
         self.histories.retain(|p| held(p.entity_id()));
+        self.forget_closed_build(cx);
         if self
             .debug
             .panel
@@ -1566,6 +1726,7 @@ impl Workspace {
         let panel = self.panels.remove(index);
         self.dock
             .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        self.forget_closed_build(cx);
         match after_close(index, self.panels.len()) {
             Some(next) => self.activate(next, window, cx),
             None => window.focus(&self.focus, cx),
@@ -1600,7 +1761,20 @@ impl Workspace {
         cx.notify();
     }
 
-    fn on_session_event(&mut self, id: SessionId, event: SessionEvent, cx: &mut Context<Self>) {
+    fn on_session_event(
+        &mut self,
+        id: SessionId,
+        event: SessionEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The build's tab may be closed already; what waited for it still runs.
+        if let SessionEvent::Exited(code) = event
+            && self.build_run.as_ref().is_some_and(|run| run.id == id)
+            && let Some(run) = self.build_run.take()
+        {
+            self.on_build_finished(run, code, window, cx);
+        }
         let Some(panel) = self.panels.iter().find(|p| p.read(cx).id() == id).cloned() else {
             return;
         };
@@ -1661,6 +1835,40 @@ impl Workspace {
         }
     }
 
+    /// F5 with the editor out of date: attach if it's running, otherwise
+    /// build and launch it under the debugger.
+    fn debug_after_finding_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.unreal_project().cloned() else {
+            return;
+        };
+        self.debug.status = DebugStatus::Attaching;
+        self.refresh_debug(cx);
+        let debugger = cx.global::<Services>().debugger.clone();
+        let found = cx
+            .background_executor()
+            .spawn(async move { usecases::editor_is_running(debugger.as_ref(), &project) });
+        cx.spawn_in(window, async move |this, cx| {
+            let found = found.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.debug.status = DebugStatus::Detached;
+                match found {
+                    Ok(true) => this.start_debugging(DebugStart::Attach, window, cx),
+                    Ok(false) => this.start_build(
+                        BuildAction::Build,
+                        BuildConfig::editor(this.configuration),
+                        Some(AfterBuild::Debug(DebugStart::Launch)),
+                        window,
+                        cx,
+                    ),
+                    Err(e) => this.error = Some(format!("Can't debug: {e}")),
+                }
+                this.refresh_debug(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Attaches to this project's running editor, or launches it under the
     /// debugger in the chosen configuration.
     fn start_debugging(&mut self, how: DebugStart, window: &mut Window, cx: &mut Context<Self>) {
@@ -1669,6 +1877,23 @@ impl Workspace {
             return;
         };
         if self.debug.status != DebugStatus::Detached {
+            return;
+        }
+        let editor = BuildConfig::editor(self.configuration);
+        if how != DebugStart::Attach && self.needs_build(editor) {
+            match how {
+                DebugStart::Launch => self.start_build(
+                    BuildAction::Build,
+                    editor,
+                    Some(AfterBuild::Debug(DebugStart::Launch)),
+                    window,
+                    cx,
+                ),
+                // The running editor is attached to as it is; without one,
+                // build, then launch.
+                DebugStart::Auto => self.debug_after_finding_editor(window, cx),
+                DebugStart::Attach => unreachable!(),
+            }
             return;
         }
         self.debug.generation += 1;
@@ -2379,13 +2604,36 @@ impl Workspace {
             });
 
         // Icon only, square at the toolbar height; the tooltips name them.
+        // Build and Rebuild carry a dot saying whether the chosen
+        // configuration is up to date.
+        let freshness = self
+            .build_state
+            .as_ref()
+            .and_then(|state| state.freshness(self.build));
+        let building = self.build_run.is_some();
+        let status = build_status(freshness.as_ref(), building);
         let build = Button::new("build")
             .small()
             .size(TOOLBAR_HEIGHT)
             .outline()
             .icon(Icon::new(IconName::Hammer))
-            .tooltip("Build (Ctrl+Shift+B)")
+            .tooltip(format!(
+                "Build {} (Ctrl+Shift+B)\n{status}",
+                self.build.label()
+            ))
             .on_click(cx.listener(|this, _, window, cx| this.build(&BuildProject, window, cx)));
+        let build = with_status_dot(build, freshness.as_ref(), building, cx);
+        let rebuild = Button::new("rebuild")
+            .small()
+            .size(TOOLBAR_HEIGHT)
+            .outline()
+            .icon(Icon::new(IconName::RefreshCw))
+            .tooltip(format!(
+                "Rebuild {}: clean, then build everything\n{status}",
+                self.build.label()
+            ))
+            .on_click(cx.listener(|this, _, window, cx| this.rebuild(&RebuildProject, window, cx)));
+        let rebuild = with_status_dot(rebuild, freshness.as_ref(), building, cx);
         let live_coding = Button::new("live-coding")
             .small()
             .size(TOOLBAR_HEIGHT)
@@ -2417,6 +2665,7 @@ impl Workspace {
                 header
                     .child(configuration)
                     .child(build)
+                    .child(rebuild)
                     .child(launch_editor)
                     .child(debug_button)
                     .child(live_coding)
@@ -2435,6 +2684,58 @@ impl Workspace {
             .child(header)
             .child(body)
     }
+}
+
+/// The second line of Build's and Rebuild's tooltips: how the chosen
+/// configuration's last build stands against the source.
+fn build_status(freshness: Option<&Freshness>, building: bool) -> String {
+    if building {
+        return "Building…".into();
+    }
+    match freshness {
+        None => "Not checked yet".into(),
+        Some(Freshness::Current) => "Up to date: built after the last source change".into(),
+        Some(Freshness::NeverBuilt) => "Never built".into(),
+        Some(Freshness::Stale { changed }) => {
+            let name = changed
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| changed.display().to_string());
+            format!("Out of date: {name} changed after the last build")
+        }
+    }
+}
+
+/// The dot in a build button's corner: green when the configuration is up
+/// to date, amber when it needs building; none while that isn't known or a
+/// build is running.
+fn with_status_dot(button: Button, freshness: Option<&Freshness>, building: bool, cx: &App) -> Div {
+    let color = match freshness {
+        _ if building => None,
+        None => None,
+        Some(Freshness::Current) => Some(crate::tests_panel::passed_color()),
+        Some(Freshness::NeverBuilt | Freshness::Stale { .. }) => {
+            Some(crate::tests_panel::warning_color())
+        }
+    };
+    let theme = cx.theme();
+    div()
+        .relative()
+        .flex_none()
+        .child(button)
+        .when_some(color, |this, color| {
+            this.child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .right(px(2.))
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(color)
+                    .border_1()
+                    .border_color(theme.title_bar),
+            )
+        })
 }
 
 /// The button that starts an agent or a terminal at `at` in the main area:
@@ -2515,6 +2816,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_session))
             .on_action(cx.listener(Self::prev_session))
             .on_action(cx.listener(Self::build))
+            .on_action(cx.listener(Self::rebuild))
             .on_action(cx.listener(Self::live_code))
             .on_action(cx.listener(Self::launch_editor))
             .on_action(cx.listener(Self::show_projects))
@@ -2696,6 +2998,27 @@ fn association_label(project: &Project) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_status_names_the_changed_file() {
+        assert_eq!(build_status(None, false), "Not checked yet");
+        assert_eq!(build_status(Some(&Freshness::Current), true), "Building…");
+        assert_eq!(
+            build_status(Some(&Freshness::Current), false),
+            "Up to date: built after the last source change"
+        );
+        assert_eq!(
+            build_status(Some(&Freshness::NeverBuilt), false),
+            "Never built"
+        );
+        let stale = Freshness::Stale {
+            changed: PathBuf::from(r"D:\p\Source\Game\Pawn.cpp"),
+        };
+        assert_eq!(
+            build_status(Some(&stale), false),
+            "Out of date: Pawn.cpp changed after the last build"
+        );
+    }
+
     use std::path::{Path, PathBuf};
 
     use tethys_core::Project;
@@ -2705,9 +3028,10 @@ mod tests {
     use tethys_core::usecases::RecentProject;
 
     use super::{
-        Debug, DebugEffect, DebugStatus, FrameRow, after_close, association_label, close_target,
-        delete_prompt, describe_stop, droppable, frame_rows, innermost_with_source, is_uproject,
-        key_bindings, next_index, prev_index, recent_entry_text, remap_path, stop_line,
+        Debug, DebugEffect, DebugStatus, FrameRow, Freshness, after_close, association_label,
+        build_status, close_target, delete_prompt, describe_stop, droppable, frame_rows,
+        innermost_with_source, is_uproject, key_bindings, next_index, prev_index,
+        recent_entry_text, remap_path, stop_line,
     };
 
     fn unreal(association: &str) -> Project {

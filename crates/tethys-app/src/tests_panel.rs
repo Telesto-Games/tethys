@@ -33,13 +33,13 @@ const CELL_GAP: f32 = 1.;
 /// The results grid's starting height; the split under it is draggable.
 const GRID_HEIGHT: f32 = 120.;
 
-fn passed_color() -> Hsla {
+pub(crate) fn passed_color() -> Hsla {
     rgb(0x98c379).into()
 }
 fn failed_color() -> Hsla {
     rgb(0xe06c75).into()
 }
-fn warning_color() -> Hsla {
+pub(crate) fn warning_color() -> Hsla {
     rgb(0xe5c07b).into()
 }
 

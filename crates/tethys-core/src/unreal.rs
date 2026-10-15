@@ -3,7 +3,9 @@
 //! Pure functions from a project and engine root to a command. Running them is
 //! the app's job (a terminal session for builds, a detached process for the editor).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -266,23 +268,178 @@ fn check_engine(project: &Project, config: BuildConfig) -> Result<(), ToolError>
     Ok(())
 }
 
-/// `Engine\Build\BatchFiles\Build.bat <Target> Win64 <Configuration> -Project=<uproject> -WaitMutex`
-pub fn build_command(project: &Project, config: BuildConfig) -> Result<CommandSpec, ToolError> {
+/// Build what changed, or clean first and build everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildAction {
+    #[default]
+    Build,
+    /// `-Rebuild`: what `Rebuild.bat` adds to `Build.bat`.
+    Rebuild,
+}
+
+impl BuildAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BuildAction::Build => "Build",
+            BuildAction::Rebuild => "Rebuild",
+        }
+    }
+}
+
+/// `Engine\Build\BatchFiles\Build.bat <Target> Win64 <Configuration> -Project=<uproject> -WaitMutex`,
+/// plus `-Rebuild` for a rebuild.
+pub fn build_command(
+    project: &Project,
+    config: BuildConfig,
+    action: BuildAction,
+) -> Result<CommandSpec, ToolError> {
     let engine = engine_root(project)?;
     if project.modules.is_empty() {
         return Err(ToolError::NothingToBuild(project.name().to_string()));
     }
     check_engine(project, config)?;
+    let mut args = vec![
+        build_target(project, config)?,
+        PLATFORM.into(),
+        config.configuration.as_str().into(),
+        format!("-Project={}", project.path.display()),
+        "-WaitMutex".into(),
+    ];
+    if action == BuildAction::Rebuild {
+        args.push("-Rebuild".into());
+    }
     Ok(CommandSpec {
         program: engine.join(r"Engine\Build\BatchFiles\Build.bat"),
-        args: vec![
-            build_target(project, config)?,
-            PLATFORM.into(),
-            config.configuration.as_str().into(),
-            format!("-Project={}", project.path.display()),
-            "-WaitMutex".into(),
-        ],
+        args,
     })
+}
+
+/// The receipt UBT writes when `config` links:
+/// `Binaries\Win64\<Target>[-Win64-<Configuration>].target`. Its time is the
+/// time of the last successful build.
+pub fn receipt_path(project: &Project, config: BuildConfig) -> Result<PathBuf, ToolError> {
+    let target = build_target(project, config)?;
+    Ok(project.root().join(format!(
+        r"Binaries\{PLATFORM}\{target}{}.target",
+        config.configuration.binary_suffix()
+    )))
+}
+
+/// Whether a file's change means a build is needed: C++ and the C# that
+/// describes modules and targets, plus the project and plugin descriptors.
+fn is_source(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "inl" | "cs" | "uproject" | "uplugin"
+    )
+}
+
+/// The most recently changed source file under `root`: the `.uproject`,
+/// `Source/`, and each plugin's descriptor and `Source/`. Content, Binaries
+/// and Intermediate aren't source. `None` when there is none.
+pub fn newest_source(root: &Path) -> Option<(PathBuf, SystemTime)> {
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+    let mut note = |path: PathBuf| {
+        if !is_source(&path) {
+            return;
+        }
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified())
+            && newest.as_ref().is_none_or(|(_, t)| modified > *t)
+        {
+            newest = Some((path, modified));
+        }
+    };
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        note(entry.path());
+    }
+    walk(&root.join("Source"), &mut note);
+    for plugin in std::fs::read_dir(root.join("Plugins"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let dir = plugin.path();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            note(entry.path());
+        }
+        walk(&dir.join("Source"), &mut note);
+    }
+    newest
+}
+
+fn walk(dir: &Path, note: &mut impl FnMut(PathBuf)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            walk(&path, note);
+        } else {
+            note(path);
+        }
+    }
+}
+
+/// Whether a configuration's last build is older than the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Freshness {
+    /// Built after the last source change.
+    Current,
+    /// No receipt: never built, or cleaned.
+    NeverBuilt,
+    /// `changed` was saved after the last build.
+    Stale { changed: PathBuf },
+}
+
+impl Freshness {
+    pub fn is_current(&self) -> bool {
+        *self == Freshness::Current
+    }
+}
+
+/// When each configuration of a project was last built, against its newest
+/// source: one scan serves every configuration. Taken by [`BuildState::scan`]
+/// in the background, since it reads the whole `Source` tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildState {
+    newest_source: Option<(PathBuf, SystemTime)>,
+    /// A receipt's time, or `None` when it doesn't exist; configurations
+    /// without a target aren't listed.
+    receipts: HashMap<BuildConfig, Option<SystemTime>>,
+}
+
+impl BuildState {
+    pub fn scan(project: &Project) -> BuildState {
+        let receipts = build_configs(project)
+            .into_iter()
+            .filter_map(|config| {
+                let receipt = receipt_path(project, config).ok()?;
+                let built = std::fs::metadata(receipt).and_then(|m| m.modified()).ok();
+                Some((config, built))
+            })
+            .collect();
+        BuildState {
+            newest_source: newest_source(project.root()),
+            receipts,
+        }
+    }
+
+    /// `None` for a configuration the project has no target for.
+    pub fn freshness(&self, config: BuildConfig) -> Option<Freshness> {
+        let Some(built) = *self.receipts.get(&config)? else {
+            return Some(Freshness::NeverBuilt);
+        };
+        Some(match &self.newest_source {
+            Some((changed, modified)) if *modified > built => Freshness::Stale {
+                changed: changed.clone(),
+            },
+            _ => Freshness::Current,
+        })
+    }
 }
 
 /// Extra editor arguments when the user hasn't set any: start the Unreal MCP
@@ -476,7 +633,12 @@ mod tests {
     #[test]
     fn build_command_for_editor_target() {
         let p = project(Ok(r"D:\UE_5.8"), &["Arcade"], &["Arcade", "ArcadeEditor"]);
-        let cmd = build_command(&p, BuildConfig::editor(Configuration::Development)).unwrap();
+        let cmd = build_command(
+            &p,
+            BuildConfig::editor(Configuration::Development),
+            BuildAction::Build,
+        )
+        .unwrap();
         assert_eq!(
             cmd.program,
             Path::new(r"D:\UE_5.8\Engine\Build\BatchFiles\Build.bat")
@@ -506,14 +668,171 @@ mod tests {
         assert!(matches!(
             build_command(
                 &project(Err("missing"), &["A"], &[]),
-                BuildConfig::default()
+                BuildConfig::default(),
+                BuildAction::Build
             ),
             Err(ToolError::NoEngine(_))
         ));
         assert!(matches!(
-            build_command(&project(Ok("E"), &[], &[]), BuildConfig::default()),
+            build_command(
+                &project(Ok("E"), &[], &[]),
+                BuildConfig::default(),
+                BuildAction::Build
+            ),
             Err(ToolError::NothingToBuild(_))
         ));
+    }
+
+    #[test]
+    fn rebuild_adds_the_flag_rebuild_bat_adds() {
+        let p = project(Ok(r"D:\UE_5.8"), &["Arcade"], &["Arcade", "ArcadeEditor"]);
+        let config = BuildConfig {
+            target: TargetKind::Game,
+            configuration: Configuration::Shipping,
+        };
+        let cmd = build_command(&p, config, BuildAction::Rebuild).unwrap();
+        assert_eq!(cmd.args[0], "Arcade");
+        assert_eq!(cmd.args.last().unwrap(), "-Rebuild");
+    }
+
+    #[test]
+    fn receipt_is_named_like_the_binaries() {
+        let p = project(Ok("E"), &["Arcade"], &["Arcade", "ArcadeEditor"]);
+        assert_eq!(
+            receipt_path(&p, BuildConfig::editor(Configuration::Development)).unwrap(),
+            Path::new(r"D:\dev\Arcade\Binaries\Win64\ArcadeEditor.target")
+        );
+        let debug_game = BuildConfig {
+            target: TargetKind::Game,
+            configuration: Configuration::DebugGame,
+        };
+        assert_eq!(
+            receipt_path(&p, debug_game).unwrap(),
+            Path::new(r"D:\dev\Arcade\Binaries\Win64\Arcade-Win64-DebugGame.target")
+        );
+        let server = BuildConfig {
+            target: TargetKind::Server,
+            configuration: Configuration::Development,
+        };
+        assert!(matches!(
+            receipt_path(&p, server),
+            Err(ToolError::NoTarget { .. })
+        ));
+    }
+
+    /// A project on disk: `Arcade.uproject`, one module, a plugin, and the
+    /// receipts asked for.
+    fn disk_project(name: &str, receipts: &[&str]) -> Project {
+        let root = std::env::temp_dir().join(format!("tethys-fresh-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [
+            "Source/Arcade",
+            "Plugins/Gizmo/Source/Gizmo",
+            "Binaries/Win64",
+            "Content",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let json = r#"{"Modules":[{"Name":"Arcade"}]}"#;
+        let uproject = root.join("Arcade.uproject");
+        std::fs::write(&uproject, json).unwrap();
+        std::fs::write(root.join("Source/Arcade.Target.cs"), "").unwrap();
+        std::fs::write(root.join("Source/ArcadeEditor.Target.cs"), "").unwrap();
+        std::fs::write(root.join("Source/Arcade/Arcade.cpp"), "").unwrap();
+        std::fs::write(root.join("Plugins/Gizmo/Gizmo.uplugin"), "{}").unwrap();
+        std::fs::write(root.join("Plugins/Gizmo/Source/Gizmo/Gizmo.h"), "").unwrap();
+        std::fs::write(root.join("Content/Map.umap"), "").unwrap();
+        for receipt in receipts {
+            std::fs::write(root.join("Binaries/Win64").join(receipt), "{}").unwrap();
+        }
+        let mut p = Project::parse(&uproject, json).unwrap();
+        p.engine = Ok(PathBuf::from("E"));
+        p.targets = vec!["Arcade".into(), "ArcadeEditor".into()];
+        p
+    }
+
+    /// Sets a file's modified time `secs` seconds after `base`, since writes
+    /// within one test can land on the same timestamp.
+    fn touch(path: &Path, base: SystemTime, secs: u64) {
+        let time = base + std::time::Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn newest_source_skips_content_and_sees_plugins() {
+        let p = disk_project("newest", &[]);
+        let root = p.root();
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for file in [
+            "Source/Arcade.Target.cs",
+            "Source/ArcadeEditor.Target.cs",
+            "Plugins/Gizmo/Gizmo.uplugin",
+        ] {
+            touch(&root.join(file), base, 0);
+        }
+        touch(&root.join("Arcade.uproject"), base, 1);
+        touch(&root.join("Source/Arcade/Arcade.cpp"), base, 2);
+        touch(&root.join("Plugins/Gizmo/Source/Gizmo/Gizmo.h"), base, 3);
+        touch(&root.join("Content/Map.umap"), base, 9);
+        let (path, _) = newest_source(root).unwrap();
+        assert_eq!(path, root.join("Plugins/Gizmo/Source/Gizmo/Gizmo.h"));
+        assert_eq!(newest_source(&root.join("nowhere")), None);
+    }
+
+    #[test]
+    fn freshness_compares_the_receipt_with_the_newest_source() {
+        let p = disk_project(
+            "fresh",
+            &["ArcadeEditor.target", "Arcade-Win64-DebugGame.target"],
+        );
+        let root = p.root();
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        touch(&root.join("Source/Arcade/Arcade.cpp"), base, 5);
+        touch(&root.join("Binaries/Win64/ArcadeEditor.target"), base, 9);
+        touch(
+            &root.join("Binaries/Win64/Arcade-Win64-DebugGame.target"),
+            base,
+            1,
+        );
+        // Everything else was written just now, after the receipts.
+        for file in [
+            "Arcade.uproject",
+            "Source/Arcade.Target.cs",
+            "Source/ArcadeEditor.Target.cs",
+            "Plugins/Gizmo/Gizmo.uplugin",
+            "Plugins/Gizmo/Source/Gizmo/Gizmo.h",
+        ] {
+            touch(&root.join(file), base, 0);
+        }
+        let state = BuildState::scan(&p);
+
+        let editor = BuildConfig::editor(Configuration::Development);
+        assert_eq!(state.freshness(editor), Some(Freshness::Current));
+        let game_debug = BuildConfig {
+            target: TargetKind::Game,
+            configuration: Configuration::DebugGame,
+        };
+        assert_eq!(
+            state.freshness(game_debug),
+            Some(Freshness::Stale {
+                changed: root.join("Source/Arcade/Arcade.cpp")
+            })
+        );
+        assert_eq!(
+            state.freshness(BuildConfig::editor(Configuration::DebugGame)),
+            Some(Freshness::NeverBuilt)
+        );
+        let server = BuildConfig {
+            target: TargetKind::Server,
+            configuration: Configuration::Development,
+        };
+        assert_eq!(state.freshness(server), None);
+        assert_eq!(BuildState::default().freshness(editor), None);
     }
 
     #[test]
@@ -568,7 +887,12 @@ mod tests {
     #[test]
     fn debuggame_builds_and_launches_debuggame() {
         let p = project(Ok(r"D:\UE_5.8"), &["Arcade"], &[]);
-        let build = build_command(&p, BuildConfig::editor(Configuration::DebugGame)).unwrap();
+        let build = build_command(
+            &p,
+            BuildConfig::editor(Configuration::DebugGame),
+            BuildAction::Build,
+        )
+        .unwrap();
         assert_eq!(build.args[2], "DebugGame");
         let editor = editor_command(&p, Configuration::DebugGame, &[]).unwrap();
         assert_eq!(
@@ -650,10 +974,18 @@ mod tests {
     #[test]
     fn builds_the_target_of_the_chosen_kind() {
         let p = project(Ok("E"), &["A"], &["Arcade", "ArcadeEditor", "Tools"]);
-        let shipping = build_command(&p, config(TargetKind::Game, Configuration::Shipping));
+        let shipping = build_command(
+            &p,
+            config(TargetKind::Game, Configuration::Shipping),
+            BuildAction::Build,
+        );
         assert_eq!(shipping.unwrap().args[..3], ["Arcade", "Win64", "Shipping"]);
         assert_eq!(
-            build_command(&p, config(TargetKind::Server, Configuration::Development)),
+            build_command(
+                &p,
+                config(TargetKind::Server, Configuration::Development),
+                BuildAction::Build
+            ),
             Err(ToolError::NoTarget {
                 project: "Arcade".into(),
                 kind: "Server"
@@ -671,8 +1003,12 @@ mod tests {
     fn installed_engines_refuse_what_they_cant_build() {
         let mut p = project(Ok("E"), &["A"], &["Arcade", "ArcadeEditor", "ArcadeServer"]);
         p.installed_engine = true;
-        let refused =
-            |p: &Project, c| matches!(build_command(p, c), Err(ToolError::NeedsSourceEngine(_)));
+        let refused = |p: &Project, c| {
+            matches!(
+                build_command(p, c, BuildAction::Build),
+                Err(ToolError::NeedsSourceEngine(_))
+            )
+        };
         assert!(refused(&p, BuildConfig::editor(Configuration::Debug)));
         assert!(refused(&p, config(TargetKind::Game, Configuration::Test)));
         assert!(refused(
