@@ -13,7 +13,9 @@ SmartScreen may warn the first time.
 Tethys keeps itself up to date: a few seconds after it starts it checks for a newer release and
 offers to install it (**Update and restart**, **Skip this version** or **Later**). **Help →
 Check for Updates…** checks on demand. Updating replaces `tethys.exe` in place, checked against
-the SHA-256 GitHub records for it, then reopens the same project. Set
+the SHA-256 GitHub records for it, then reopens the same project. The replaced exe stays beside
+it as `tethys.exe.old` until the old Tethys has exited, when the new one removes it. If the swap
+fails, the old `tethys.exe` stays where it was and the download is kept as `tethys.exe.new`. Set
 `TETHYS_NO_UPDATE_CHECK=1` to turn the startup check off; debug builds never check by
 themselves.
 

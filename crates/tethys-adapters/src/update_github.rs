@@ -5,7 +5,7 @@
 //! against the SHA-256 GitHub records for every asset (`digest`).
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,12 +65,25 @@ impl UpdateSource for GitHubReleases {
     }
 
     fn download(&self, release: &Release, dest: &Path) -> PortResult<()> {
-        let result = download_to(&self.agent, release, dest);
+        // Written under a name of its own and moved to `dest` once verified,
+        // so two Tethys windows updating at once can't truncate each other's
+        // download, and `dest` only ever holds a whole, checked exe.
+        let partial = partial_path(dest);
+        let result = download_to(&self.agent, release, &partial)
+            .and_then(|()| std::fs::rename(&partial, dest).map_err(Into::into));
         if result.is_err() {
-            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(&partial);
         }
         result
     }
+}
+
+/// Where this process downloads to before the download is checked:
+/// `<dest>.<pid>.part`.
+fn partial_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.part", std::process::id()));
+    dest.with_file_name(name)
 }
 
 fn download_to(agent: &ureq::Agent, release: &Release, dest: &Path) -> PortResult<()> {
@@ -164,6 +177,13 @@ impl ApiRelease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_process_downloads_beside_the_staging_file_under_its_own_name() {
+        let dest = Path::new(r"C:\Tethys\tethys.exe.new");
+        let expected = format!(r"C:\Tethys\tethys.exe.new.{}.part", std::process::id());
+        assert_eq!(partial_path(dest), PathBuf::from(expected));
+    }
 
     /// Trimmed from a real `releases/latest` response.
     const LATEST: &str = r###"{

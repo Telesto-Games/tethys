@@ -25,7 +25,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 sha2 = "0.11"
 # UDP message bus: SO_REUSEADDR and multicast membership, which std::net lacks.
 socket2 = "0.6"
-self-replace = "1.5"
 
 gpui-kit = "=0.7.1"
 # Only to enable syntax highlighting grammars; the code uses it through gpui-kit.
