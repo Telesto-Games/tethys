@@ -13,11 +13,12 @@ use gpui_kit::base::{Disableable, GlobalState};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{
-    DockArea, DockEvent, DockPlacement, InsertTarget, NodeId, Panel, PanelHandle, PanelId,
+    DockArea, DockEvent, DockPlacement, InsertTarget, NodeId, PaneRef, Panel, PanelHandle, PanelId,
     PanelStyle,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{AppMenuBar, DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::component::{Icon, WindowExt};
 use gpui_kit::prelude::FluentBuilder;
@@ -1024,17 +1025,36 @@ impl Workspace {
                 };
                 let panel = cx.new(|cx| SessionPanel::new(id, kind, label, session, handle, cx));
                 // Agents and terminals go in the main area; builds go in the
-                // build pane on the right.
-                let placement = match kind {
-                    SessionKind::Agent | SessionKind::Terminal => DockPlacement::Center,
-                    SessionKind::Build => DockPlacement::Right,
+                // build pane on the right, or wherever its tab was dragged.
+                let home = match kind {
+                    SessionKind::Build => self.build_tab_home(cx),
+                    SessionKind::Agent | SessionKind::Terminal => None,
                 };
+                let placement = match (kind, home) {
+                    (_, Some((placement, ..))) => placement,
+                    (SessionKind::Agent | SessionKind::Terminal, None) => DockPlacement::Center,
+                    (SessionKind::Build, None) => DockPlacement::Right,
+                };
+                self.add_dock_panel(&panel, placement, Some(BUILD_PANE_WIDTH), window, cx);
+                if let Some((_, node, ix)) = home {
+                    // Takes the old tab's place before that tab goes, so its
+                    // group survives.
+                    let id = PanelId::from(panel.entity_id());
+                    let target = InsertTarget::Tabs {
+                        node,
+                        ix: Some(ix),
+                        activate: true,
+                    };
+                    self.dock
+                        .update(cx, |dock, cx| dock.move_panel(id, target, window, cx));
+                }
                 if kind == SessionKind::Build {
                     self.close_finished_builds(window, cx);
                 }
-                self.add_dock_panel(&panel, placement, Some(BUILD_PANE_WIDTH), window, cx);
                 // The dock adds to the first group; move it to the one asked for.
-                if let Some(node) = group.filter(|_| placement == DockPlacement::Center) {
+                if let Some(node) =
+                    group.filter(|_| home.is_none() && placement == DockPlacement::Center)
+                {
                     let id = PanelId::from(panel.entity_id());
                     let target = InsertTarget::Tabs {
                         node,
@@ -1061,6 +1081,35 @@ impl Workspace {
         };
         cx.notify();
         started
+    }
+
+    /// Where the build tab, or the placeholder standing in for it, sits: its
+    /// region, tab group and index. A new build replaces it there.
+    fn build_tab_home(&self, cx: &App) -> Option<(DockPlacement, NodeId, usize)> {
+        let id = self
+            .panels
+            .iter()
+            .find(|p| p.read(cx).kind() == SessionKind::Build)
+            .map(|p| p.entity_id())
+            .or_else(|| self.build_placeholder.as_ref().map(|p| p.entity_id()))?;
+        let id = PanelId::from(id);
+        let dock = self.dock.read(cx);
+        [
+            DockPlacement::Right,
+            DockPlacement::Bottom,
+            DockPlacement::Left,
+            DockPlacement::Center,
+        ]
+        .into_iter()
+        .find_map(|placement| {
+            let tree = dock.layout(placement)?;
+            let node = tree.find_panel_node(id)?;
+            let ix = match tree.find_node(node)?.kind() {
+                PaneRef::Tabs { panels, .. } => panels.iter().position(|held| *held == id)?,
+                PaneRef::Split { .. } => return None,
+            };
+            Some((placement, node, ix))
+        })
     }
 
     /// Keeps the build pane on the right: when it has no build tab, it shows
@@ -2612,11 +2661,21 @@ impl Workspace {
             .and_then(|state| state.freshness(self.build));
         let building = self.build_run.is_some();
         let status = build_status(freshness.as_ref(), building);
+        // While building, the hammer taps and the rebuild arrows turn.
+        let build_icon = |icon: IconName, ease: fn(f32) -> f32| {
+            move |button: Button| {
+                if building {
+                    button.icon(Spinner::new().icon(icon).ease(ease))
+                } else {
+                    button.icon(Icon::new(icon))
+                }
+            }
+        };
         let build = Button::new("build")
             .small()
             .size(TOOLBAR_HEIGHT)
             .outline()
-            .icon(Icon::new(IconName::Hammer))
+            .map(build_icon(IconName::Hammer, hammer_tap))
             .tooltip(format!(
                 "Build {} (Ctrl+Shift+B)\n{status}",
                 self.build.label()
@@ -2627,7 +2686,7 @@ impl Workspace {
             .small()
             .size(TOOLBAR_HEIGHT)
             .outline()
-            .icon(Icon::new(IconName::RefreshCw))
+            .map(build_icon(IconName::RefreshCw, |t| t))
             .tooltip(format!(
                 "Rebuild {}: clean, then build everything\n{status}",
                 self.build.label()
@@ -2704,6 +2763,13 @@ fn build_status(freshness: Option<&Freshness>, building: bool) -> String {
             format!("Out of date: {name} changed after the last build")
         }
     }
+}
+
+/// The Build button's spinner easing, as a fraction of a turn: the hammer
+/// lifts a tenth of a turn and strikes back down, once per cycle. Counted
+/// back from a whole turn, since gpui only takes fractions from 0 to 1.
+fn hammer_tap(t: f32) -> f32 {
+    1. - 0.1 * (std::f32::consts::PI * t).sin().powi(2)
 }
 
 /// The dot in a build button's corner: green when the configuration is up
@@ -3019,6 +3085,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hammer_tap_stays_within_a_turn() {
+        // `gpui::percentage` panics outside 0..=1.
+        for i in 0..=100 {
+            let turn = hammer_tap(i as f32 / 100.);
+            assert!((0.0..=1.0).contains(&turn), "{turn} at step {i}");
+        }
+    }
+
     use std::path::{Path, PathBuf};
 
     use tethys_core::Project;
@@ -3030,7 +3105,7 @@ mod tests {
     use super::{
         Debug, DebugEffect, DebugStatus, FrameRow, Freshness, after_close, association_label,
         build_status, close_target, delete_prompt, describe_stop, droppable, frame_rows,
-        innermost_with_source, is_uproject, key_bindings, next_index, prev_index,
+        hammer_tap, innermost_with_source, is_uproject, key_bindings, next_index, prev_index,
         recent_entry_text, remap_path, stop_line,
     };
 
