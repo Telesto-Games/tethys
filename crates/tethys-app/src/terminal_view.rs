@@ -24,6 +24,17 @@ const SELECTION: Rgb = Rgb {
     b: 0x2d,
 };
 
+/// Takes Tab and Shift+Tab back from gpui-kit, whose `Root` binds them to
+/// focus cycling. Bindings run before `on_key_down`, so without this the
+/// terminal never sees them: no completion in a shell, no mode switch in
+/// Claude Code.
+pub fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("tab", NoAction, Some("Terminal")),
+        KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+    ]
+}
+
 pub struct TerminalView {
     handle: TerminalHandle,
     focus: FocusHandle,
@@ -1019,5 +1030,70 @@ mod tests {
         assert_eq!(grid_size(area(800., 480.), cell, line), (100, 30));
         assert_eq!(grid_size(area(807., 479.), cell, line), (100, 29));
         assert_eq!(grid_size(area(0., 0.), cell, line), (2, 1));
+    }
+}
+
+/// Tab and Shift+Tab in a headless window: gpui-kit's `Root` binds both to
+/// focus cycling, and bindings run before `on_key_down`.
+#[cfg(test)]
+mod key_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui_kit::{
+        AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, Render,
+        Styled, TestAppContext, Window, div, px, size,
+    };
+
+    use crate::test_support::{self, open_window, temp_config};
+
+    /// Stands in for `TerminalView`, which needs a live terminal: the same
+    /// key context, focused, recording what its `on_key_down` is given.
+    struct Probe {
+        focus: FocusHandle,
+        seen: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.seen.clone();
+            div()
+                .id("probe")
+                .key_context("Terminal")
+                .track_focus(&self.focus)
+                .size_full()
+                .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                    seen.borrow_mut().push(event.keystroke.unparse());
+                    cx.stop_propagation();
+                })
+        }
+    }
+
+    #[gpui_kit::test]
+    fn tab_and_shift_tab_reach_the_terminal(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            test_support::init(temp_config("terminal-keys"), cx);
+            cx.bind_keys(crate::workspace::key_bindings());
+        });
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (window, probe) = open_window(cx, size(px(300.), px(200.)), {
+            let seen = seen.clone();
+            |_, cx| {
+                cx.new(|cx| Probe {
+                    focus: cx.focus_handle(),
+                    seen,
+                })
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let focus = probe.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        cx.simulate_keystrokes(window.into(), "tab shift-tab ctrl-c a");
+
+        assert_eq!(*seen.borrow(), ["tab", "shift-tab", "ctrl-c", "a"]);
     }
 }

@@ -182,6 +182,9 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-tab", NextSession, None),
         KeyBinding::new("ctrl-shift-tab", PrevSession, None),
     ]
+    .into_iter()
+    .chain(crate::terminal_view::key_bindings())
+    .collect()
 }
 
 /// The adapters, created once by the composition root.
