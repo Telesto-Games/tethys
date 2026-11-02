@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::automation::{AutomationTest, TestEvent, TestInstance};
 use crate::debug::{DebugEvent, ProcessInfo, SourceBreakpoint};
 use crate::domain::{AdapterKind, AgentProfile, Project, SessionId};
+use crate::layout::Layouts;
 use crate::scm::{Commit, FileStatus, WorkingCopyInfo};
 use crate::theme::ThemeSpec;
 use crate::unreal::{BuildConfig, CommandSpec, Configuration, LaunchMode};
@@ -58,6 +59,9 @@ pub trait ConfigStore {
     /// Saves the user's themes and which one is in use (`None`: the
     /// built-in), together, so one can't be written without the other.
     fn set_themes(&self, themes: &[ThemeSpec], active: Option<&str>) -> PortResult<()>;
+    /// The saved panel layouts, and which one each project starts with.
+    fn layouts(&self) -> PortResult<Layouts>;
+    fn set_layouts(&self, layouts: &Layouts) -> PortResult<()>;
 }
 
 /// A source control system (Subversion and git now; Perforce later).

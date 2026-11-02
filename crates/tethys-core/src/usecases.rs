@@ -8,6 +8,7 @@ use crate::automation;
 use crate::debug::{self, FindEditorError, ProcessInfo, SourceBreakpoint};
 use crate::diff::{self, FileDiff};
 use crate::domain::{AdapterKind, AgentProfile, DomainError, Project, ProjectError, SessionId};
+use crate::layout::Layouts;
 use crate::ports::{
     AgentHost, AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EngineLocator,
     EventSink, PortError, ProcessLauncher, SourceControl, TestEventSink, TestRunner, TestSession,
@@ -545,6 +546,17 @@ pub fn forget_project(config: &dyn ConfigStore, path: &Path) -> Result<(), PortE
     config.set_recent_projects(&recent)
 }
 
+/// The saved layouts after `change`, which are saved first.
+pub fn update_layouts(
+    config: &dyn ConfigStore,
+    change: impl FnOnce(&mut Layouts),
+) -> Result<Layouts, PortError> {
+    let mut layouts = config.layouts()?;
+    change(&mut layouts);
+    config.set_layouts(&layouts)?;
+    Ok(layouts)
+}
+
 /// A recent project, loaded for display. `project` is the error message if it
 /// can no longer be opened (moved, deleted, or broken).
 #[derive(Debug)]
@@ -662,6 +674,7 @@ mod tests {
     struct FakeConfig {
         profiles: Vec<AgentProfile>,
         recent: RefCell<Vec<PathBuf>>,
+        layouts: RefCell<Layouts>,
     }
     impl ConfigStore for FakeConfig {
         fn agent_profiles(&self) -> PortResult<Vec<AgentProfile>> {
@@ -723,6 +736,13 @@ mod tests {
             Ok(None)
         }
         fn set_themes(&self, _: &[crate::theme::ThemeSpec], _: Option<&str>) -> PortResult<()> {
+            Ok(())
+        }
+        fn layouts(&self) -> PortResult<Layouts> {
+            Ok(self.layouts.borrow().clone())
+        }
+        fn set_layouts(&self, layouts: &Layouts) -> PortResult<()> {
+            *self.layouts.borrow_mut() = layouts.clone();
             Ok(())
         }
     }
@@ -793,6 +813,25 @@ mod tests {
         assert!(!p.is_unreal());
         assert_eq!(p.root(), dir);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn layouts_are_saved_after_each_change() {
+        let config = FakeConfig::default();
+        let layout = crate::layout::PanelLayout {
+            name: "Debugging".into(),
+            center: vec![],
+            docks: vec![],
+        };
+
+        let changed = update_layouts(&config, |l| {
+            l.save(layout.clone());
+            l.set_default(Some("Debugging"));
+        })
+        .unwrap();
+
+        assert_eq!(changed.get("Debugging"), Some(&layout));
+        assert_eq!(config.layouts().unwrap(), changed);
     }
 
     #[test]

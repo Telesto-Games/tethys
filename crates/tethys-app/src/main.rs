@@ -9,6 +9,7 @@ mod editor_panel;
 mod file_tree;
 mod history_panel;
 mod keys;
+mod layouts;
 mod session_panel;
 mod settings_ui;
 mod tab_skin;
@@ -54,7 +55,8 @@ fn main() {
             .installer
             .remove_leftovers();
         theme::init(cx);
-        workspace::install_menus(cx);
+        workspace::install_menus(None, cx);
+        layouts::init(cx);
         tab_skin::init(cx);
         cx.bind_keys(workspace::key_bindings());
 
