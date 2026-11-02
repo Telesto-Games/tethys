@@ -7,6 +7,7 @@ pub mod automation;
 pub mod debug;
 pub mod diff;
 pub mod domain;
+pub mod layout;
 pub mod ports;
 pub mod scm;
 pub mod theme;

@@ -1,14 +1,15 @@
 //! `ConfigStore` backed by TOML files in `%APPDATA%\tethys`.
 //!
 //! - `agents.toml`: `[[agent]]` profiles (user-edited, read-only to Tethys)
-//! - `state.toml`: recent projects, build configuration, launch mode and a
-//!   skipped release
+//! - `state.toml`: recent projects, build configuration, launch mode, themes,
+//!   panel layouts and a skipped release
 //!   (written by Tethys)
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tethys_core::AgentProfile;
+use tethys_core::layout::Layouts;
 use tethys_core::ports::{ConfigStore, PortResult};
 use tethys_core::theme::ThemeSpec;
 use tethys_core::unreal::{self, BuildConfig, Configuration, LaunchMode};
@@ -57,6 +58,9 @@ struct StateFile {
     /// Themes the user made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     themes: Vec<ThemeSpec>,
+    /// Panel layouts the user saved, and the defaults.
+    #[serde(default, skip_serializing_if = "Layouts::is_empty")]
+    layouts: Layouts,
 }
 
 impl TomlConfigStore {
@@ -193,6 +197,14 @@ impl ConfigStore for TomlConfigStore {
             s.theme = active.map(str::to_string);
         })
     }
+
+    fn layouts(&self) -> PortResult<Layouts> {
+        Ok(self.read::<StateFile>("state.toml")?.layouts)
+    }
+
+    fn set_layouts(&self, layouts: &Layouts) -> PortResult<()> {
+        self.update_state(|s| s.layouts = layouts.clone())
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +319,71 @@ mod state_tests {
             Configuration::DebugGame
         );
         assert_eq!(store.editor_args().unwrap(), "-log");
+    }
+
+    #[test]
+    fn layouts_round_trip_beside_the_rest_of_the_state() {
+        use tethys_core::layout::{Dock, Pane, PanelLayout, Side, Slot, ToolPane};
+
+        let dir =
+            std::env::temp_dir().join(format!("tethys-config-layouts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = TomlConfigStore::new(dir);
+        assert!(store.layouts().unwrap().is_empty());
+        store.set_launch_mode(LaunchMode::Game).unwrap();
+
+        let mut layouts = Layouts::default();
+        layouts.save(PanelLayout {
+            name: "Debugging".into(),
+            center: vec![ToolPane::Tests],
+            docks: vec![
+                Dock {
+                    side: Side::Left,
+                    size: 280.,
+                    open: false,
+                    pane: Some(Pane::Tabs {
+                        tabs: vec![ToolPane::Files],
+                        active: 0,
+                    }),
+                },
+                Dock {
+                    side: Side::Bottom,
+                    size: 320.5,
+                    open: true,
+                    pane: Some(Pane::Split {
+                        vertical: true,
+                        children: vec![
+                            Slot {
+                                size: 120.,
+                                pane: Pane::Tabs {
+                                    tabs: vec![ToolPane::Debug, ToolPane::Build],
+                                    active: 1,
+                                },
+                            },
+                            Slot {
+                                size: 0.,
+                                pane: Pane::Split {
+                                    vertical: false,
+                                    children: vec![],
+                                },
+                            },
+                        ],
+                    }),
+                },
+                Dock {
+                    side: Side::Right,
+                    size: 560.,
+                    open: true,
+                    pane: None,
+                },
+            ],
+        });
+        layouts.set_default(Some("Debugging"));
+        layouts.set_project_default(Path::new(r"D:\Game\Game.uproject"), Some("Debugging"));
+        store.set_layouts(&layouts).unwrap();
+
+        assert_eq!(store.layouts().unwrap(), layouts);
+        assert_eq!(store.launch_mode().unwrap(), LaunchMode::Game);
     }
 
     #[test]

@@ -37,6 +37,7 @@ use tethys_adapters::update_github::GitHubReleases;
 use tethys_core::automation::{TestEnd, TestEvent};
 use tethys_core::debug::{self as dbg, Breakpoints, DebugEnd, DebugEvent, StackFrame, StopReason};
 use tethys_core::diff::FileDiff;
+use tethys_core::layout::{self, Layouts, Pane, PanelLayout, Side, ToolPane};
 use tethys_core::ports::{
     AgentSession, ConfigStore, DebugEventSink, DebugSession, Debugger, EventSink, LiveCoding,
     SelfInstaller, SessionEvent, SourceControl, TestEventSink, TestRunner, TestSession,
@@ -56,6 +57,7 @@ use crate::diff_panel::DiffPanel;
 use crate::editor_panel::{self, EditorEvent, EditorPanel};
 use crate::file_tree::{FileTreeEvent, FileTreePanel, file_name};
 use crate::history_panel::HistoryPanel;
+use crate::layouts;
 use crate::session_panel::{SessionKind, SessionPanel};
 use crate::settings_ui;
 use crate::tab_skin::{self, NewSessionAt};
@@ -100,13 +102,45 @@ gpui_kit::actions!(
         DetachDebugger,
         ShowTests,
         ConnectTestsToEditor,
-        StartTestEditor
+        StartTestEditor,
+        SaveLayout,
+        ResetLayout
     ]
 );
 
-/// The menu bar: File, Edit, Build, Debug, Test and Help. Rendered in-window
-/// by `AppMenuBar`.
-pub fn install_menus(cx: &mut App) {
+/// Window > a saved layout: arranges the panels to it.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = tethys, no_json)]
+pub struct ApplyLayout {
+    name: SharedString,
+}
+
+/// Window > Default Layout: what projects open with; `None` is the built-in.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = tethys, no_json)]
+pub struct SetDefaultLayout {
+    name: Option<SharedString>,
+}
+
+/// Window > Layout for This Project; `None` uses the default.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = tethys, no_json)]
+pub struct SetProjectLayout {
+    name: Option<SharedString>,
+}
+
+/// Window > Delete Layout.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = tethys, no_json)]
+pub struct DeleteLayout {
+    name: SharedString,
+}
+
+/// The menu bar: File, Edit, Build, Debug, Test, Window and Help. Rendered
+/// in-window by `AppMenuBar`. The Window menu lists the saved layouts and
+/// ticks the defaults, `project`'s among them.
+pub fn install_menus(project: Option<&Path>, cx: &mut App) {
+    let layouts = cx.global::<Services>().config.layouts().unwrap_or_default();
     let menus = vec![
         Menu::new("File")
             .items([
@@ -154,6 +188,7 @@ pub fn install_menus(cx: &mut App) {
                 MenuItem::action("Start a Test Editor (Headless)", StartTestEditor),
             ])
             .owned(),
+        window_menu(&layouts, project).owned(),
         Menu::new("Help")
             .items([
                 MenuItem::action("Check for Updates…", CheckForUpdates),
@@ -163,6 +198,77 @@ pub fn install_menus(cx: &mut App) {
             .owned(),
     ];
     GlobalState::global_mut(cx).set_app_menus(menus);
+}
+
+/// Window: save and apply layouts, and choose the ones projects open with.
+fn window_menu(layouts: &Layouts, project: Option<&Path>) -> Menu {
+    let names: Vec<SharedString> = layouts
+        .saved
+        .iter()
+        .map(|l| SharedString::from(l.name.clone()))
+        .collect();
+    let mut items = vec![
+        MenuItem::action("Save Layout…", SaveLayout),
+        MenuItem::separator(),
+    ];
+    items.extend(
+        names
+            .iter()
+            .map(|name| MenuItem::action(name.clone(), ApplyLayout { name: name.clone() })),
+    );
+    items.push(MenuItem::action("Built-in Layout", ResetLayout));
+    items.push(MenuItem::separator());
+
+    let default = layouts.default.as_deref();
+    let defaults = std::iter::once(
+        MenuItem::action("Built-in", SetDefaultLayout { name: None }).checked(default.is_none()),
+    )
+    .chain(names.iter().map(|name| {
+        MenuItem::action(
+            name.clone(),
+            SetDefaultLayout {
+                name: Some(name.clone()),
+            },
+        )
+        .checked(default == Some(name.as_ref()))
+    }));
+    items.push(MenuItem::submenu(
+        Menu::new("Default Layout").items(defaults),
+    ));
+
+    let own = project.and_then(|p| layouts.project_default(p));
+    let for_project = std::iter::once(
+        MenuItem::action("Same as Default", SetProjectLayout { name: None })
+            .checked(project.is_some() && own.is_none())
+            .disabled(project.is_none()),
+    )
+    .chain(names.iter().map(|name| {
+        MenuItem::action(
+            name.clone(),
+            SetProjectLayout {
+                name: Some(name.clone()),
+            },
+        )
+        .checked(own == Some(name.as_ref()))
+        .disabled(project.is_none())
+    }));
+    items.push(MenuItem::submenu(
+        Menu::new("Layout for This Project").items(for_project),
+    ));
+
+    let deletable: Vec<_> = names
+        .iter()
+        .map(|name| MenuItem::action(name.clone(), DeleteLayout { name: name.clone() }))
+        .collect();
+    let deletable = if deletable.is_empty() {
+        vec![MenuItem::action("No Saved Layouts", SaveLayout).disabled(true)]
+    } else {
+        deletable
+    };
+    items.push(MenuItem::submenu(
+        Menu::new("Delete Layout").items(deletable),
+    ));
+    Menu::new("Window").items(items)
 }
 
 pub fn key_bindings() -> Vec<KeyBinding> {
@@ -553,6 +659,14 @@ impl Workspace {
             true
         });
 
+        // Every window shares the menus, and the Window menu ticks this
+        // window's project layout, so each puts its own up as it comes forward.
+        let menus = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.refresh_menus(cx);
+            }
+        });
+
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let mut this = Self {
@@ -582,7 +696,7 @@ impl Workspace {
             histories: Vec::new(),
             name_prompt: None,
             scm: None,
-            subscriptions: Vec::new(),
+            subscriptions: vec![menus],
             debug: Debug {
                 events: Some(debug_tx),
                 ..Debug::default()
@@ -643,6 +757,8 @@ impl Workspace {
                 self.show_files(window, cx);
                 self.refresh_build_state(cx);
                 self.new_session(&NewSession, window, cx);
+                self.apply_default_layout(window, cx);
+                self.refresh_menus(cx);
             }
             Err(e) => {
                 self.error = Some(e.to_string());
@@ -1086,13 +1202,7 @@ impl Workspace {
     /// Where the build tab, or the placeholder standing in for it, sits: its
     /// region, tab group and index. A new build replaces it there.
     fn build_tab_home(&self, cx: &App) -> Option<(DockPlacement, NodeId, usize)> {
-        let id = self
-            .panels
-            .iter()
-            .find(|p| p.read(cx).kind() == SessionKind::Build)
-            .map(|p| p.entity_id())
-            .or_else(|| self.build_placeholder.as_ref().map(|p| p.entity_id()))?;
-        let id = PanelId::from(id);
+        let id = self.build_tab(cx)?;
         let dock = self.dock.read(cx);
         [
             DockPlacement::Right,
@@ -1110,6 +1220,16 @@ impl Workspace {
             };
             Some((placement, node, ix))
         })
+    }
+
+    /// The build tab, or the placeholder standing in for it.
+    fn build_tab(&self, cx: &App) -> Option<PanelId> {
+        self.panels
+            .iter()
+            .find(|p| p.read(cx).kind() == SessionKind::Build)
+            .map(|p| p.entity_id())
+            .or_else(|| self.build_placeholder.as_ref().map(|p| p.entity_id()))
+            .map(PanelId::from)
     }
 
     /// Keeps the build pane on the right: when it has no build tab, it shows
@@ -1704,6 +1824,182 @@ impl Workspace {
         let focus = panel.focus_handle(cx);
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// The panel showing `tool`, if the window has one.
+    fn tool_panel(&self, tool: ToolPane, cx: &App) -> Option<PanelId> {
+        let id = match tool {
+            ToolPane::Files => self.file_tree.as_ref().map(|p| p.entity_id()),
+            ToolPane::Build => return self.build_tab(cx),
+            ToolPane::Tests => self.tests.panel.as_ref().map(|p| p.entity_id()),
+            ToolPane::Debug => self.debug.panel.as_ref().map(|p| p.entity_id()),
+        };
+        id.map(PanelId::from)
+    }
+
+    /// The tool panes the window has, with their panels.
+    fn tool_panels(&self, cx: &App) -> Vec<(ToolPane, PanelId)> {
+        ToolPane::ALL
+            .into_iter()
+            .filter_map(|tool| Some((tool, self.tool_panel(tool, cx)?)))
+            .collect()
+    }
+
+    /// The panels as a layout sees them: tool panes, and content.
+    fn arrangement(&self, cx: &App) -> layout::Arrangement<PanelId> {
+        let tools = self.tool_panels(cx);
+        let tool = |id| tools.iter().find(|(_, p)| *p == id).map(|(tool, _)| *tool);
+        layouts::read(self.dock.read(cx), tool, cx)
+    }
+
+    /// Arranges the panels to `layout`, opening the Tests and Debug panes it
+    /// shows. Nothing closes, and everything it doesn't place stays put.
+    fn apply_layout(&mut self, layout: &PanelLayout, window: &mut Window, cx: &mut Context<Self>) {
+        for tool in layout.tools() {
+            match tool {
+                ToolPane::Tests => {
+                    self.show_tests_panel(window, cx);
+                }
+                ToolPane::Debug => self.show_debug_panel(window, cx),
+                ToolPane::Files | ToolPane::Build => {}
+            }
+        }
+        let arranged = layout.apply(self.arrangement(cx));
+        let tools = self.tool_panels(cx);
+        let tool = |tool| tools.iter().find(|(t, _)| *t == tool).map(|(_, id)| *id);
+        self.dock.update(cx, |dock, cx| {
+            layouts::write(dock, arranged, tool, window, cx)
+        });
+    }
+
+    /// Arranges a project that just opened to its layout, or the default.
+    fn apply_default_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.project_path() else {
+            return;
+        };
+        let layouts = match cx.global::<Services>().config.layouts() {
+            Ok(layouts) => layouts,
+            Err(e) => {
+                self.error = Some(format!("can't read saved layouts: {e}"));
+                return;
+            }
+        };
+        if let Some(layout) = layouts.for_project(&path) {
+            self.apply_layout(&layout.clone(), window, cx);
+        }
+    }
+
+    /// Puts this window's menus up: the Window menu ticks its project's layout.
+    fn refresh_menus(&self, cx: &mut Context<Self>) {
+        install_menus(self.project_path().as_deref(), cx);
+        self.menu_bar.update(cx, |bar, cx| bar.reload(cx));
+    }
+
+    /// Changes the saved layouts, then the menus that list them.
+    fn update_layouts(&mut self, change: impl FnOnce(&mut Layouts), cx: &mut Context<Self>) {
+        if let Err(e) = usecases::update_layouts(&cx.global::<Services>().config, change) {
+            self.error = Some(format!("can't save layouts: {e}"));
+        }
+        self.refresh_menus(cx);
+        cx.notify();
+    }
+
+    /// Window > Save Layout…: names the current layout and saves it,
+    /// replacing one of the same name.
+    fn save_layout(&mut self, _: &SaveLayout, window: &mut Window, cx: &mut Context<Self>) {
+        let current = PanelLayout::capture("", &self.arrangement(cx));
+        let config = cx.global::<Services>().config.clone();
+        self.prompt_for_name(
+            "Save Layout",
+            "Save",
+            "",
+            window,
+            cx,
+            move |name| {
+                let layout = PanelLayout {
+                    name: layout::check_name(name)?.to_string(),
+                    ..current.clone()
+                };
+                usecases::update_layouts(&config, |l| l.save(layout)).map_err(|e| e.to_string())
+            },
+            |this, _, _, cx| {
+                this.refresh_menus(cx);
+                cx.notify();
+            },
+        );
+    }
+
+    fn apply_named_layout(
+        &mut self,
+        action: &ApplyLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let layouts = cx.global::<Services>().config.layouts();
+        match layouts.as_ref().map(|l| l.get(&action.name)) {
+            Ok(Some(layout)) => self.apply_layout(&layout.clone(), window, cx),
+            Err(e) => self.error = Some(format!("can't read saved layouts: {e}")),
+            Ok(None) => {
+                self.error = Some(format!("There's no layout called {} now.", action.name));
+                self.refresh_menus(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Window > Built-in Layout.
+    fn reset_layout(&mut self, _: &ResetLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_layout(&built_in_layout(), window, cx);
+    }
+
+    fn set_default_layout(
+        &mut self,
+        action: &SetDefaultLayout,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_layouts(|l| l.set_default(action.name.as_deref()), cx);
+    }
+
+    fn set_project_layout(
+        &mut self,
+        action: &SetProjectLayout,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.project_path() else {
+            return;
+        };
+        self.update_layouts(|l| l.set_project_default(&path, action.name.as_deref()), cx);
+    }
+
+    /// Window > Delete Layout: asks first.
+    fn delete_layout(
+        &mut self,
+        action: &DeleteLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = action.name.clone();
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, name) = (this.clone(), name.clone());
+            alert
+                .confirm()
+                .title(format!("Delete the {name} layout?"))
+                .description("Projects that open with it will open with the default instead.")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .on_ok(move |_, _, cx| {
+                    let name = name.clone();
+                    let _ =
+                        this.update(cx, |this, cx| this.update_layouts(|l| l.delete(&name), cx));
+                    true
+                })
+        });
     }
 
     /// Collapses docks whose last tab was dragged away, so they leave a strip
@@ -2745,6 +3041,25 @@ impl Workspace {
     }
 }
 
+/// The layout a project opens with when none is chosen: Files on the left
+/// and the build pane on the right, open at their first sizes.
+fn built_in_layout() -> PanelLayout {
+    let dock = |side, size: Pixels, tool| layout::Dock {
+        side,
+        size: size.as_f32(),
+        open: true,
+        pane: Pane::tabs(vec![tool]),
+    };
+    PanelLayout {
+        name: "Built-in".into(),
+        center: Vec::new(),
+        docks: vec![
+            dock(Side::Left, FILES_PANE_WIDTH, ToolPane::Files),
+            dock(Side::Right, BUILD_PANE_WIDTH, ToolPane::Build),
+        ],
+    }
+}
+
 /// The second line of Build's and Rebuild's tooltips: how the chosen
 /// configuration's last build stands against the source.
 fn build_status(freshness: Option<&Freshness>, building: bool) -> String {
@@ -2898,6 +3213,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_tests))
             .on_action(cx.listener(Self::connect_tests_to_editor))
             .on_action(cx.listener(Self::start_test_editor))
+            .on_action(cx.listener(Self::save_layout))
+            .on_action(cx.listener(Self::apply_named_layout))
+            .on_action(cx.listener(Self::reset_layout))
+            .on_action(cx.listener(Self::set_default_layout))
+            .on_action(cx.listener(Self::set_project_layout))
+            .on_action(cx.listener(Self::delete_layout))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if let Some(path) = droppable(paths.paths(), |p| p.is_dir()) {
                     this.open(path.clone(), window, cx);

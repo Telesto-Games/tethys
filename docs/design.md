@@ -745,20 +745,35 @@ Things learned while building M0–M3 that aren't obvious from the code.
   (`palette::set_defaults`), so one that picks a scheme by background colour picks right.
 - **Docking.** Sessions (Claude and builds) are panels in a gpui-component `DockArea`
   (`SessionPanel`), so tabs can be dragged into splits and resized. The panel owns its
-  `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. The layout
-  isn't saved yet. Every panel moves the same way, including the last tab in an area, which
+  `AgentSession`: closing its tab calls `on_removed`, which stops the process tree. Layouts are
+  saved by name (below). Every panel moves the same way, including the last tab in an area, which
   gpui-component holds in place: `tab_skin` lays a drag layer over a lone tab bar (gpui-base's
   `Tab` swallows the left mouse press), and the workspace collapses a dock emptied by a drag
   instead of removing it, so tabs can be dropped back. Collapsing is per dock, as in the toolkit,
   but each dock's button ends its own tab bar (the toolkit puts the side docks' on the main
   area), and a collapsed side dock leaves a strip that reopens it and takes drops, as the bottom
   dock's tab strip does.
+- **Layouts.** Window → Save Layout… names the current arrangement of the tool panes (Files,
+  Build, Tests, Debug) and the docks' sizes and open state; sessions, editors, diffs and
+  histories aren't part of it. Choosing a saved layout from the Window menu applies it: the tool
+  panes it names move where it says (Tests and Debug open if they weren't), and everything else
+  stays in its region, joining that region's first tab group. Nothing is closed, so no session
+  stops. Built-in Layout is the arrangement a project opens with when no layout is chosen.
+  Window → Default Layout picks the layout every project opens with, and Layout for This Project
+  overrides it for the open one; both are checked in the menu for the window in front. The model
+  is `tethys_core::layout` (`PanelLayout::capture` and `apply` over an `Arrangement` of tool
+  panes and content, with `Layouts` holding the saved ones and the defaults), saved in
+  `state.toml` under `[layouts]`. `layouts.rs` reads the `DockArea` into an arrangement and
+  writes one back with a single `DockArea::load`, in which every leaf is a `tethys.seat` panel
+  whose registry builder hands back the panel already in the window. Moving panels region by
+  region with `set_center`/`set_dock` would drop a panel from the dock between two calls, which
+  closes it.
 - **Agent choice.** Without an `agents.toml`, the built-in profiles are Claude Code and opencode,
   both on the terminal adapter. The main area's + (new session) button lists every profile and Ctrl+Shift+T starts the
   first. For full-screen TUIs like opencode, the terminal sends mouse-wheel reports (SGR or
   legacy) when the program enables mouse mode, and arrow keys on the alternate screen. Mouse
   clicks aren't forwarded yet.
-- **Menu bar.** File / Build / Help, drawn in-window by gpui-component's `AppMenuBar` from
+- **Menu bar.** File / Edit / Build / Debug / Test / Window / Help, drawn in-window by gpui-component's `AppMenuBar` from
   menus set in `install_menus`. Menu items dispatch the same actions as the shortcuts. Exit
   closes every window, which stops their sessions gracefully. Help → About opens a dialog. The
   app registers an asset source (`assets.rs`) with gpui-kit's default icons plus the few Lucide
